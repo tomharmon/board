@@ -65,6 +65,10 @@ impl Delivery {
     }
 }
 impl State {
+    pub fn root_channel(&self) -> &str {
+        let name = self.destination.text.trim();
+        name.strip_prefix('#').unwrap_or(name)
+    }
     pub fn edits_root(&self) -> bool {
         self.page.is_feed() || (self.root_editor_in_thread && matches!(self.page, Page::Thread(_)))
     }
@@ -178,7 +182,7 @@ impl State {
             return Ok(());
         };
         let channel = if self.edits_root() {
-            self.destination.text.trim().to_owned()
+            self.root_channel().to_owned()
         } else {
             self.thread
                 .first()
@@ -259,7 +263,7 @@ impl State {
                 ..Default::default()
             };
             let dest = if self.edits_root() {
-                automation::Destination::Channel(self.destination.text.trim())
+                automation::Destination::Channel(self.root_channel())
             } else if let Some(root) = self.page.thread_id() {
                 automation::Destination::Reply(self.reply_to.unwrap_or(root))
             } else {

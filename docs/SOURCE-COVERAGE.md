@@ -66,6 +66,46 @@ check leaves a retryable unsent job, not an uncertain mutation. The fixtures
 inspect every request body, verify the allowed send and reject a moved or
 out-of-team issue without sending any message text.
 
+Two SQLite connections reproduce an edit, then a tombstone, between leasing
+and sending in `outbox_rechecks_an_edit_or_tombstone`. The stale proof
+cannot arm a remote write, even if the newer body is ready to send. The test
+`a_message_changed_during_the_provider_check` interleaves that edit with
+the real connector's read-only Linear team check: its loopback server gets
+two read-only queries and precisely one mutation with the updated body.
+Once intent has actually committed, a later edit cannot retract a request
+already in flight: normal follow-up delivery and uncertain-write
+reconciliation still apply.
+
+`queued_platform_status_notes_keep_fenced_examples_as_prose` passes an
+unknown schema fence through a provider's conditional status reply. Its
+labels, exact origin and prose commit together, but it produces no trusted
+structured block. The same body is rejected as a native assertion. Watchers
+see the final imported origin, not provisional native writes during binding.
+`a_fresh_platform_edit_replaces_identical_local_data` checks that an
+authoritative provider edit, upsert or reconcile also removes native blocks
+when its prose happens to be byte-for-byte identical to a local edit.
+Replaying the original delivery neither changes the revision nor emits an event.
+
+Native [source-settings scripts](../ui/tests/inspector/source_settings.rs)
+start with an empty database, create all four provider types, restart,
+confirm publishing and source-specific options, handle invalid and
+unauthorized fields, cancel and refuse an outdated form. They operate the
+actual inspector binary through Rune. To also check each saved mapping via
+a separately built CLI, use:
+
+```sh
+cargo build --offline --locked -p board-cli
+BOARD_UI_TEST_CLI="$(pwd)/target/debug/board" cargo test --offline --locked -p board-ui --test inspector source_settings::
+BOARD_UI_TEST_CLI="$(pwd)/target/debug/board" cargo test --offline --locked -p board-ui --bin board-ui state::sources::tests::
+```
+
+The clipboard test parses the copied command as actual shell arguments and,
+on Unix with the CLI supplied, imports a local fixture while another board
+is selected in the shell. Only the inspected database (with an apostrophe
+and spaces in its filename) changes. A separate Rune script opens a
+non-UTF-8 path supplied by the inspector launcher and checks that no command
+can be copied and no fallback database is created.
+
 **Additional evidence:** signed native intake, Slack file upload/permission
 fallback, membership checks before preview/join, conditional public link
 snapshots, dropped-import responses, GitHub review/CI and Linear comment

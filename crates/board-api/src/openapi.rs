@@ -58,6 +58,7 @@ pub(super) fn models() -> Value {
         "Edit":obj(json!({"text":s,"if_revision":n}),&["text"]),
         "LabelPatch":obj(json!({"set":labels,"unset":arr(s.clone()),"conditions":{"type":"object","additionalProperties":{"type":["string","null"]}}}),&[]),
         "Source":obj(json!({"name":s,"channel":s,"provider":{"enum":["github","slack","linear","local"]},"remote":s}),&["name","channel","provider","remote"]),
+        "NewChannel":obj(json!({"name":s,"private":{"type":"boolean","default":false,"description":"Atomically restrict this new channel and its subtree to the local creator's family. Never changes an existing channel."}}),&["name"]),
         "SourcePatch":obj(json!({"outbound":b,"mirror_roots":b,"mirror_files":b,"display_authors":b,"github_items":{"enum":["all","issues","pulls"]}}),&[]),
         "JoinThread":obj(json!({"root":n}),&["root"]),
         "Rule":obj(json!({"priority":n,"script":{"type":"string","maxLength":8192}}),&["script"]),
@@ -102,6 +103,7 @@ pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
     }
     let input = match (path, verb) {
         ("/messages", "post") => "NewMessage",
+        ("/channels", "post") => "NewChannel",
         ("/messages/{id}", "patch") => "Edit",
         ("/messages/{id}/labels", "patch") => "LabelPatch",
         ("/tasks", "post") => "NewTask",
@@ -119,6 +121,24 @@ pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
     };
     if !input.is_empty() {
         op["requestBody"] = json!({"required":input!="WatcherAck","content":{"application/json":{"schema":reference(input)}}});
+    }
+    if input == "NewChannel" {
+        op["responses"].as_object_mut().unwrap().remove("2XX");
+        op["responses"]["200"] =
+            json!({"description":"The requested public channel already exists; created is false."});
+        op["responses"]["201"] = json!({"description":"New channel. Private creation also returns both committed grants.","headers":{"Location":{"schema":{"type":"string"},"description":"New channel resource"}}});
+        for (code, description) in [
+            (
+                "403",
+                "Permission denied. Private creation also requires listing board-wide grants.",
+            ),
+            (
+                "409",
+                "Private creation found an existing channel/subtree (channel_exists) or a grant reaching it (channel_granted). Nothing changed.",
+            ),
+        ] {
+            op["responses"][code] = json!({"description":description,"content":{"application/json":{"schema":reference("Problem")}}});
+        }
     }
     if path == "/sources/{name}/thread-links" {
         op["parameters"] = json!([{"name":"thread","in":"query","required":true,"schema":{"type":"string"},"description":"Existing provider conversation ID. Joining publishes no existing messages."}]);

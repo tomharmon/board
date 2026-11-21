@@ -80,6 +80,15 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS watcher_lane ON watcher_queue(name,lane,cursor) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS watcher_pending ON watcher_queue(name,cursor) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS watcher_verbose(name TEXT PRIMARY KEY REFERENCES watchers(name) ON DELETE CASCADE);
+        CREATE TABLE IF NOT EXISTS watcher_filter_start(
+            singleton INTEGER PRIMARY KEY CHECK(singleton=1),through INTEGER NOT NULL);
+        INSERT OR IGNORE INTO watcher_filter_start SELECT 1,coalesce(max(cursor),0) FROM events;
+        CREATE TABLE IF NOT EXISTS watcher_filter_hits(
+            name TEXT NOT NULL REFERENCES watchers(name) ON DELETE CASCADE,
+            cursor INTEGER NOT NULL REFERENCES events(cursor),PRIMARY KEY(name,cursor)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS watcher_identity_filters ON watchers(kind,name)
+            WHERE json_extract(filter,'$.by') IS NOT NULL OR json_extract(filter,'$.mentions') IS NOT NULL;
         INSERT OR IGNORE INTO watcher_scan(name,scanned)
             SELECT name,cursor FROM watchers;",
     )?;
@@ -102,6 +111,63 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// A name, its owner and a credential's grants can all change before a pull.
+/// Save only positive decisions, not message copies. A provisional task, source
+/// or scheduled post may replace its own snapshot inside this same transaction.
+pub(crate) fn capture_filters(tx: &Transaction<'_>, cursor: i64) -> Result<()> {
+    let mut stmt = tx.prepare_cached(
+        "SELECT w.name,w.filter,r.credential FROM watcher_registry r JOIN watchers w ON w.name=r.internal
+            WHERE w.kind IS NULL OR w.kind=(SELECT kind FROM events WHERE cursor=?1)
+         UNION ALL
+         SELECT w.name,w.filter,NULL FROM watchers w
+            WHERE (json_extract(w.filter,'$.by') IS NOT NULL OR json_extract(w.filter,'$.mentions') IS NOT NULL)
+              AND (w.kind IS NULL OR w.kind=(SELECT kind FROM events WHERE cursor=?1))
+              AND NOT EXISTS(SELECT 1 FROM watcher_registry r WHERE r.internal=w.name)
+         ORDER BY 3")?;
+    let mut rows = stmt.query([cursor])?;
+    let Some(mut row) = rows.next()? else {
+        return Ok(());
+    };
+    let event = event_at(tx, cursor)?;
+    let mut add = tx.prepare_cached("INSERT OR IGNORE INTO watcher_filter_hits VALUES(?,?)")?;
+    let mut remove =
+        tx.prepare_cached("DELETE FROM watcher_filter_hits WHERE name=? AND cursor=?")?;
+    loop {
+        // Only the credential that registered a watcher determines its event-time view.
+        let credential: Option<String> = row.get(2)?;
+        let access = match &credential {
+            Some(id) => Board::credential_access_on(tx, id)?,
+            None => Some(Access::owner()),
+        };
+        let mut audience = match access.as_ref() {
+            Some(a) => crate::feed::allowed(tx, a, event.clone())?
+                .map(|e| (crate::feed::EventResolver::new(tx, a), e)),
+            None => None,
+        };
+        loop {
+            let name: String = row.get(0)?;
+            let matches = if let Some((resolver, e)) = &mut audience {
+                let filter = serde_json::from_str(&row.get::<_, String>(1)?)?;
+                resolver.resolve(&filter)?.matches(e)
+            } else {
+                false
+            };
+            if matches {
+                add.execute(params![name, cursor])?;
+            } else {
+                remove.execute(params![name, cursor])?;
+            }
+            let Some(next) = rows.next()? else {
+                return Ok(());
+            };
+            row = next;
+            if row.get::<_, Option<String>>(2)? != credential {
+                break;
+            }
+        }
+    }
 }
 
 fn get(conn: &Connection, name: &str) -> Result<Watcher> {
@@ -241,6 +307,7 @@ fn validate_spec(
     kind: Option<&str>,
 ) -> Result<()> {
     crate::validate_actor(actor)?;
+    filter.validate()?;
     ensure!(
         name.as_bytes()
             .first()
@@ -406,6 +473,7 @@ pub fn replace_watchers(b: &Board, actor: &str, specs: &[WatchSpec]) -> Result<V
                     && Board::credential_access_on(&tx, id)?.is_none()
                 {
                     tx.execute("DELETE FROM watcher_queue WHERE name=?", [&old.key])?;
+                    tx.execute("DELETE FROM watcher_filter_hits WHERE name=?", [&old.key])?;
                     tx.execute(
                         "UPDATE watcher_scan SET scanned=? WHERE name=?",
                         params![head, old.key],
@@ -537,13 +605,47 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
     let Some(last) = events.last().map(|e| e.cursor) else {
         return Ok(false);
     };
+    let captured =
+        p.owner.is_some() || watcher.filter.by.is_some() || watcher.filter.mentions.is_some();
+    let since = if captured {
+        tx.query_row(
+            "SELECT through FROM watcher_filter_start WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?
+    } else {
+        i64::MAX
+    };
+    let hits: std::collections::HashSet<i64> = if captured && last > since {
+        tx.prepare_cached(
+            "SELECT cursor FROM watcher_filter_hits WHERE name=? AND cursor>? AND cursor<=?",
+        )?
+        .query_map(params![watcher.key, scanned, last], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?
+    } else {
+        Default::default()
+    };
+    let legacy = if captured && scanned < since {
+        Some(crate::feed::EventMatcher::resolve(
+            tx,
+            p.owner.as_ref().unwrap_or(&p.caller),
+            &watcher.filter,
+        )?)
+    } else {
+        None
+    };
     for event in events {
         let Some(event) = p.registered(tx, event)? else {
             continue;
         };
-        if watcher.kind.as_ref().is_some_and(|k| k != &event.kind)
-            || !event.matches(&watcher.filter)
-        {
+        let matched = if event.message.is_some() && event.cursor > since {
+            hits.contains(&event.cursor)
+        } else if let Some(legacy) = &legacy {
+            legacy.matches(&event)
+        } else {
+            event.matches(&watcher.filter)
+        };
+        if !matched || watcher.kind.as_ref().is_some_and(|k| k != &event.kind) {
             continue;
         }
         if watcher.kind.is_none()
@@ -565,6 +667,12 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
         tx.execute(
             "INSERT OR IGNORE INTO watcher_queue(name,cursor,lane) VALUES(?,?,?)",
             params![watcher.key, event.cursor, lane],
+        )?;
+    }
+    if !hits.is_empty() {
+        tx.execute(
+            "DELETE FROM watcher_filter_hits WHERE name=? AND cursor<=?",
+            params![watcher.key, last],
         )?;
     }
     tx.execute(

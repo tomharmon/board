@@ -1,17 +1,12 @@
 use super::*;
 
 pub(super) fn repo(s: &Source) -> Result<String> {
-    let p = s.remote.split('/').collect::<Vec<_>>();
-    ensure!(
-        p.len() == 2
-            && p.iter().all(|v| !v.is_empty()
-                && *v != "."
-                && *v != ".."
-                && v.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))),
-        "expected GitHub OWNER/REPO"
-    );
-    Ok(format!("/repos/{}/{}", seg(p[0]), seg(p[1])))
+    Provider::Github.validate_remote(&s.remote)?;
+    let (owner, repo) = s
+        .remote
+        .split_once('/')
+        .context("expected GitHub OWNER/REPO")?;
+    Ok(format!("/repos/{}/{}", seg(owner), seg(repo)))
 }
 fn num(s: &str) -> Result<u64> {
     s.parse::<u64>()

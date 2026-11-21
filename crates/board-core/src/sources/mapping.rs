@@ -309,7 +309,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             Board::labels_tx(tx, root, &actor, set, unset, &BTreeMap::new())?
         };
         if let Some(text) = reply {
-            let m = Board::reply_tx(
+            let m = Board::platform_reply_tx(
                 tx,
                 root,
                 &actor,
@@ -400,8 +400,8 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                 unset.append(&mut extra);
                 unset.sort();
                 unset.dedup();
-                if text != &old.text {
-                    Board::edit_tx(tx, old.id, &old.actor, text, None)?;
+                if text != &old.text || !old.blocks.is_empty() {
+                    Board::platform_edit_tx(tx, old.id, &actor, text, None)?;
                 }
                 if !unset.is_empty() || next.iter().any(|(k, v)| old.labels.get(k) != Some(v)) {
                     Board::labels_tx(tx, old.id, &actor, next, &unset, &BTreeMap::new())?;
@@ -410,13 +410,13 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                 Board::get_on(tx, old.id)?
             }
             Change::Edit { text } => {
-                if old.text == *text {
+                if old.text == *text && old.blocks.is_empty() {
                     old
                 } else {
-                    Board::edit_tx(tx, old.id, &old.actor, text, None)?
+                    Board::platform_edit_tx(tx, old.id, &actor, text, None)?
                 }
             }
-            Change::Delete => Board::delete_tx(tx, old.id, &old.actor, None)?,
+            Change::Delete => Board::platform_delete_tx(tx, old.id, &actor, None)?,
             Change::React { .. } => unreachable!("handled independently of message version"),
             Change::Signal { .. } | Change::Ignore => {
                 unreachable!("handled before looking up the copy")
@@ -478,8 +478,8 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         };
         meet_authors(tx, s, i, &actor)?;
         let m = match parent {
-            Some(p) => Board::reply_tx(tx, p, &actor, text, &opts)?,
-            None => Board::post_tx(tx, &s.channel, &actor, text, &opts)?,
+            Some(p) => Board::platform_reply_tx(tx, p, &actor, text, &opts)?,
+            None => Board::platform_post_tx(tx, &s.channel, &actor, text, &opts)?,
         };
         bind(tx, s, &i.thread, &i.external, &m, true, i.url.as_deref())?;
         let m = Board::get_on(tx, m.id)?;

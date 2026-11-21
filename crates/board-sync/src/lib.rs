@@ -521,6 +521,17 @@ impl Connector {
         Ok(report)
     }
     pub fn send_next(&self, b: &Board, who: &str, name: &str) -> Result<Option<Job>> {
+        // A writer may edit/delete while this process is doing a read-only provider
+        // check. Prepare again, but don't spin forever if an actor is still editing.
+        for _ in 0..2 {
+            match self.prepared_send(b, who, name) {
+                Err(e) if board_local::errors::classify(&e).1 == "delivery_changed" => continue,
+                result => return result,
+            }
+        }
+        self.prepared_send(b, who, name)
+    }
+    fn prepared_send(&self, b: &Board, who: &str, name: &str) -> Result<Option<Job>> {
         let src = b.source(who, name)?;
         ensure!(
             src.outbound,
@@ -563,7 +574,7 @@ impl Connector {
             b.start_sending(who, name, l.job.id, &l.receipt)?;
             return self.confirm(b, who, name, &l, self.respond(&src, &target, text));
         }
-        let mut d: Delivery = serde_json::from_value(l.job.payload.clone())?;
+        let d: Delivery = serde_json::from_value(l.job.payload.clone())?;
         let find = |id| -> Result<Option<Copy>> {
             Ok(b.source_copies(who, name, id)?
                 .into_iter()
@@ -571,38 +582,6 @@ impl Connector {
         };
         let copy = find(d.message)?;
         let parent = d.parent.map(find).transpose()?.flatten();
-        if matches!(
-            d.event.as_str(),
-            "message.posted" | "message.edited" | "thread.start" | "file.note"
-        ) {
-            let m = b.get(d.message)?;
-            if src.settings.display_authors {
-                let who = m
-                    .author
-                    .as_ref()
-                    .map_or(m.actor.as_str(), |a| a.name.as_str());
-                let name: String = who
-                    .chars()
-                    .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '/'))
-                    .take(80)
-                    .collect();
-                d.text.push_str(&format!("\n\nFrom {name} on Board"));
-            }
-            let declined = if self.provider == Provider::Slack {
-                b.declined_assets(who, name, &l.job.thread, m.id)?
-            } else {
-                Vec::new()
-            };
-            for file in &m.attachments {
-                if self.provider != Provider::Slack || declined.contains(&file.id) {
-                    let filename = file.name.replace('`', "'");
-                    d.text.push_str(&format!(
-                        "\n\nFile: `{filename}` ({} bytes; on Board #{})",
-                        file.size, m.id
-                    ));
-                }
-            }
-        }
         let target = destination(if d.event == "message.posted" {
             parent.as_ref()
         } else {

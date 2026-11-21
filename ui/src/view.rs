@@ -21,13 +21,14 @@ use rune_kit::{Kit, glyphs};
 use std::cell::Cell;
 
 const BG: &str = "#fafafa";
-const INK: &str = "#040404";
-const DIM: &str = "#303030";
-const MUTED: &str = "#646464";
-const FAINT: &str = "#909090";
-const EDGE: &str = "#d9d9d9";
-const TINT: &str = "#f0f0f0";
-const AVATAR: &str = "#e3e3e3";
+const INK: &str = "#191b1e";
+const DIM: &str = "#34373b";
+const MUTED: &str = "#50555b";
+const FAINT: &str = "#60666d";
+const EDGE: &str = "#cdd0d3";
+const TINT: &str = "#eff0f1";
+const AVATAR: &str = "#e0e2e4";
+const CONTROL: &str = "#81858a";
 const ERROR: &str = "#c70000";
 const ACCENT: &str = INK;
 const PANEL: &str = TINT;
@@ -40,14 +41,15 @@ fn dark() -> bool {
 fn c(token: &str) -> Color {
     let hex = if dark() {
         match token {
-            BG => "#040404",
-            INK => "#fafafa",
-            DIM => "#dedede",
-            MUTED => "#909090",
-            FAINT => "#646464",
-            EDGE => "#252525",
-            TINT => "#161616",
-            AVATAR => "#252525",
+            BG => "#141517",
+            INK => "#f2f3f5",
+            DIM => "#dedfe2",
+            MUTED => "#b9bdc2",
+            FAINT => "#a0a5ac",
+            EDGE => "#393c40",
+            TINT => "#25272a",
+            AVATAR => "#323539",
+            CONTROL => "#747a81",
             ERROR => "#ff7b72",
             v => v,
         }
@@ -66,7 +68,48 @@ fn label(s: impl Into<String>, size: f32, weight: f32, ink: &str) -> El {
     text(s).font(font(size, weight)).color(c(ink))
 }
 fn mono(s: impl Into<String>, ink: &str) -> El {
-    label(s, 11.0, 400.0, ink)
+    label(s, 12.0, 400.0, ink)
+}
+
+fn short_input(edit: &rune::TextEdit, key: &'static str, name: &str, prompt: &str) -> El {
+    text_input(edit, font(13., 450.).lh(18.))
+        .key(key)
+        .label(name)
+        .single_line()
+        .placeholder(prompt, c(FAINT))
+        .color(c(INK))
+        .h(18.)
+        .min_w(0.)
+        .grow(1.)
+        .padding(0.)
+        .no_focus_ring()
+}
+
+// Rune aligns both text and an editor's glyphs to the top of their line box.
+// Center two identical line boxes, not a natural-height label next to a 28px editor.
+fn short_field(key: &'static str, edit: &rune::TextEdit, prefix: Option<&str>, editor: El) -> El {
+    let mut shell = row()
+        .key(format!("{key}-field"))
+        .w_full()
+        .h(30.)
+        .center_y()
+        .px(8.)
+        .radius(4.)
+        .fill(c(TINT))
+        .border(1., c(if edit.focused { DIM } else { CONTROL }))
+        .on_press_tx(move |_: &mut State, tx| tx.focus(key, false))
+        .role("group");
+    if let Some(prefix) = prefix.filter(|p| !edit.text.starts_with(p)) {
+        shell = shell.child(
+            text(prefix)
+                .key(format!("{key}-prefix"))
+                .font(font(13., 450.).lh(18.))
+                .h(18.)
+                .color(c(MUTED))
+                .a11y_hidden(),
+        );
+    }
+    shell.child(editor)
 }
 fn rule() -> El {
     el().w_full().h(1.0).fill(c(EDGE))
@@ -96,6 +139,21 @@ fn action(key: &str, name: &str, primary: bool) -> El {
         name,
     )
     .child(label(name, 12.0, 450.0, if primary { BG } else { DIM }))
+}
+fn submit(key: &str, name: &str, enabled: bool) -> El {
+    click(
+        row()
+            .key(key)
+            .h(32.)
+            .center()
+            .px(12.)
+            .radius(3.)
+            .fill(c(if enabled { INK } else { TINT }))
+            .border(1., c(if enabled { INK } else { CONTROL })),
+        name,
+    )
+    .child(label(name, 13., 550., if enabled { BG } else { FAINT }))
+    .disabled(!enabled)
 }
 fn avatar_size(actor: &str, size: f32) -> El {
     let initial = actor
@@ -139,6 +197,11 @@ fn title_for(s: &State) -> String {
         .unwrap_or_else(|| "activity".into())
 }
 fn search(s: &State) -> El {
+    let prompt = if s.is_timeline() {
+        "Search messages"
+    } else {
+        "Search threads"
+    };
     let mut field = row()
         .grow(1.0)
         .min_w(0.0)
@@ -153,8 +216,8 @@ fn search(s: &State) -> El {
             text_input(&s.query, font(13.0, 450.0))
                 .single_line()
                 .key("search")
-                .label("Search threads")
-                .placeholder("Search threads", c(MUTED))
+                .label(prompt)
+                .placeholder(prompt, c(MUTED))
                 .grow(1.0)
                 .min_w(0.0)
                 .on_edit(|s: &mut State| &mut s.query)
@@ -163,13 +226,19 @@ fn search(s: &State) -> El {
                     s.refresh();
                 })
                 .on_input_key(|s: &mut State, k, tx| {
-                    let Some(first) = s.threads.last() else {
+                    let result = if s.is_timeline() {
+                        s.activity_messages.last()
+                    } else {
+                        s.threads.last().map(|t| &t.message)
+                    };
+                    let Some(message) = result else {
                         return false;
                     };
-                    let id = first.message.id;
                     match k.key {
-                        Key::Enter => s.go(Page::Thread(id)),
-                        Key::Down => tx.focus(format!("thread-{id}"), true),
+                        Key::Enter if s.query.preedit().is_none() => {
+                            s.open_message_thread(message.id)
+                        }
+                        Key::Down => tx.focus(messages::feed_key(message), true),
                         _ => return false,
                     }
                     true
@@ -188,6 +257,7 @@ fn search(s: &State) -> El {
 }
 
 pub fn view(s: &State, cx: &mut Cx<State>) -> El {
+    cx.zoom(f32::from(s.layout.zoom_percent) / 100.0);
     let preference = THEME.get_or_init(|| match std::env::var("BOARD_UI_THEME").as_deref() {
         Ok("light") => Some(false),
         Ok("dark") => Some(true),

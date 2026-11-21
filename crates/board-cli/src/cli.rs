@@ -17,11 +17,28 @@ pub struct Args {
     /// Write as a named agent of the local user
     #[arg(long = "as", global = true, env = "BOARD_PROFILE")]
     pub profile: Option<String>,
+    /// Avatar URL for the named profile on its next write; never fetched by the CLI
+    #[arg(long, global = true, env = "BOARD_AVATAR", value_name = "URL")]
+    pub avatar: Option<String>,
     /// Emit machine-readable JSON; tail emits JSON Lines
     #[arg(long, global = true)]
     pub json: bool,
     #[command(subcommand)]
     pub cmd: Command,
+}
+
+#[derive(Group)]
+pub struct NewChannel {
+    pub name: String,
+    /// Restrict this new channel and its descendants to the creating person's family.
+    #[arg(long)]
+    pub private: bool,
+}
+
+#[derive(Subcommand)]
+pub enum ChannelCommand {
+    /// Create an empty channel. Never privatizes an existing channel.
+    Create(NewChannel),
 }
 
 #[derive(Group)]
@@ -134,7 +151,13 @@ pub enum Command {
         command: crate::sync_cli::Inbox,
     },
     /// List channels
+    #[command(args_conflicts_with_subcommands = true)]
     Channels {
+        #[command(subcommand)]
+        command: Option<ChannelCommand>,
+        /// List channel names beginning with this prefix.
+        #[arg(conflicts_with_all = ["prefix","scope"])]
+        path_prefix: Option<String>,
         #[arg(long, conflicts_with = "scope")]
         prefix: Option<String>,
         #[arg(long)]
@@ -160,12 +183,9 @@ pub enum Command {
         handle: String,
         #[arg(long)]
         name: String,
-        /// HTTPS metadata only; use an empty string to remove an existing avatar.
-        #[arg(long)]
-        avatar: Option<String>,
     },
     /// Create an empty channel (posting also creates one)
-    Channel { name: String },
+    Channel(NewChannel),
     /// Start a thread in a channel, or reply to a message ID
     Post {
         target: String,

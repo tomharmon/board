@@ -117,6 +117,52 @@ pub struct PostOptions {
     pub attachment_ids: Vec<i64>,
 }
 
+#[derive(Clone, Copy)]
+enum WriteOrigin {
+    Board,
+    Platform,
+}
+impl WriteOrigin {
+    fn blocks(self, c: &Connection, text: &str) -> Result<Vec<Block>> {
+        match self {
+            Self::Board => Board::blocks_on(c, text),
+            Self::Platform => Ok(Vec::new()),
+        }
+    }
+
+    fn may_change(self, m: &Message, actor: &str, revision: Option<i64>) -> Result<()> {
+        match self {
+            Self::Board => ensure!(
+                owned_by(&m.actor, actor),
+                Forbidden.error(
+                    "not_owned",
+                    "only the author or profile owner can change this message"
+                )
+            ),
+            Self::Platform => {
+                // A source represents moderation on its own original, never on an outbound copy.
+                let source = actor
+                    .strip_prefix("source:")
+                    .and_then(|s| s.split_once('/'))
+                    .map(|(name, _)| name);
+                ensure!(
+                    m.origin
+                        .as_ref()
+                        .is_some_and(|origin| Some(origin.source.as_str()) == source),
+                    Forbidden.error("not_owned", "the source does not own this platform message")
+                );
+            }
+        }
+        if revision.is_some_and(|v| v != m.revision) {
+            bail!(Conflict.error(
+                "revision_conflict",
+                format!("current revision is {}", m.revision)
+            ));
+        }
+        Ok(())
+    }
+}
+
 pub fn validate_channel(s: &str) -> Result<()> {
     ensure!(
         s.len() <= 2048
@@ -229,7 +275,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 13;
+const DB_VERSION: i64 = 14;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -358,6 +404,9 @@ impl Board {
         crate::files::init(&tx)?;
         crate::actors::init(&tx)?;
         crate::projections::init(&tx)?;
+        if locked_version < 14 {
+            crate::schemas::migrate_imported_blocks(&tx)?;
+        }
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         tx.pragma_update(None, "user_version", DB_VERSION)?;
         tx.commit()?;
@@ -656,7 +705,7 @@ impl Board {
                 a.require(Action::Label, &channel)?;
             }
             let (text, mentions) = crate::actors::settle(tx, &a, actor, Some(id), text)?;
-            let (m, created) = Self::insert_reply(tx, id, actor, &text, opts)?;
+            let (m, created) = Self::insert_reply(tx, id, actor, &text, opts, WriteOrigin::Board)?;
             Ok((
                 crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
                 created,
@@ -679,7 +728,16 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
-        Self::insert(tx, channel, None, actor, text, opts)
+        Self::insert(tx, channel, None, actor, text, opts, WriteOrigin::Board)
+    }
+    pub(crate) fn platform_post_tx(
+        tx: &Transaction<'_>,
+        channel: &str,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+    ) -> Result<Message> {
+        Ok(Self::insert(tx, channel, None, actor, text, opts, WriteOrigin::Platform)?.0)
     }
     pub(crate) fn reply_tx(
         tx: &Transaction,
@@ -688,7 +746,16 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<Message> {
-        Ok(Self::insert_reply(tx, id, actor, text, opts)?.0)
+        Ok(Self::insert_reply(tx, id, actor, text, opts, WriteOrigin::Board)?.0)
+    }
+    pub(crate) fn platform_reply_tx(
+        tx: &Transaction<'_>,
+        id: i64,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+    ) -> Result<Message> {
+        Ok(Self::insert_reply(tx, id, actor, text, opts, WriteOrigin::Platform)?.0)
     }
     fn insert_reply(
         tx: &Transaction,
@@ -696,6 +763,7 @@ impl Board {
         actor: &str,
         text: &str,
         opts: &PostOptions,
+        origin: WriteOrigin,
     ) -> Result<(Message, bool)> {
         let parent = Self::get_on(tx, id)?;
         Self::insert(
@@ -705,6 +773,7 @@ impl Board {
             actor,
             text,
             opts,
+            origin,
         )
     }
     fn insert(
@@ -714,6 +783,7 @@ impl Board {
         actor: &str,
         text: &str,
         opts: &PostOptions,
+        origin: WriteOrigin,
     ) -> Result<(Message, bool)> {
         if let Some(key) = &opts.key {
             validate_client_key(key)?;
@@ -771,6 +841,8 @@ impl Board {
             );
         }
         let attached = !opts.files.is_empty() || !opts.attachment_ids.is_empty();
+        let original_text = text;
+        let original_blocks = origin.blocks(tx, text)?;
         let patch = crate::policy::filter(
             tx,
             crate::policy::Write {
@@ -795,7 +867,11 @@ impl Board {
                 validate_value(v)?;
             }
         }
-        let blocks = Self::blocks_on(tx, text)?;
+        let blocks = if text == original_text {
+            original_blocks
+        } else {
+            origin.blocks(tx, text)?
+        };
         tx.execute("INSERT OR IGNORE INTO channels VALUES (?)", [channel])?;
         let ts = now();
         tx.execute(
@@ -843,6 +919,7 @@ impl Board {
                 cursor
             ],
         )?;
+        crate::automation::capture_filters(tx, cursor)?;
         Ok(())
     }
     pub(crate) fn event_tx(
@@ -922,9 +999,31 @@ impl Board {
         text: &str,
         revision: Option<i64>,
     ) -> Result<Message> {
+        Self::edit_body(tx, id, actor, text, revision, WriteOrigin::Board)
+    }
+    pub(crate) fn platform_edit_tx(
+        tx: &Transaction<'_>,
+        id: i64,
+        actor: &str,
+        text: &str,
+        revision: Option<i64>,
+    ) -> Result<Message> {
+        Self::edit_body(tx, id, actor, text, revision, WriteOrigin::Platform)
+    }
+    fn edit_body(
+        tx: &Transaction<'_>,
+        id: i64,
+        actor: &str,
+        text: &str,
+        revision: Option<i64>,
+        origin: WriteOrigin,
+    ) -> Result<Message> {
         let old = Self::get_on(tx, id)?;
-        may_edit(&old, actor, revision)?;
+        origin.may_change(&old, actor, revision)?;
         ensure!(!old.deleted, Gone.error("deleted", "message removed"));
+        let original_text = text;
+        validate_text(text, !old.attachments.is_empty())?;
+        let original_blocks = origin.blocks(tx, text)?;
         let patch = crate::policy::filter(
             tx,
             crate::policy::Write {
@@ -940,7 +1039,11 @@ impl Board {
         )?;
         let text = patch.as_ref().map_or(text, |(s, _)| s.as_str());
         validate_text(text, !old.attachments.is_empty())?;
-        let blocks = Self::blocks_on(tx, text)?;
+        let blocks = if text == original_text {
+            original_blocks
+        } else {
+            origin.blocks(tx, text)?
+        };
         tx.execute(
             "UPDATE messages SET text=?,blocks=? WHERE id=?",
             params![text, serde_json::to_string(&blocks)?, id],
@@ -971,8 +1074,25 @@ impl Board {
         actor: &str,
         revision: Option<i64>,
     ) -> Result<Message> {
+        Self::delete_body(tx, id, actor, revision, WriteOrigin::Board)
+    }
+    pub(crate) fn platform_delete_tx(
+        tx: &Transaction<'_>,
+        id: i64,
+        actor: &str,
+        revision: Option<i64>,
+    ) -> Result<Message> {
+        Self::delete_body(tx, id, actor, revision, WriteOrigin::Platform)
+    }
+    fn delete_body(
+        tx: &Transaction<'_>,
+        id: i64,
+        actor: &str,
+        revision: Option<i64>,
+        origin: WriteOrigin,
+    ) -> Result<Message> {
         let old = Self::get_on(tx, id)?;
-        may_edit(&old, actor, revision)?;
+        origin.may_change(&old, actor, revision)?;
         if old.deleted {
             return Ok(old);
         }
@@ -1130,22 +1250,6 @@ pub fn owned_by(owner: &str, actor: &str) -> bool {
             .is_some_and(|(person, _)| person == actor)
 }
 
-fn may_edit(m: &Message, actor: &str, revision: Option<i64>) -> Result<()> {
-    ensure!(
-        owned_by(&m.actor, actor),
-        Forbidden.error(
-            "not_owned",
-            "only the author or profile owner can change this message"
-        )
-    );
-    if revision.is_some_and(|v| v != m.revision) {
-        bail!(Conflict.error(
-            "revision_conflict",
-            format!("current revision is {}", m.revision)
-        ));
-    }
-    Ok(())
-}
 pub(crate) fn labels_on(c: &Connection, id: i64) -> Result<BTreeMap<String, String>> {
     Ok(
         c.prepare("SELECT key,value FROM labels WHERE message_id=?")?

@@ -118,6 +118,221 @@ fn http_headers(
 }
 
 #[test]
+fn named_profile_avatar_is_committed_with_the_write_and_visible_from_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("profile.db");
+    let url = "https://example.invalid/profile.png";
+    let named = || {
+        let mut command = board(&db);
+        command
+            .env("BOARD_PROFILE", "Desk")
+            .env("BOARD_AVATAR", url);
+        command
+    };
+    // Merely selecting a profile, or failing a write, must not update it.
+    assert!(
+        named()
+            .args(["channels"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let snapshot = cli(&db, &["channels"], None);
+    assert!(
+        !named()
+            .args(["reply", "999", "missing"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert_eq!(cli(&db, &["channels"], None), snapshot);
+    let message = cli(
+        &db,
+        &["--as", "Desk", "--avatar", url, "post", "dev", "one"],
+        None,
+    );
+    let id = message["message"]["id"].as_i64().unwrap();
+    let master = "profile-test-master";
+    let (_server, addr) = launch(&db, master);
+    let (status, stored) = http(
+        &addr,
+        "GET",
+        &format!("messages/{id}"),
+        master,
+        None,
+        Value::Null,
+    );
+    assert_eq!(status, 200);
+    assert_eq!(stored["actor"], "owner/desk");
+    assert_eq!(stored["author"]["avatar"], url);
+    let other = named()
+        .env("BOARD_PROFILE", "Review")
+        .args(["post", "dev", "two"])
+        .output()
+        .unwrap();
+    assert!(other.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&other.stdout).unwrap()["message"]["author"]["avatar"],
+        url
+    );
+    assert!(
+        !board(&db)
+            .args(["--avatar", url, "post", "dev", "no profile"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(
+        !named()
+            .env("BOARD_AVATAR", "file:///etc/passwd")
+            .args(["post", "dev", "bad"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn private_channel_creation_is_atomic_across_cli_and_http_and_never_adopts_a_public_tree() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("channels.sqlite");
+    let master = "private-channel-test";
+    for person in ["ada", "bea"] {
+        cli(&db, &["grants", "create", person, "--can", "*=all"], None);
+    }
+    let token = |actor| {
+        cli(&db, &["credentials", "issue", actor], None)["token"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let ada = token("ada");
+    let agent = token("ada/desk");
+    let bea = token("bea");
+    let (_server, addr) = launch(&db, master);
+    let (_, spec) = http(&addr, "GET", "openapi.json", master, None, Value::Null);
+    let operation = &spec["paths"]["/channels"]["post"];
+    assert_eq!(
+        spec["components"]["schemas"]["NewChannel"]["properties"]["private"]["default"],
+        false
+    );
+    assert!(operation["responses"]["201"]["headers"]["Location"].is_object());
+    assert!(operation["responses"]["409"].is_object());
+    // A sibling, even one matching SQL LIKE's underscore, does not overlap.
+    cli(&db, &["channel", "vaultxops/existing"], None);
+    let (s, body, loc) = http_with_key(
+        &addr,
+        "POST",
+        "channels",
+        &agent,
+        None,
+        None,
+        json!({"name":"vault_ops","private":true}),
+    );
+    assert_eq!(s, 201, "{body}");
+    assert_eq!(loc.as_deref(), Some("/v1/channels/vault_ops"));
+    let grants = body["grants"].as_array().unwrap();
+    assert_eq!(grants.len(), 2);
+    assert_eq!(grants[0]["subject"], "ada");
+    assert_eq!(grants[1]["subject"], "*");
+    let id = cli(
+        &db,
+        &["post", "vault_ops/notes", "Hidden content"],
+        Some(&ada),
+    )["message"]["id"]
+        .clone();
+    assert_eq!(
+        http(
+            &addr,
+            "GET",
+            &format!("messages/{id}"),
+            &bea,
+            None,
+            Value::Null
+        )
+        .0,
+        404
+    );
+    assert_eq!(
+        cli(&db, &["channels", "vault_ops"], Some(&bea))["channels"],
+        json!([])
+    );
+    let made = cli(
+        &db,
+        &["channels", "create", "another", "--private"],
+        Some(&bea),
+    );
+    assert_eq!(made["grants"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        http(&addr, "GET", "channels/another", &ada, None, Value::Null).0,
+        404
+    );
+    let before = cli(&db, &["grants", "list"], None);
+    let denied = http(
+        &addr,
+        "POST",
+        "channels",
+        &ada,
+        None,
+        json!({"name":"vaultxops","private":true}),
+    );
+    assert_eq!(
+        (denied.0, denied.1["code"].as_str()),
+        (409, Some("channel_exists"))
+    );
+    let denied = http(
+        &addr,
+        "POST",
+        "channels",
+        &ada,
+        None,
+        json!({"name":"vault_ops","private":true}),
+    );
+    assert_eq!(
+        (denied.0, denied.1["code"].as_str()),
+        (409, Some("channel_granted"))
+    );
+    assert_eq!(before, cli(&db, &["grants", "list"], None));
+    cli(
+        &db,
+        &["grants", "create", "bea", "--can", "reserved/child=read"],
+        None,
+    );
+    assert_eq!(
+        http(
+            &addr,
+            "POST",
+            "channels",
+            &ada,
+            None,
+            json!({"name":"reserved","private":true})
+        )
+        .1["code"],
+        "channel_granted"
+    );
+    assert_eq!(
+        http(
+            &addr,
+            "POST",
+            "channels",
+            &ada,
+            Some("*=read,post"),
+            json!({"name":"denied","private":true})
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        http(&addr, "GET", "channels/denied", master, None, Value::Null).0,
+        404
+    );
+}
+
+#[test]
 fn strict_ack_over_loopback_and_cli_shares_the_proven_outcome_but_default_put_replays() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("conformance.sqlite");

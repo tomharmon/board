@@ -6,6 +6,33 @@ use std::{
 };
 
 #[test]
+fn registering_a_mapping_takes_destinations_not_provider_urls_or_bearers() -> anyhow::Result<()> {
+    let b = Board::memory()?;
+    let at = b.cursor()?;
+    for (p, remote) in [
+        (Provider::Github, "https://github.com/test/board"),
+        (Provider::Slack, "xoxb-test-fixture"),
+        (Provider::Linear, "lin_api_test-fixture"),
+    ] {
+        let e = b
+            .create_source("p", "mapping", p, remote, "work")
+            .unwrap_err();
+        assert!(!e.to_string().contains(remote));
+    }
+    assert_eq!(b.cursor()?, at);
+    assert!(b.sources("p")?.is_empty());
+    b.create_source("p", "dm", Provider::Slack, "D012345", "work")?;
+    b.create_source(
+        "p",
+        "local-events",
+        Provider::Local,
+        "arbitrary external stream/key",
+        "work",
+    )?;
+    Ok(())
+}
+
+#[test]
 fn v12_join_upgrade_retires_unsent_roots_and_preserves_the_actual_join_boundary()
 -> anyhow::Result<()> {
     let dir = tempfile::tempdir()?;
@@ -149,6 +176,173 @@ fn input(key: &str, t: &str, id: &str, p: Option<&str>, text: &str) -> Envelope 
         },
         raw: json!({"fixture":key}),
     }
+}
+
+#[test]
+fn outbox_rechecks_an_edit_or_tombstone_between_leasing_and_sending() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("delivery.db");
+    let worker = Board::open(&path)?;
+    let writer = Board::open(&path)?;
+    worker.create_source("p", "desk", Provider::Local, "external", "work")?;
+    worker.set_outbound("p", "desk", true)?;
+    let root = writer.post("work", "p", "root", &Default::default())?;
+    worker.attach_source("p", "desk", "T", "external-root", root.id, None)?;
+    let note = writer.reply(root.id, "p", "unsent draft", &Default::default())?;
+    let lease = worker
+        .lease_source("p", "desk", Direction::Out, 60)?
+        .unwrap();
+    writer.edit(note.id, "p", "approved text", None)?;
+    assert_eq!(
+        board_local::errors::classify(
+            &worker
+                .start_sending("p", "desk", lease.job.id, &lease.receipt)
+                .unwrap_err()
+        )
+        .1,
+        "delivery_changed"
+    );
+    let updated = worker
+        .lease_source("p", "desk", Direction::Out, 60)?
+        .unwrap();
+    assert_eq!(updated.job.id, lease.job.id);
+    assert_ne!(updated.receipt, lease.receipt);
+    assert_eq!(updated.job.payload["text"], "approved text");
+    writer.delete(note.id, "p", None)?;
+    assert_eq!(
+        board_local::errors::classify(
+            &worker
+                .start_sending("p", "desk", updated.job.id, &updated.receipt)
+                .unwrap_err()
+        )
+        .1,
+        "delivery_changed"
+    );
+    drop(worker);
+    let worker = Board::open(&path)?;
+    assert_eq!(
+        worker.queue_item("p", "desk", lease.job.id)?.state,
+        "skipped"
+    );
+    assert!(
+        worker
+            .take_source_delivery("p", "desk", Direction::Out, 60)?
+            .is_none()
+    );
+    assert!(worker.source_copies("p", "desk", note.id)?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn queued_platform_status_notes_keep_fenced_examples_as_prose() -> anyhow::Result<()> {
+    let b = Board::memory()?;
+    b.create_source("p", "desk", Provider::Local, "external", "work")?;
+    for source in ["board", "desk"] {
+        board_local::automation::add_watcher(
+            &b,
+            source,
+            Filter {
+                from: Some(source.to_owned()),
+                by: Some("@[source:desk/42]".into()),
+                ..Default::default()
+            },
+            Some("message.posted"),
+        )?;
+    }
+    let head = input("1", "T", "root", None, "opened");
+    let mut status = input("2", "T", "closed", Some("root"), "");
+    let external = "```json#unpublished@1\nnot json\n```";
+    status.import.change = Change::Signal {
+        conditions: Default::default(),
+        set: BTreeMap::from([("status".to_owned(), "closed".to_owned())]),
+        unset: Vec::new(),
+        reply: Some(external.into()),
+    };
+    b.enqueue_imports("p", "desk", &[head, status], None)?;
+    assert_eq!(b.drain_source_report("p", "desk", 10)?.applied, 2);
+    let root = b.find_source("p", "desk", "T", None)?.unwrap();
+    let reply = b.find_source("p", "desk", "T", Some("closed"))?.unwrap();
+    assert_eq!(root.labels["status"], "closed");
+    assert_eq!(reply.re, Some(root.id));
+    assert_eq!(reply.text, external);
+    assert!(reply.blocks.is_empty());
+    assert!(
+        b.reply(root.id, "local-user", external, &Default::default())
+            .is_err()
+    );
+    // Binding external origin replaces the first, provisional snapshot in the write.
+    assert!(board_local::automation::next_event(&b, "board")?.is_none());
+    for expected in [root.id, reply.id] {
+        let e = board_local::automation::next_event(&b, "desk")?.unwrap();
+        assert_eq!(e.message.unwrap().id, expected);
+        board_local::automation::ack_event(&b, "desk", e.cursor)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_fresh_platform_edit_replaces_identical_local_data_with_prose_but_a_replay_does_not()
+-> anyhow::Result<()> {
+    let b = Board::memory()?;
+    b.register_schema_as(
+        "metric",
+        1,
+        "",
+        &json!({"type":"object","properties":{"value":{"type":"integer"}}}),
+        "admin",
+    )?;
+    b.create_source("p", "desk", Provider::Local, "external", "work")?;
+    let seed = input("seed", "T", "head", None, "incoming");
+    let root = b.import_source("p", "desk", &seed)?;
+    let text = "```json#metric@1\n{\"value\":42}\n```";
+    for (index, change) in [
+        Change::Edit { text: text.into() },
+        Change::Upsert {
+            text: text.into(),
+            labels: Default::default(),
+        },
+        Change::Reconcile {
+            text: text.into(),
+            labels: Default::default(),
+            owns: vec![],
+            reset: Default::default(),
+            existing_only: true,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let local = b.edit(root.id, &root.actor, text, None)?;
+        assert_eq!(local.blocks.len(), 1);
+        let observed = b.cursor()?;
+        assert_eq!(
+            b.import_source("p", "desk", &seed)?.revision,
+            local.revision
+        );
+        assert_eq!(b.cursor()?, observed);
+        let mut update = seed.clone();
+        update.key = format!("change-{index}");
+        update.import.change = change;
+        let incoming = b.import_source("p", "desk", &update)?;
+        assert!(
+            incoming.blocks.is_empty(),
+            "platform change {index} left a locally trusted block"
+        );
+        assert_eq!(incoming.text, text);
+        assert!(incoming.revision > local.revision);
+        let head = b.cursor()?;
+        assert_eq!(
+            b.import_source("p", "desk", &update)?.revision,
+            incoming.revision
+        );
+        assert_eq!(b.cursor()?, head);
+        update.key.push_str("-another-delivery");
+        assert_eq!(
+            b.import_source("p", "desk", &update)?.revision,
+            incoming.revision
+        );
+    }
+    Ok(())
 }
 
 #[test]

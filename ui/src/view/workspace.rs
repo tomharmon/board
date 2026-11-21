@@ -97,23 +97,26 @@ pub(super) fn field(
     write: fn(&mut State) -> &mut TextEdit,
     multi: bool,
 ) -> El {
-    let mut input = text_input(value, font(13.0, 400.0))
+    let mut input = text_input(value, font(13.0, 400.0).lh(18.))
         .key(key)
         .label(name)
         .on_edit(write)
         .w_full()
         .color(c(INK))
-        .padding(7.0)
+        .padding(6.0)
+        .px(8.)
+        .border(1., c(if value.focused { DIM } else { CONTROL }))
+        .radius(4.)
         .fill(c(TINT));
     if multi {
         input = input.h(72.0);
     } else {
-        input = input.single_line().h(30.0);
+        input = input.single_line().h(32.0);
     }
     col()
         .w_full()
         .gap(3.0)
-        .child(label(name, 11.0, 400.0, MUTED))
+        .child(label(name, 12.0, 500.0, MUTED))
         .child(input)
 }
 

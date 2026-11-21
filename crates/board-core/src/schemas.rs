@@ -34,6 +34,29 @@ impl Schema {
     }
 }
 
+/// Before v14, imported text was incorrectly promoted to typed data. Its original
+/// text and immutable event records stay untouched; only correct the derived views.
+pub(crate) fn migrate_imported_blocks(c: &Connection) -> Result<()> {
+    c.execute_batch("CREATE TABLE IF NOT EXISTS legacy_platform_revisions(message INTEGER PRIMARY KEY,through INTEGER NOT NULL);
+        INSERT OR IGNORE INTO legacy_platform_revisions
+            SELECT m.id,m.revision FROM messages m WHERE EXISTS(SELECT 1 FROM sync_copies cp WHERE cp.message=m.id AND cp.origin=1);
+        UPDATE messages SET blocks='[]' WHERE blocks!='[]' AND EXISTS(
+            SELECT 1 FROM legacy_platform_revisions fix WHERE fix.message=messages.id AND messages.revision<=fix.through);")?;
+    Ok(())
+}
+pub(crate) fn correct_snapshot(c: &Connection, m: &mut crate::Message) -> Result<()> {
+    if !m.blocks.is_empty()
+        && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM legacy_platform_revisions WHERE message=? AND through>=?)",
+            params![m.id, m.revision],
+            |r| r.get::<_, bool>(0),
+        )?
+    {
+        m.blocks.clear();
+    }
+    Ok(())
+}
+
 pub(crate) fn init(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS schema_origins(
         name TEXT NOT NULL,version INTEGER NOT NULL,builtin INTEGER NOT NULL,actor TEXT,at TEXT,
@@ -194,6 +217,34 @@ fn distinct_names(xs: &[Value], valid: impl Fn(&str) -> bool) -> bool {
         .all(|v| v.as_str().is_some_and(|s| valid(s) && seen.insert(s)))
 }
 
+// JSON has a single number type. Compare integral doubles to an integer without
+// rounding the integer through f64 (which would merge distinct IDs above 2^53).
+fn same_definition(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Number(l), Value::Number(r)) if l.is_f64() != r.is_f64() => {
+            let (float, int) = if l.is_f64() { (l, r) } else { (r, l) };
+            let Some(n) = float.as_f64() else {
+                return false;
+            };
+            n.fract() == 0.0
+                && int
+                    .as_i64()
+                    .map(i128::from)
+                    .or_else(|| int.as_u64().map(i128::from))
+                    == Some(n as i128)
+        }
+        (Value::Array(l), Value::Array(r)) => {
+            l.len() == r.len() && l.iter().zip(r).all(|(x, y)| same_definition(x, y))
+        }
+        (Value::Object(l), Value::Object(r)) => {
+            l.len() == r.len()
+                && l.iter()
+                    .all(|(k, v)| r.get(k).is_some_and(|u| same_definition(v, u)))
+        }
+        _ => a == b,
+    }
+}
+
 fn check_definition(schema: &Value) -> Result<()> {
     ensure!(
         schema.get("type").and_then(Value::as_str) == Some("object"),
@@ -306,7 +357,7 @@ impl Board {
                 .optional()?
             {
                 ensure!(
-                    d == description && serde_json::from_str::<Value>(&def)? == *schema,
+                    d == description && same_definition(&serde_json::from_str::<Value>(&def)?,schema),
                     Conflict.error("schema_immutable", "register a new version")
                 );
                 return Ok(false);

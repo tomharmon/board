@@ -119,6 +119,8 @@ fn sidebar(s: &State, drawer: bool, width: f32) -> El {
                         .on_press_tx(|s: &mut State, tx| {
                             s.browse.channel_name.clear();
                             s.browse.adding_channel = true;
+                            s.browse.private_channel = false;
+                            s.refresh();
                             tx.focus_when_shown("new-channel-name", true);
                         }),
                 ),
@@ -157,6 +159,39 @@ fn sidebar(s: &State, drawer: bool, width: f32) -> El {
                         .on_press(State::add_channel),
                 ),
         );
+        if s.desk.access.registry() {
+            items = items.child(
+                rune_kit::Checkbox::new(s.browse.private_channel)
+                    .label("Private channel")
+                    .on_toggle(|s: &mut State| s.browse.private_channel = !s.browse.private_channel)
+                    .build(&Kit::neutral(dark()))
+                    .key("new-channel-private"),
+            );
+            if s.browse.private_channel {
+                items = items.child(
+                    label(
+                        "Restricted to you and your profiles through credentials.",
+                        11.,
+                        400.,
+                        MUTED,
+                    )
+                    .w_full()
+                    .px(8.)
+                    .wrap_anywhere(),
+                );
+                items = items.child(
+                    label(
+                        "Anyone with direct access to the database can still read it.",
+                        11.,
+                        400.,
+                        MUTED,
+                    )
+                    .w_full()
+                    .px(8.)
+                    .wrap_anywhere(),
+                );
+            }
+        }
     }
     let mut groups = BTreeSet::from([String::new()]);
     for channel in &s.channels {
@@ -502,6 +537,22 @@ fn header(s: &State, narrow: bool, detail: Option<i64>) -> El {
     } else {
         bar = bar
             .child(el().grow(1.0))
+            .child(
+                tool("zoom-out", "Zoom out", &icons::MINUS)
+                    .disabled(!s.can_zoom(false))
+                    .on_press(|s: &mut State| s.zoom_step(-1)),
+            )
+            .child(
+                click(row().key("zoom-reset").w(42.).h(28.).center(), "Reset zoom")
+                    .help("Reset window zoom")
+                    .child(mono(format!("{}%", s.layout.zoom_percent), DIM))
+                    .on_press(|s: &mut State| s.zoom_step(0)),
+            )
+            .child(
+                tool("zoom-in", "Zoom in", &icons::PLUS)
+                    .disabled(!s.can_zoom(true))
+                    .on_press(|s: &mut State| s.zoom_step(1)),
+            )
             .child(tool("back-to-feed", "Back", &glyphs::CLOSE).on_press(State::back));
     }
     bar

@@ -240,7 +240,7 @@ impl State {
         let actor = self.actor.clone();
         let generation = std::sync::Arc::downgrade(&self.delivery.instance);
         let (root, target, no_sync) = (self.edits_root(), self.reply_to, self.delivery.no_sync);
-        let channel = self.destination.text.clone();
+        let channel = self.root_channel().to_owned();
         tx.open_file(
             FileDialogOptions {
                 title: "Attach file".into(),
@@ -254,7 +254,7 @@ impl State {
                         && s.actor == actor
                         && s.edits_root() == root
                         && s.reply_to == target
-                        && (!root || s.destination.text == channel)
+                        && (!root || s.root_channel() == channel)
                         && s.delivery.no_sync == no_sync
                         && s.properties.is_none() =>
                 {
@@ -263,7 +263,7 @@ impl State {
                             let db = s.db()?;
                             db.activity_seen(&s.actor)?;
                             let destination = if root {
-                                channel.trim().to_owned()
+                                channel.clone()
                             } else if let Some(id) = page.thread_id() {
                                 db.get(target.unwrap_or(id))?.channel
                             } else {

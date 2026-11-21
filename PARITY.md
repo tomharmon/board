@@ -14,6 +14,7 @@ show what the previous checklist missed.
 | Reference contract | Local design | Executable proof (test name) |
 | --- | --- | --- |
 | One thread, precise reply target, create channel on first use | A post's event cursor is its stable ID; root and parent links; hierarchical paths and per-channel counts | [message_workflow_profiles_attachments_and_tombstones](crates/board-core/tests/messages.rs); [composer_search_individual_reply_and_reaction](ui/tests/inspector.rs) |
+| Create a private empty subtree without changing someone else's channel | Family allowance, everyone lock, channel and events commit together. Existing names, descendants or overlapping grants conflict. | [Race and rollback](crates/board-core/tests/private_channels.rs); [client comparison against original](scripts/compare-private-channels.mjs) |
 | Attributed people/profiles, files, reactions, labels, blocks and tombstones | Author/owner checks; SQLite BLOBs; immutable, locally validated schemas; revision separate from version | [local_blocks_are_immutable_and_validate_posts_and_edits](crates/board-core/tests/messages.rs); [resources_have_locations_statuses_and_replay_safe_writes](crates/board-api/src/tests.rs) |
 | Retry without duplicates; conditional revision, labels and newest reply | Board-wide key bound to author and exact placement, with comparisons inside the same immediate write transaction | [a_key_binds_to_the_exact_actor_and_placement_not_a_request_body and concurrency tests](crates/board-core/tests/messages.rs) |
 | Mutation and event either both commit or neither does | Snapshot of the affected message captured in the transaction; events ordered by SQLite | [fault_during_event_snapshot_rolls_back_post_and_attachments](crates/board-core/tests/messages.rs); [failed_schedule_commit_retries_once_even_with_competing_workers](crates/board-core/tests/automation_delivery.rs) |
@@ -65,17 +66,22 @@ every workspace member and the real-clock lease test, not only the default
 CLI build. `board conformance` is a separate seven-invariant smoke check on
 a fresh temporary board. It is not a replacement for the full tests.
 
-Exact release-suite invocation (including the native inspector and the slow
+Unsharded release-suite command (including the native inspector and the slow
 lease test):
 
 ```sh
-cargo +stable test --offline --locked --release -j 4 --workspace -- --include-ignored --test-threads=3
+cargo +stable build --offline --locked --release -j 4 --workspace --bins
+BOARD_UI_TEST_CLI="$PWD/target/release/board" cargo +stable test --offline --locked --release -j 4 --workspace -- --include-ignored --test-threads=3
 ```
 
-The locked release-profile workspace run on **2026-11-21 passed 250 tests**, with none
-ignored: 119 core/storage, 24 CLI/process, 22 REST, 25 provider protocol,
-and 60 native UI (58 scripted inspector cases, a Rune clipboard test and a
-media-container check).
+The locked release-profile workspace tests on **2026-11-21 passed 287 tests**,
+with none ignored: 134 core/storage, 26 CLI/process, 22 REST, 26 provider
+protocol and 79 native UI (74 scripted cases plus 5 binary unit tests).
+The long single invocation was interrupted during rendering; the final run
+used [bounded test groups](docs/REFERENCE-CHECKS.md#bounded-native-test-runs).
+The 74 distinct passing native case names matched the final test executable's
+entire discovered list, with no missing or extra cases. It includes the
+regression that keeps the reading position when the last older page is loaded.
 The [visual audit](docs/INSPECTOR-VISUALS.md) compares actual browser and native
 renders. V11 introduced per-channel, per-identity read marks; v12 backfills
 indexed channel counts, live thread activity and source lookup indexes. A
@@ -83,10 +89,15 @@ populated v11 upgrade is tested against an independent fold of its raw messages;
 upgrading does not advance board events. V13 records the join cursor for
 existing external conversations. An upgrade test opens a populated early
 v12 database, retires an unsent root without erasing delivery history, and
-proves that the later reply remains eligible.
+proves that the later reply remains eligible. V14 separates externally supplied
+prose from native typed blocks and captures new filtered watcher matches at event
+time. Older boards did not record every editor's origin or historical display
+handle; see the [migration limits](docs/CORE-COVERAGE.md) and
+[watcher recovery behavior](docs/WORK-COVERAGE.md).
 Both debug and release binaries built offline. Workspace formatting and
-all-target Clippy with warnings denied passed. A separate locked release
-build of the current CLI from an empty target directory passed the
+all-target Clippy with warnings denied passed. The CLI dependency tree again
+contained no desktop/graphics crates. In the preceding audit (`562e882`),
+a separate locked CLI release build from an empty target directory passed the
 seven-invariant smoke check without compiling Rune or windowing/GPU crates.
 In the earlier workflow audit (`7b6951c`), a clean export also built both
 binaries offline in a separate target directory. An anonymous live pull of
@@ -96,7 +107,8 @@ Slack, Linear and all external writes were tested using local fixtures only.
 
 [Reproduce the reference checks](docs/REFERENCE-CHECKS.md). The original
 SQLite backend and the Rust binary agreed on **40 message/storage/sync
-outcomes and 47 watcher/schedule/task outcomes**, including restart and a
+outcomes, 47 watcher/schedule/task outcomes, 17 private-channel outcomes and
+8 native/platform block outcomes**, including restart and a
 real-clock stale lease. The leased event's attempt number and a
 holder's private renewal response now match. One interface difference is
 explicitly asserted: an exact retry succeeds by default on the local
@@ -104,6 +116,9 @@ idempotent resource. With `--if-pending`, the same successful holder gets
 `no_match`, as it does in the original. Separate pure-contract comparisons
 matched **17 schema definitions, 83 schema values, 13 block inputs,
 16 mention queries, 16 provider tag names, 8 imported handles and 276 reaction spellings**.
+As a separate control, the original unmodified conformance kit reported 86 passed,
+5 skipped and 0 failed against its own local backend, including discovery.
+Those numbers are not counted as Rust passes.
 
 The [round-trip script](scripts/roundtrip.py) also ran from outside the checkout
 with just the two installed release binaries, in a network namespace containing
@@ -115,3 +130,10 @@ element tree. The API and UI exited, then fresh CLI, API and UI processes
 read the same IDs and text. Opening the independent backup returned the same
 root and reply; SQLite's integrity and foreign-key checks were clean. No worker
 was used. Other backup tests cover attachment bytes and watcher state.
+
+The [source settings check](scripts/inspect-source-settings.py) also ran from
+outside the checkout with only loopback. From an empty board, the native UI
+created a GitHub mapping, the standalone CLI read and edited it, and another
+inspector process reopened its settings. Publishing stayed off. The full UI
+suite also checks the Local, Slack and Linear forms, permission loss, conflicting
+edits and compact-screen input. [See the screens](docs/INSPECTOR-VISUALS.md#readability).

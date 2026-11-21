@@ -4,6 +4,34 @@ use board_local::{LabelTerm, automation::Schedule};
 
 const REPLIES: usize = 40;
 
+#[derive(Default)]
+pub struct ReadingEdge {
+    latest: Option<i64>,
+    seen: Option<i64>,
+    scrolled_back: bool,
+}
+
+impl ReadingEdge {
+    pub fn observe(&mut self, latest: Option<i64>) {
+        if latest.is_none() || self.latest.is_none() {
+            self.scrolled_back = false;
+        }
+        self.latest = latest;
+        if !self.scrolled_back {
+            self.seen = latest;
+        }
+    }
+    pub fn show_jump(&self) -> bool {
+        self.scrolled_back && self.latest > self.seen
+    }
+    pub fn visible(&mut self, visible: bool) {
+        self.scrolled_back = !visible;
+        if visible {
+            self.seen = self.latest;
+        }
+    }
+}
+
 #[derive(Default, Clone, Copy, Eq, PartialEq)]
 pub enum Position {
     #[default]
@@ -15,6 +43,7 @@ pub enum Position {
 pub struct Browse {
     pub search_open: bool,
     pub adding_channel: bool,
+    pub private_channel: bool,
     pub channel_name: TextEdit,
     pub filter: Filter,
     pub filter_open: bool,
@@ -31,13 +60,17 @@ pub struct Browse {
     pub older: bool,
     pub newer: bool,
     pub schedules: Vec<Schedule>,
+    pub targets: Vec<board_local::sources::SyncTarget>,
     pub cancel: Option<i64>,
+    pub feed_edge: ReadingEdge,
+    pub thread_edge: ReadingEdge,
 }
 impl Default for Browse {
     fn default() -> Self {
         Self {
             search_open: false,
             adding_channel: false,
+            private_channel: false,
             channel_name: TextEdit::new(""),
             filter: Filter::default(),
             filter_open: false,
@@ -54,7 +87,10 @@ impl Default for Browse {
             older: false,
             newer: false,
             schedules: Vec::new(),
+            targets: Vec::new(),
             cancel: None,
+            feed_edge: ReadingEdge::default(),
+            thread_edge: ReadingEdge::default(),
         }
     }
 }
@@ -66,7 +102,9 @@ impl Browse {
         self.older = false;
         self.newer = false;
         self.schedules.clear();
+        self.targets.clear();
         self.cancel = None;
+        self.thread_edge = ReadingEdge::default();
     }
 
     pub fn read_thread(&mut self, db: &Board, root: i64) -> Result<Vec<Message>> {
@@ -123,9 +161,33 @@ impl Browse {
     }
 }
 impl State {
+    pub fn copy_destination(&mut self, root: i64, url: &str, tx: &mut Tx) {
+        let result = self.db().and_then(|db| {
+            ensure!(
+                self.page.thread_id() == Some(root) && !db.get(root)?.deleted,
+                "Destination is no longer visible"
+            );
+            ensure!(
+                db.sync_targets(root)?
+                    .targets
+                    .iter()
+                    .any(|t| t.url.as_deref() == Some(url)),
+                "Destination is no longer visible"
+            );
+            Ok(())
+        });
+        match result {
+            Ok(()) => tx.copy(url.to_owned()),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.refresh();
+            }
+        }
+    }
     pub fn reset_feed(&mut self) {
         self.starts.clear();
         self.feed_size = 50;
+        self.browse.feed_edge = ReadingEdge::default();
     }
     pub fn add_channel(&mut self) {
         let name = self
@@ -135,12 +197,17 @@ impl State {
             .trim()
             .trim_start_matches('#')
             .to_owned();
-        match self
-            .db()
-            .and_then(|db| db.create_channel_as(&name, &self.actor))
-        {
+        let result = self.db().and_then(|db| {
+            if self.browse.private_channel {
+                db.create_private_channel(&name, &self.actor).map(|_| ())
+            } else {
+                db.create_channel_as(&name, &self.actor).map(|_| ())
+            }
+        });
+        match result {
             Ok(_) => {
                 self.browse.adding_channel = false;
+                self.browse.private_channel = false;
                 self.select(Some(name));
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -259,5 +326,62 @@ impl State {
         } else if let Some(m) = self.thread.get(1) {
             tx.scroll_into_view(format!("message-{}", m.id));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use board_local::{access::Rules, sources::Provider};
+    use rune::{Env, Runtime, clipboard};
+
+    #[test]
+    fn copying_a_recorded_destination_requires_current_read_access_even_before_poll() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("proof.db");
+        let owner = Board::open(&path).unwrap();
+        let root = owner
+            .post("work", "owner", "Report", &Default::default())
+            .unwrap();
+        let url = "https://example.invalid/archive/42";
+        owner
+            .create_source("owner", "archive", Provider::Local, "audit-room", "work")
+            .unwrap();
+        owner
+            .attach_source("owner", "archive", "t", "note", root.id, Some(url))
+            .unwrap();
+        let grant = owner
+            .set_grant("owner", None, "reader", &Rules::parse("work=read").unwrap())
+            .unwrap();
+        let token = owner
+            .issue_credential("owner", "reader", None, None)
+            .unwrap();
+        let mut db = Board::open(&path).unwrap();
+        db.bind_token(&token.token).unwrap();
+        let mut state = State::opened(Ok((db, Some("reader".to_owned()))));
+        state.go(Page::Thread(root.id));
+        let mut rt = Runtime::new(state, crate::view::view, (1200., 800.), Env::default());
+        let clip = clipboard::memory();
+        rt.use_clipboard(&clip);
+        rt.frame(0.);
+        let (x, y) = rt.find("copy-destination-0").unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.04);
+        assert_eq!(clip.text().unwrap().as_str(), url);
+        clip.set_text("leave alone");
+        owner
+            .set_grant(
+                "owner",
+                Some(grant.id),
+                "reader",
+                &Rules::parse("other=read").unwrap(),
+            )
+            .unwrap();
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(0.08);
+        assert_eq!(clip.text().unwrap().as_str(), "leave alone");
+        assert!(rt.find("copy-destination-0").is_none());
     }
 }

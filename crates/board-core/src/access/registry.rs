@@ -96,7 +96,7 @@ fn grant(c: &Connection, id: i64) -> Result<Grant> {
     })
 }
 
-fn set_on(
+pub(super) fn set_on(
     tx: &Transaction<'_>,
     owner: &str,
     id: Option<i64>,

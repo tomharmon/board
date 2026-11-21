@@ -249,85 +249,158 @@ fn scope(rules: &board_local::access::Rules) -> String {
         .collect::<Vec<_>>()
         .join("    ")
 }
+fn access_subject(s: &mut State, other: bool, focus_actor: bool, tx: &mut Tx) {
+    if other && !s.desk.access.registry() {
+        return;
+    }
+    let review = &mut s.desk.access;
+    review.other = other;
+    review.query = None;
+    review.decision = None;
+    let key = if other && focus_actor {
+        "explain-actor"
+    } else if other {
+        "explain-subject"
+    } else {
+        "explain-self"
+    };
+    tx.focus_when_shown(key, true);
+}
+
+fn subject_switch(other: bool) -> El {
+    let mut group = row()
+        .key("explain-identity")
+        .role("radiogroup")
+        .label("Check permissions for")
+        .focus_group()
+        .h(30.)
+        .padding(2.)
+        .radius(5.)
+        .fill(c(TINT))
+        .border(1., c(CONTROL));
+    for (index, key, name) in [(0, "explain-self", "You"), (1, "explain-subject", "Actor")] {
+        let actor = index == 1;
+        let on = actor == other;
+        let mut segment = click(row().key(key).w(61.).h(24.).center().radius(3.), name)
+            .role("radio")
+            .checked(on)
+            .focus_selected(on)
+            .position_in_set(index + 1, 2);
+        if on {
+            segment = segment.fill(c(BG)).border(1., c(MUTED));
+        }
+        group = group.child(
+            segment
+                .child(label(
+                    name,
+                    13.,
+                    if on { 600. } else { 450. },
+                    if on { INK } else { MUTED },
+                ))
+                .on_press_tx(move |s: &mut State, tx| access_subject(s, actor, true, tx))
+                .on_key(|s: &mut State, k, tx| match k.key {
+                    Key::Left | Key::Right => {
+                        access_subject(s, !s.desk.access.other, false, tx);
+                        true
+                    }
+                    _ => false,
+                }),
+        );
+    }
+    group
+}
+
 fn explainer(s: &State) -> El {
     let a = &s.desk.access;
-    let check = action("explain-access", "explain", true)
-        .disabled(
-            a.fields.channel.text.trim().is_empty()
-                || (a.other && a.fields.name.text.trim().is_empty()),
-        )
-        .on_press(State::explain_access);
+    let enabled = !a.fields.channel.text.trim().is_empty()
+        && (!a.other || !a.fields.name.text.trim().is_empty());
+    let check = click(
+        row()
+            .key("explain-access")
+            .h(30.)
+            .px(12.)
+            .gap(7.)
+            .center()
+            .radius(4.)
+            .border(1., c(if enabled { INK } else { CONTROL }))
+            .fill(c(if enabled { INK } else { BG })),
+        "Explain access",
+    )
+    .child(icon(&glyphs::SEARCH, 13.).color(c(if enabled { BG } else { FAINT })))
+    .child(label(
+        "Explain",
+        13.,
+        550.,
+        if enabled { BG } else { FAINT },
+    ))
+    .disabled(!enabled)
+    .on_press(State::explain_access);
     let input = |edit: &TextEdit,
-                 key: &str,
+                 key: &'static str,
                  title: &str,
                  prompt: &str,
+                 prefix: Option<&str>,
                  write: fn(&mut State) -> &mut TextEdit| {
-        text_input(edit, font(12.0, 400.0))
-            .key(key)
-            .label(title)
-            .single_line()
-            .w(158.0)
-            .max_w(200.0)
-            .h(28.0)
-            .placeholder(prompt, c(FAINT))
-            .color(c(INK))
-            .fill(c(TINT))
-            .px(7.0)
+        let editor = short_input(edit, key, title, prompt)
             .on_edit(write)
             .on_input_key(|s: &mut State, k, _| {
-                if k.key == Key::Enter {
+                if k.key == Key::Enter
+                    && s.desk.access.fields.channel.preedit().is_none()
+                    && s.desk.access.fields.name.preedit().is_none()
+                {
                     s.explain_access();
                     true
                 } else {
                     false
                 }
-            })
+            });
+        short_field(key, edit, prefix, editor).w(174.)
     };
-    let mut out = col()
-        .w_full()
-        .gap(5.0)
-        .pt(6.0)
-        .child(mono("explain", FAINT));
+    let labeled = |name: &str, child: El| {
+        col()
+            .gap(5.)
+            .child(label(name, 12., 500., MUTED))
+            .child(child)
+    };
+    let mut out =
+        col()
+            .w_full()
+            .gap(10.0)
+            .pt(10.0)
+            .child(label("Check permissions", 15., 600., INK));
     let mut controls = row()
         .w_full()
-        .gap(4.0)
+        .gap(12.0)
         .flex_wrap()
         .center_y()
-        .child(input(
-            &a.fields.channel,
-            "explain-channel",
-            "Channel to explain",
-            "#channel",
-            |s| &mut s.desk.access.fields.channel,
-        ))
-        .child(mono("for", MUTED))
-        .child(
-            action("explain-self", "you", !a.other).on_press(|s: &mut State| {
-                s.desk.access.other = false;
-                s.desk.access.query = None;
-                s.desk.access.decision = None;
-            }),
-        );
-    if a.registry() {
-        controls = controls.child(action("explain-subject", "actor", a.other).on_press_tx(
-            |s: &mut State, tx| {
-                s.desk.access.other = true;
-                s.desk.access.query = None;
-                s.desk.access.decision = None;
-                tx.focus_when_shown("explain-actor", true);
-            },
+        .child(labeled(
+            "Channel",
+            input(
+                &a.fields.channel,
+                "explain-channel",
+                "Channel to explain",
+                "channel",
+                Some("#"),
+                |s| &mut s.desk.access.fields.channel,
+            ),
         ));
+    if a.registry() {
+        controls = controls.child(labeled("For", subject_switch(a.other)));
     }
     if a.other && a.registry() {
-        controls = controls.child(input(
-            &a.fields.name,
-            "explain-actor",
-            "Person or profile to explain",
-            "name or profile",
-            |s| &mut s.desk.access.fields.name,
+        controls = controls.child(labeled(
+            "Actor",
+            input(
+                &a.fields.name,
+                "explain-actor",
+                "Person or profile to explain",
+                "name or profile",
+                None,
+                |s| &mut s.desk.access.fields.name,
+            ),
         ));
     }
-    out = out.child(controls.child(check));
+    out = out.child(controls.child(col().h(50.).justify_end().child(check)));
     if let (Some((who, ch, _)), Some(d)) = (&a.query, &a.decision) {
         let mut result = format!("@{who}  #{ch}  {}", actions(&d.actions));
         if let Some(level) = &d.level {

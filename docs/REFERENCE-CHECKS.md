@@ -26,8 +26,11 @@ audit=$(mktemp -d)
 cp -R "$ref/packages/board/src" "$audit/src"
 npm install --prefix "$audit" --ignore-scripts --no-audit --no-fund \
   zod@4.6.5 experimental-a2@0.24.0 ajv@8.17.1 ajv-formats@2.1.1
+node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/run-reference-conformance.mjs "$audit"
 node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/compare-workflows.mjs "$audit" "$bin"
 node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/compare-work.mjs "$audit" "$bin" --expiry
+node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/compare-private-channels.mjs "$audit" "$bin"
+node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/compare-platform-blocks.mjs "$audit" "$bin"
 ```
 
 Both workflow scripts call real original backend methods and real Rust
@@ -39,6 +42,20 @@ work script separately asserts one default response difference: repeating an ack
 for the idempotent local resource rather than `no_match`. The slow case waits for an actual lease
 to expire. These comparisons do **not** certify wire compatibility, every
 possible input, or the operation of a third-party account.
+
+As a control, `run-reference-conformance.mjs` runs the unmodified original conformance
+kit **against the original backend**, not Board's REST API. With one local person,
+real profile/narrowing headers and no hosted account, the original reported **86 passed,
+5 skipped, 0 failed**. Its 91 results include the discovery handshake as well as the
+90 statically inventoried cases. It prints each skip's reason.
+
+The private-channel check additionally invokes the original client against the original HTTP
+handler, supplying two synthetic local identities, not an external login. It compares 17 outcomes:
+parent and sibling profiles, someone else's access at the root and below it, whole-path
+versus sibling matching, and conflict behavior before any grants are changed. The platform-block
+check sends the same four schema-shaped texts through a native post and an external import:
+native content is validated, while external content remains literal. Rust-only tests separately
+cover competing writers, transaction rollback, provider edits and upgrades of older databases.
 
 ## Prove local operation
 
@@ -59,3 +76,22 @@ waits for an already-open Rune inspector, closes the clients and verifies
 the fresh processes and a separately opened backup. The two PNGs and Rune
 element trees are kept alongside the disposable DB. On a machine with a
 different software driver, set `VK_DRIVER_FILES` to its local ICD manifest.
+
+## Bounded native test runs
+
+The normal release workspace command is in [PARITY](../PARITY.md#verification-record).
+For runners with a per-job wall-clock limit, split native rendering without dropping
+tests. Build the release binaries first. Run the non-UI workspace and the native
+binary's unit tests, then run the native integration cases in bounded batches:
+
+```sh
+export RUSTUP_TOOLCHAIN=stable
+cargo build --release --offline --locked -j 4 --workspace --bins
+cargo test --release --offline --locked -j 4 --workspace --exclude board-ui -- --include-ignored
+cargo test --release --offline --locked -j 4 -p board-ui --bin board-ui -- --include-ignored
+python3 scripts/test-inspector.py
+```
+
+Alternatively run `python3 scripts/test-inspector.py --shard N --shards 12` for **every**
+N from 1 through 12. The script discovers tests from Cargo's built executable and
+partitions exact test names; it never silently skips a case marked ignored.

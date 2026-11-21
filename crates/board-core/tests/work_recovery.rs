@@ -577,5 +577,69 @@ fn delegated_watchers_use_private_names_and_recheck_both_registered_and_pulling_
     assert_eq!(bo_event.cursor, b.id);
     assert_ne!(bo_event.cursor, hidden.id);
     assert!(get_watcher(&ada, "jobs")?.cursor >= a.id);
+    // A broader grant at first pull must not retrospectively create matches.
+    owner.post(
+        "work/b",
+        "human",
+        "not readable when posted",
+        &Default::default(),
+    )?;
+    owner.set_grant("owner", Some(grant.id), "ada/triage", &full)?;
+    let newly_readable = owner.post("work/b", "human", "readable now", &Default::default())?;
+    assert_eq!(
+        lease_event(&ada, "jobs", 60)?.unwrap().event.cursor,
+        newly_readable.id
+    );
+    Ok(())
+}
+
+#[test]
+fn loss_of_board_admission_fences_a_due_schedule_and_offline_watcher_even_with_everyone_grants()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("admission.db");
+    let owner = Board::open(&path)?;
+    let rules = Rules::parse("work/=read,post")?;
+    owner.set_grant("owner", None, "*", &rules)?;
+    let admission = owner.set_grant("owner", None, "triage", &rules)?;
+    let issued = owner.issue_credential("owner", "triage", None, None)?;
+    let mut client = Board::open(&path)?;
+    client.bind_token(&issued.token)?;
+    add_watcher_as(
+        &client,
+        "triage",
+        "events",
+        board_local::Filter::default(),
+        Some("message.posted"),
+    )?;
+    let later = schedule(
+        &client,
+        "triage",
+        Destination::Channel("work/inbox"),
+        "must not fire",
+        Timing {
+            due: chrono::Utc::now().timestamp(),
+            every: None,
+            times: None,
+            until: None,
+        },
+        Default::default(),
+    )?;
+    owner.revoke_grant("owner", admission.id)?;
+    assert_eq!(classify(&client.cursor().unwrap_err()).1, "no_access");
+    owner.post(
+        "work/inbox",
+        "owner",
+        "outside membership",
+        &Default::default(),
+    )?;
+    assert_eq!(dispatch_due(&owner)?, 0);
+    assert_eq!(get_schedule(&owner, later.id)?.state, "revoked");
+    owner.set_grant("owner", None, "triage", &rules)?;
+    let admitted = owner.post("work/inbox", "owner", "admitted again", &Default::default())?;
+    assert_eq!(
+        lease_event(&client, "events", 30)?.unwrap().event.cursor,
+        admitted.id
+    );
     Ok(())
 }

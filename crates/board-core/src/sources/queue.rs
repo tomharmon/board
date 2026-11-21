@@ -196,7 +196,7 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
     if job.payload["event"] == "source.response" {
         if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_threads t JOIN messages m ON m.id=t.root LEFT JOIN private_messages p ON p.id=m.id WHERE t.source=? AND t.thread=? AND (p.id IS NOT NULL OR m.deleted))",params![source.name,job.thread],|r|r.get::<_,bool>(0))?{return Ok(true);}
         tx.execute(
-            "UPDATE sync_queue SET state='skipped',error='thread no longer shareable' WHERE id=?",
+            "UPDATE sync_queue SET state='skipped',error='thread no longer shareable',receipt=NULL,deadline=NULL WHERE id=?",
             [id],
         )?;
         return Ok(false);
@@ -249,7 +249,7 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
             "thread.start" | "message.posted" | "message.edited" | "file.note"
         )
     {
-        match render::body(tx, source, &job.thread, &m) {
+        match render::outbound(tx, source, &job.thread, &m) {
             Ok(text) => {
                 if d.event == "message.edited" && last.as_deref() == Some(&text) {
                     current = false;
@@ -258,7 +258,7 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
             }
             Err(e) => {
                 tx.execute(
-                    "UPDATE sync_queue SET state='failed',error=? WHERE id=?",
+                    "UPDATE sync_queue SET state='failed',error=?,receipt=NULL,deadline=NULL WHERE id=?",
                     params![e.to_string(), id],
                 )?;
                 Board::event_tx(
@@ -274,7 +274,7 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
     }
     if private || !current {
         tx.execute(
-            "UPDATE sync_queue SET state='skipped',error='superseded before delivery' WHERE id=?",
+            "UPDATE sync_queue SET state='skipped',error='superseded before delivery',receipt=NULL,deadline=NULL WHERE id=?",
             [id],
         )?;
         if d.event == "thread.start" {
@@ -448,10 +448,11 @@ fn complete(
                 mapping::bind(tx, s, target, &r.external, &m, false, r.url.as_deref())?;
                 if matches!(
                     d.event.as_str(),
-                    "thread.start" | "message.posted" | "message.edited"
+                    "thread.start" | "message.posted" | "message.edited" | "file.note"
                 ) {
                     tx.execute("INSERT INTO sync_rendered VALUES(?,?,?,?) ON CONFLICT(source,thread,message) DO UPDATE SET text=excluded.text",params![s.name,target,m.id,d.text])?;
-                    if s.settings.mirror_files && !m.deleted && !m.no_sync {
+                    if d.event != "file.note" && s.settings.mirror_files && !m.deleted && !m.no_sync
+                    {
                         for file in &m.attachments {
                             media::queue_asset(tx, s, target, &m, file.id, false)?;
                         }
@@ -571,8 +572,7 @@ impl Board {
     ) -> Result<Vec<i64>> {
         let tx = self.conn.unchecked_transaction()?;
         self.authorized_source(&tx, name, who)?;
-        let rows=tx.prepare("SELECT asset FROM sync_file_notes WHERE source=? AND thread=? AND message=? ORDER BY asset")?
-            .query_map(params![name,thread,id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?;
+        let rows = render::declined_files(&tx, name, thread, id)?;
         tx.commit()?;
         Ok(rows)
     }
@@ -741,6 +741,16 @@ impl Board {
         dir: Direction,
         seconds: i64,
     ) -> Result<Option<Lease>> {
+        self.lease_source_inner(who, name, dir, seconds, false)
+    }
+    fn lease_source_inner(
+        &self,
+        who: &str,
+        name: &str,
+        dir: Direction,
+        seconds: i64,
+        arm_outbound: bool,
+    ) -> Result<Option<Lease>> {
         ensure!(
             (1..=3600).contains(&seconds),
             "lease must be 1..3600 seconds"
@@ -754,12 +764,13 @@ impl Board {
             let Some(id)=id else{return Ok(None)};
             if dir==Direction::Out && !refresh_outbound(tx,&s,id)?{continue;}
             let receipt=Uuid::new_v4().to_string();let deadline=now+seconds;
-            tx.execute("UPDATE sync_queue SET state='leased',attempts=attempts+1,receipt=?,deadline=? WHERE id=?",params![receipt,deadline,id])?;
+            let state=if arm_outbound && dir==Direction::Out { "sending" } else { "leased" };
+            tx.execute("UPDATE sync_queue SET state=?,attempts=attempts+1,receipt=?,deadline=? WHERE id=?",params![state,receipt,deadline,id])?;
             return Ok(Some(Lease{job:get(tx,name,id)?,receipt,deadline}));}})
     }
     /// Commit the intent before an external write. A crash after this point never silently repeats a remote POST.
     pub fn start_sending(&self, who: &str, name: &str, id: i64, receipt: &str) -> Result<()> {
-        self.write(|tx| {
+        let started = self.write(|tx| {
             let s = self.authorized_source(tx, name, who)?;
             let j = check_receipt(tx, name, id, receipt)?;
             ensure!(
@@ -769,9 +780,25 @@ impl Board {
                     "publishing is disabled or the delivery is not newly leased"
                 )
             );
+            if !refresh_outbound(tx,&s,id)? {
+                return Ok(false);
+            }
+            if get(tx,name,id)?.payload != j.payload {
+                // The holder prepared a different body. No remote mutation has been attempted.
+                tx.execute("UPDATE sync_queue SET state='pending',receipt=NULL,deadline=NULL,attempts=attempts-1 WHERE id=?", [id])?;
+                return Ok(false);
+            }
             tx.execute("UPDATE sync_queue SET state='sending' WHERE id=?", [id])?;
-            Ok(())
-        })
+            Ok(true)
+        })?;
+        ensure!(
+            started,
+            Kind::Conflict.error(
+                "delivery_changed",
+                "delivery changed before send; no remote write was armed"
+            )
+        );
+        Ok(())
     }
     /// Hand an external consumer a lease. Returning an outbound receipt arms crash reconciliation.
     pub fn take_source_delivery(
@@ -781,14 +808,7 @@ impl Board {
         dir: Direction,
         seconds: i64,
     ) -> Result<Option<Lease>> {
-        let Some(mut l) = self.lease_source(who, name, dir, seconds)? else {
-            return Ok(None);
-        };
-        if dir == Direction::Out {
-            self.start_sending(who, name, l.job.id, &l.receipt)?;
-            l.job.state = "sending".into();
-        }
-        Ok(Some(l))
+        self.lease_source_inner(who, name, dir, seconds, true)
     }
     pub fn finish_source(
         &self,

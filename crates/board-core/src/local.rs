@@ -1,5 +1,19 @@
 //! Local defaults shared by the CLI, worker, and native inspector.
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
+
+impl crate::Board {
+    /// The actual main database opened by SQLite, not a guess based on current
+    /// environment settings. In-memory and non-UTF-8 filenames have no text path.
+    pub fn database_file(&self) -> Option<&Path> {
+        self.conn
+            .path()
+            .map(Path::new)
+            .filter(|path| path.is_absolute())
+    }
+}
 
 fn var(key: &str) -> Option<String> {
     env::var(key).ok().filter(|s| !s.trim().is_empty())
@@ -38,7 +52,9 @@ pub fn named_database_path(name: &str) -> PathBuf {
     board_dir().join("boards").join(format!("{stem}.sqlite3"))
 }
 pub fn database_path() -> PathBuf {
-    if let Some(path) = var("BOARD_DB") {
+    if let Some(path) = env::var_os("BOARD_DB")
+        .filter(|p| !p.is_empty() && p.to_str().is_none_or(|s| !s.trim().is_empty()))
+    {
         return path.into();
     }
     if let Some(name) = var("BOARD_NAME") {

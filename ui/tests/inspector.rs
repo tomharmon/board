@@ -18,12 +18,20 @@ use tempfile::TempDir;
 mod composing;
 #[path = "inspector/picker.rs"]
 mod picker;
+#[path = "inspector/presentation.rs"]
+mod presentation;
+#[path = "inspector/reading.rs"]
+mod reading;
+#[path = "inspector/source_settings.rs"]
+mod source_settings;
 #[path = "inspector/task_conversation.rs"]
 mod task_conversation;
 #[path = "inspector/video.rs"]
 mod video;
 #[path = "inspector/work_views.rs"]
 mod work_views;
+#[path = "inspector/zoom.rs"]
+mod zoom;
 
 // Each shipped binary creates a whole graphics device, including a software
 // renderer's thread pool on CPU-only builders. Bound those devices independently
@@ -87,6 +95,7 @@ impl Fixture {
             .env("BOARD_USER", "reader")
             .env("BOARD_UI_THEME", "light")
             .env_remove("BOARD_PROFILE")
+            .env_remove("BOARD_AVATAR")
             .env_remove("BOARD_TOKEN")
             .env("RUNE_DIRS_ROOT", self.dir.path().join("rune"))
             .arg("--script")

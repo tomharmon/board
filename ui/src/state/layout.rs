@@ -9,7 +9,10 @@ pub struct Layout {
     pub sidebar: f32,
     pub thread: f32,
     pub collapsed: bool,
+    pub zoom_percent: u16,
 }
+
+const ZOOM: &[u16] = &[85, 100, 110, 125, 150];
 
 impl Default for Layout {
     fn default() -> Self {
@@ -17,6 +20,7 @@ impl Default for Layout {
             sidebar: 224.0,
             thread: 440.0,
             collapsed: false,
+            zoom_percent: 100,
         }
     }
 }
@@ -38,6 +42,9 @@ impl Layout {
             .unwrap_or_default();
         layout.sidebar = layout.sidebar.clamp(180.0, 400.0);
         layout.thread = layout.thread.clamp(320.0, 4096.0);
+        if !ZOOM.contains(&layout.zoom_percent) {
+            layout.zoom_percent = 100;
+        }
         layout
     }
 
@@ -51,5 +58,34 @@ impl Layout {
         serde_json::to_writer(file.as_file_mut(), self)?;
         file.persist(path)?;
         Ok(())
+    }
+}
+
+impl super::State {
+    pub fn zoom_step(&mut self, delta: i8) {
+        let index = ZOOM
+            .iter()
+            .position(|n| *n == self.layout.zoom_percent)
+            .unwrap_or(1);
+        let next = if delta == 0 {
+            100
+        } else {
+            ZOOM[index
+                .saturating_add_signed(isize::from(delta))
+                .min(ZOOM.len() - 1)]
+        };
+        if self.layout.zoom_percent != next {
+            self.layout.zoom_percent = next;
+            if let Err(err) = self.layout.save() {
+                self.error = Some(format!("Could not save window zoom: {err}"));
+            }
+        }
+    }
+    pub fn can_zoom(&self, more: bool) -> bool {
+        if more {
+            Some(&self.layout.zoom_percent) != ZOOM.last()
+        } else {
+            Some(&self.layout.zoom_percent) != ZOOM.first()
+        }
     }
 }

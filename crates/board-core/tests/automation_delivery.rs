@@ -17,6 +17,95 @@ fn due() -> Timing {
 }
 
 #[test]
+fn offline_watchers_match_author_families_and_canonical_mentions_at_the_event_not_at_pull()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("matches.db");
+    let b = Board::open(&path)?;
+    b.set_actor_profile("person-7", "lead", "Jules")?;
+    b.set_actor_profile("person-9", "reviewer", "Ari")?;
+    let f = Filter {
+        by: Some("lead".into()),
+        mentions: Some("reviewer".into()),
+        channel: Some("work".into()),
+        ..Default::default()
+    };
+    add_watcher(&b, "review", f.clone(), Some("message.posted"))?;
+    let accepted = b.post(
+        "work",
+        "person-7/agent",
+        "review @[person-9]",
+        &Default::default(),
+    )?;
+    assert_eq!(
+        b.event_page(0, 10, &f, Some("message.posted"))?.1[0]
+            .message
+            .as_ref()
+            .unwrap()
+            .id,
+        accepted.id
+    );
+    b.set_actor_profile("person-7", "retired", "Jules")?;
+    b.set_actor_profile("person-9", "away", "Ari")?;
+    b.post(
+        "work",
+        "person-7/agent",
+        "not this @[person-9]",
+        &Default::default(),
+    )?;
+    b.set_actor_profile("person-11", "lead", "Jo")?;
+    b.set_actor_profile("person-12", "reviewer", "Mira")?;
+    let next = b.post(
+        "work",
+        "person-11",
+        "action @[person-12]",
+        &Default::default(),
+    )?;
+    drop(b);
+    let resumed = Board::open(path)?;
+    for expected in [accepted.id, next.id] {
+        let offer = lease_event(&resumed, "review", 60)?.expect("durable event-time handle match");
+        assert_eq!(offer.event.message.as_ref().unwrap().id, expected);
+        ack_delivery(&resumed, "review", offer.event.cursor, Some(&offer.receipt))?;
+    }
+    assert!(lease_event(&resumed, "review", 60)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn v13_unscanned_identity_filters_use_the_upgrade_directory_without_losing_existing_leases()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("v13.db");
+    let b = Board::open(&path)?;
+    b.set_actor_profile("person-7", "lead", "Jules")?;
+    add_watcher(
+        &b,
+        "review",
+        Filter {
+            by: Some("lead".into()),
+            ..Default::default()
+        },
+        Some("message.posted"),
+    )?;
+    let first = b.post("work", "person-7", "first", &Default::default())?;
+    let lease = lease_event(&b, "review", 30)?.unwrap();
+    assert_eq!(lease.event.cursor, first.id);
+    let unscanned = b.post("work", "person-7", "waiting", &Default::default())?;
+    drop(b);
+    Connection::open(&path)?.execute_batch(
+        "DROP TABLE watcher_filter_hits; DROP TABLE watcher_filter_start; PRAGMA user_version=13;",
+    )?;
+    let b = Board::open(&path)?;
+    ack_delivery(&b, "review", first.id, Some(&lease.receipt))?;
+    assert_eq!(
+        lease_event(&b, "review", 30)?.unwrap().event.cursor,
+        unscanned.id
+    );
+    Ok(())
+}
+
+#[test]
 fn conditional_ack_has_one_winner_and_only_its_proof_can_report_no_match_after_reopen() -> Result<()>
 {
     let dir = tempfile::tempdir()?;

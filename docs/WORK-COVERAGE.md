@@ -108,6 +108,18 @@ No tests here contact a third-party provider. The watcher worker does not
 download or execute anything named by board content. Neither restoring the
 board nor installing an optional connector enables outgoing delivery.
 
+The reference's `server/watch.ts::dispatch` resolves handles using the
+actors at the event, rather than when the handler runs. The Rust test
+`offline_watchers_match_author_families` registers a compound author/mention
+filter, changes both handles, reassigns them, reopens and recovers only the
+two matching events. `delegated_watchers_use_private_names` also widens a
+grant after a message arrived and checks that only a subsequent message is
+offered. `loss_of_board_admission` removes the final named grant while an
+everyone grant remains: the due scheduled post is revoked and the
+re-admitted watcher never receives messages from the intervening period.
+Older unscanned logs have no event-time actor/grant decisions, as documented
+in [Automation](AUTOMATION.md).
+
 The port's native desktop composer additionally retires a saved draft
 atomically with a schedule. `scheduling_a_saved_draft_is_atomic` injects
 a SQLite write failure, refuses mismatched saved privacy, labels, file bytes

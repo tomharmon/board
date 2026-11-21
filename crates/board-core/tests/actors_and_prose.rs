@@ -230,3 +230,44 @@ fn drafts_survive_restart_but_cannot_cross_an_unreadable_thread_or_actor() -> Re
     assert!(client.save_draft("ann/bot", &scope, None).is_err());
     Ok(())
 }
+#[test]
+fn a_named_profile_inherits_its_persons_handle_without_changing_either_identity()
+-> anyhow::Result<()> {
+    let b = Board::memory()?;
+    b.set_actor_profile("person42", "oncall", "On call")?;
+    let m = b.post("notes", "person42/helper", "present", &Default::default())?;
+    let card = m.author.as_ref().unwrap();
+    assert_eq!(
+        (card.handle.as_str(), card.via.as_deref()),
+        ("oncall/helper", Some("oncall"))
+    );
+    assert_eq!(m.actor, "person42/helper");
+    let ping = b.post("notes", "reader", "@oncall/helper", &Default::default())?;
+    assert_eq!(ping.text, "@[person42/helper]");
+    assert_eq!(
+        b.messages(
+            &board_local::Filter {
+                by: Some("oncall/helper".into()),
+                ..Default::default()
+            },
+            1
+        )?[0]
+            .id,
+        m.id
+    );
+    b.set_actor_profile("person42", "dispatch", "Dispatch")?;
+    assert_eq!(b.get(m.id)?.author.unwrap().handle, "dispatch/helper");
+    assert_eq!(b.get(ping.id)?.text, "@[person42/helper]");
+    assert_eq!(b.viewer("person42/helper")?.handle, "dispatch/helper");
+    assert_eq!(
+        b.actor_directory(Some("dispatch/helper"))?[0].id,
+        "person42/helper"
+    );
+    b.set_actor_profile("person42/helper", "team/alias", "Helper")?;
+    assert_eq!(
+        b.get(m.id)?.author.unwrap().handle,
+        "team/alias",
+        "an explicitly configured local profile handle wins"
+    );
+    Ok(())
+}

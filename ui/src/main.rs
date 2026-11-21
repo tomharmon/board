@@ -19,7 +19,13 @@ fn initial() -> State {
 }
 
 fn key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
-    if k.is_command('n') && s.connected() {
+    if k.is_command('=') || k.is_command('+') {
+        s.zoom_step(1);
+    } else if k.is_command('-') {
+        s.zoom_step(-1);
+    } else if k.is_command('0') {
+        s.zoom_step(0);
+    } else if k.is_command('n') && s.connected() {
         view::compose(s, tx);
     } else if k.is_command('l') && s.connected() {
         s.jump_field(tx);
@@ -107,10 +113,17 @@ fn main() {
         }
     }
     rune::set_app_id("org.localboard.Board");
-    rune::run(AppSpec {
+    let app = AppSpec {
         min_size: Some((380.0, 420.0)),
         poll: Some(State::poll),
         on_key: Some(key),
         ..AppSpec::new("Board", (1000.0, 690.0), initial, view::view)
-    });
+    };
+    // Our layout starts at the top of the client area; the OS owns its titlebar.
+    rune::App::new(app)
+        .chrome(rune::Chrome {
+            full_size_content: false,
+            ..rune::Chrome::DEFAULT
+        })
+        .run();
 }

@@ -6,6 +6,32 @@ Linear. Network use is explicit: `sync pull`, `sync preview`, `sync send`,
 the owner-confirmed Slack channel join, status or file transfer. Remote configuration uses a
 repository, channel ID or team key, not a configurable token destination.
 
+## In the inspector
+
+Open **Settings > Sync > Add source**, even on an empty board. Choose
+GitHub, Slack, Linear or Local, name the mapping, then enter the external
+destination and the board channel. A channel need not exist yet. Creating a
+source saves only its local mapping: no account is connected, no import is
+started, and publishing and automatic mirroring are off. The selected source
+shows its inbox/outbox and a copyable command to run explicitly as the same
+identity. The copied command supplies an absolute, quoted `--db` path to
+this database even if the shell defaults to another board; it never copies
+a delegated credential or provider token. Supply the intended actor and
+credentials in your own shell. Use a POSIX shell on Unix or PowerShell on Windows. No command is
+offered for an in-memory database or an unsafe or unrepresentable filename.
+Local streams accept a normalized event file instead of making a network request.
+
+Choose **Settings** inside a source to change publishing and its applicable
+mirror options. GitHub supports selecting issues or pull requests but never
+automatically creates remote roots. Slack supports file mirroring. A second
+confirmation protects publishing changes and disabling file mirroring:
+disabling publishing skips unsent jobs but cannot recall an in-flight
+request. Changes to an open form are refused if another process has already
+changed that source. Provider, remote and board channel are fixed identities
+for saved receipts; to change routing, disable publishing and create a new
+mapping under a different name. There is no destructive delete operation.
+The inspector has no token field and never runs the copied command.
+
 ## Read first
 
 ```sh
@@ -136,6 +162,12 @@ The renderer never edits the Board message. Label changes only edit a
 confirmed external copy when the rendered body actually changes. Clear it
 with `board sources renderer NAME --clear`. See also [write rules](RULES.md)
 for rejecting an import with an explicit, durable external response.
+
+Before arming a remote write the connector checks that the leased job is
+still shareable and still has the same rendered body, including configured
+bylines and file notes. An edit during a read-only provider check releases
+the old proof and prepares again; a deletion of an unsent post skips it.
+A change after send intent commits cannot recall an in-flight request.
 
 After an ambiguous external write (including a crash after intent was
 recorded), later outgoing work on the same thread waits. The board cannot

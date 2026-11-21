@@ -90,21 +90,37 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
         .w_full()
         .padding(8.0)
         .gap(5.0)
-        .border(1.0, c(EDGE))
-        .border_dash(2.0, 2.0)
+        .border(
+            1.0,
+            c(if t.form.body.focused || t.form.channel.focused {
+                MUTED
+            } else {
+                CONTROL
+            }),
+        )
+        .border_dash(3.0, 2.0)
         .child(
-            text_input(&t.form.channel, font(13.0, 400.0))
-                .key("quick-task-channel")
-                .label("Task channel")
-                .placeholder("#channel", c(FAINT))
+            short_field(
+                "quick-task-channel",
+                &t.form.channel,
+                Some("#"),
+                short_input(
+                    &t.form.channel,
+                    "quick-task-channel",
+                    "Task channel",
+                    "channel",
+                )
                 .on_edit(|s: &mut State| &mut s.desk.task_entry.form.channel)
-                .single_line()
-                .color(c(INK))
-                .fill(c(TINT))
-                .padding(6.0)
-                .h(28.0)
-                .w_full()
-                .max_w(320.0),
+                .on_input_key(|s: &mut State, k, tx| {
+                    if k.key == Key::Enter && s.desk.task_entry.form.channel.preedit().is_none() {
+                        tx.focus_when_shown("quick-task-body", true);
+                        true
+                    } else {
+                        false
+                    }
+                }),
+            )
+            .max_w(320.),
         )
         .child(
             text_input(&t.form.body, font(14.0, 400.0))
@@ -191,7 +207,7 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
                 row().key("new-task").h(28.0).px(4.0).center_y(),
                 "Task details, prerequisites and assignee",
             )
-            .child(mono("needs, for", MUTED))
+            .child(mono("Task details", MUTED))
             .on_press_tx(|s: &mut State, tx| {
                 s.go(Page::NewTask);
                 tx.focus_when_shown("task-body", true)
@@ -199,10 +215,8 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
         )
         .child(el().grow(1.0))
         .child(
-            action("quick-task-send", "start task", true)
-                .fill(c(if ready(s) { INK } else { MUTED }))
+            submit("quick-task-send", "Start task", ready(s))
                 .min_w(99.0)
-                .disabled(!ready(s))
                 .on_press(|s: &mut State| s.create_task(None)),
         );
     col().w_full().px(inset).pb(20.0).child(body.child(footer))
@@ -386,8 +400,7 @@ pub(super) fn new_task(s: &State) -> El {
                 ),
         )
         .child(
-            action("create-task", "Create task", true)
-                .disabled(!ready(s))
+            submit("create-task", "Create task", ready(s))
                 .on_press(|s: &mut State| s.create_task(None)),
         );
     if d.task_entry.reload_needed {
@@ -482,21 +495,21 @@ pub(super) fn list(s: &State, compact: bool) -> El {
             },
         )),
     );
-    let c = &d.criteria;
+    let criteria = &d.criteria;
     let mut terms = Vec::new();
-    if let Some(ch) = &c.channel {
+    if let Some(ch) = &criteria.channel {
         terms.push(format!("#{ch}"));
     }
-    if let Some(o) = &c.owner {
+    if let Some(o) = &criteria.owner {
         terms.push(format!("Owner {o}"));
     }
-    if let Some(a) = &c.assignee {
+    if let Some(a) = &criteria.assignee {
         terms.push(format!("Assignee {a}"));
     }
-    if let Some(n) = c.needs {
+    if let Some(n) = criteria.needs {
         terms.push(format!("Needs #{n}"));
     }
-    for t in &c.label_terms {
+    for t in &criteria.label_terms {
         terms.push(t.values.as_ref().map_or_else(
             || format!("Has {}", t.key),
             |v| format!("{}={}", t.key, v.join("|")),
@@ -506,7 +519,48 @@ pub(super) fn list(s: &State, compact: bool) -> El {
         panel = panel.child(mono(terms.join("   "), MUTED).w_full().wrap_anywhere());
     }
     if d.tasks.is_empty() {
-        panel = panel.child(empty("No matching tasks"));
+        let kind = crate::state::Desk::TASK_STATES[d.task_filter];
+        let title = if !terms.is_empty() {
+            "No tasks match these filters".to_owned()
+        } else if kind == "all" {
+            "No tasks yet".into()
+        } else {
+            format!("No {kind} tasks")
+        };
+        let button = if terms.is_empty() {
+            click(
+                row().key("empty-new-task").h(30.).gap(6.).center_y(),
+                "Create a task",
+            )
+            .child(icon(&icons::PLUS, 15.).color(c(DIM)))
+            .child(label("Create a task", 13., 550., DIM))
+            .on_press_tx(|s: &mut State, tx| {
+                s.go(Page::NewTask);
+                tx.focus_when_shown("task-body", true);
+            })
+        } else {
+            action("empty-clear-task-filters", "Clear filters", false).on_press(|s: &mut State| {
+                s.desk.criteria = Default::default();
+                s.desk.first_page();
+                s.refresh();
+            })
+        };
+        panel = panel.child(
+            col()
+                .key("tasks-empty")
+                .w_full()
+                .py(20.)
+                .gap(6.)
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.)
+                        .center_y()
+                        .child(icon(&icons::LIST_TODO, 18.).color(c(MUTED)))
+                        .child(label(title, 15., 600., INK).grow(1.).wrap_anywhere()),
+                )
+                .child(row().w_full().child(button)),
+        );
     }
     for task in &d.tasks {
         panel = panel.child(task_row(s, task, compact));

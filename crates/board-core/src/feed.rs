@@ -4,6 +4,10 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    rc::Rc,
+};
 
 fn normal(event: &Event) -> bool {
     event.message.is_some()
@@ -127,7 +131,7 @@ impl Board {
     ) -> Result<(i64, Vec<Event>)> {
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
-        let (authors, filters) = expanded(&tx, &a, filter)?;
+        let matcher = EventMatcher::compile(&tx, &a, filter)?;
         let mut pos = after.min(crate::read::cursor_on(&tx)?);
         let mut found = Vec::new();
         'scan: while found.len() < limit {
@@ -139,10 +143,7 @@ impl Board {
                 pos = event.cursor;
                 if (all || normal(&event))
                     && kind.is_none_or(|k| k == event.kind)
-                    && authors.as_ref().is_none_or(|by| {
-                        event.message.as_ref().is_some_and(|m| by.matches(&m.actor))
-                    })
-                    && filters.iter().any(|f| event.matches(f))
+                    && matcher.matches(&event)
                     && let Some(event) = allowed(&tx, &a, event)?
                 {
                     found.push(event);
@@ -164,7 +165,7 @@ impl Board {
         ensure!(count <= 100, "tail history cannot exceed 100 events");
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
-        let (authors, filters) = expanded(&tx, &a, filter)?;
+        let matcher = EventMatcher::compile(&tx, &a, filter)?;
         let head: i64 = tx.query_row("SELECT coalesce(max(cursor),0) FROM events", [], |r| {
             r.get(0)
         })?;
@@ -173,16 +174,13 @@ impl Board {
         while end > 0 && found.len() < count {
             let start = end.saturating_sub(128).max(0);
             let rows = Board::events_on(&tx, start, (end - start) as usize)?;
-            for event in rows.into_iter().rev().filter(|e| {
-                e.cursor <= end
-                    && (all || normal(e))
-                    && authors
-                        .as_ref()
-                        .is_none_or(|by| e.message.as_ref().is_some_and(|m| by.matches(&m.actor)))
-                    && filters.iter().any(|f| e.matches(f))
-            }) {
+            for event in rows
+                .into_iter()
+                .rev()
+                .filter(|e| e.cursor <= end && (all || normal(e)) && matcher.matches(e))
+            {
                 if let Some(e) = allowed(&tx, &a, event)?
-                    && let Some(e) = current_event(&tx, &a, e, filter, &filters)?
+                    && let Some(e) = current_event(&tx, &a, e, filter, &matcher.filters)?
                 {
                     found.push(e);
                     if found.len() == count {
@@ -325,27 +323,81 @@ impl Board {
     }
 }
 
-fn expanded(
-    c: &Connection,
-    a: &Access,
-    f: &Filter,
-) -> Result<(Option<crate::actors::Authors>, Vec<Filter>)> {
-    f.validate()?;
-    let mut f = f.clone();
-    let authors =
-        f.by.take()
-            .as_deref()
-            .map(|q| crate::actors::author_filter(c, a, q))
-            .transpose()?;
-    let filters = match &f.mentions {
-        None => vec![f],
-        Some(q) => crate::actors::mention_terms(c, a, q)?
-            .into_iter()
+pub(crate) struct EventMatcher {
+    authors: Option<Rc<crate::actors::Authors>>,
+    filters: Vec<Filter>,
+}
+
+/// Resolves directory-sensitive terms within one read snapshot and one audience.
+pub(crate) struct EventResolver<'a> {
+    conn: &'a Connection,
+    access: &'a Access,
+    by: HashMap<String, Rc<crate::actors::Authors>>,
+    mentions: HashMap<String, Vec<String>>,
+}
+
+fn lookup<T>(
+    entries: &mut HashMap<String, T>,
+    query: String,
+    resolve: impl FnOnce(&str) -> Result<T>,
+) -> Result<&T> {
+    Ok(match entries.entry(query) {
+        Entry::Occupied(existing) => existing.into_mut(),
+        Entry::Vacant(vacant) => {
+            let value = resolve(vacant.key())?;
+            vacant.insert(value)
+        }
+    })
+}
+
+impl<'a> EventResolver<'a> {
+    pub(crate) fn new(conn: &'a Connection, access: &'a Access) -> Self {
+        Self {
+            conn,
+            access,
+            by: HashMap::new(),
+            mentions: HashMap::new(),
+        }
+    }
+    pub(crate) fn resolve(&mut self, filter: &Filter) -> Result<EventMatcher> {
+        let mut f = filter.clone();
+        let authors =
+            f.by.take()
+                .map(|q| {
+                    lookup(&mut self.by, q, |q| {
+                        crate::actors::author_filter(self.conn, self.access, q).map(Rc::new)
+                    })
+                    .cloned()
+                })
+                .transpose()?;
+        let filters = match f.mentions.take() {
+            None => vec![f],
+            Some(q) => lookup(&mut self.mentions, q, |q| {
+                crate::actors::mention_terms(self.conn, self.access, q)
+            })?
+            .iter()
             .map(|term| Filter {
-                mentions: Some(term),
+                mentions: Some(term.clone()),
                 ..f.clone()
             })
             .collect(),
-    };
-    Ok((authors, filters))
+        };
+        Ok(EventMatcher { authors, filters })
+    }
+}
+
+impl EventMatcher {
+    pub(crate) fn compile(c: &Connection, a: &Access, f: &Filter) -> Result<Self> {
+        f.validate()?;
+        Self::resolve(c, a, f)
+    }
+    pub(crate) fn resolve(c: &Connection, a: &Access, f: &Filter) -> Result<Self> {
+        EventResolver::new(c, a).resolve(f)
+    }
+    pub(crate) fn matches(&self, event: &Event) -> bool {
+        self.authors
+            .as_ref()
+            .is_none_or(|by| event.message.as_ref().is_some_and(|m| by.matches(&m.actor)))
+            && self.filters.iter().any(|f| event.matches(f))
+    }
 }

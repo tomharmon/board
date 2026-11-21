@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail, ensure};
 use board_local::errors::{Kind, classify};
 use board_local::{Board, Filter, Message, PostOptions, local};
 use clap::Parser;
-use cli::{Args, Body, Command, Query, SchemaCommand, WriteOptions};
+use cli::{Args, Body, ChannelCommand, Command, Query, SchemaCommand, WriteOptions};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -336,7 +336,12 @@ fn stream(
     }
 }
 
-fn inspector(db: PathBuf, profile: Option<String>, thread: Option<i64>) -> Result<()> {
+fn inspector(
+    db: PathBuf,
+    profile: Option<String>,
+    avatar: Option<String>,
+    thread: Option<i64>,
+) -> Result<()> {
     let beside = env::current_exe()?.with_file_name(format!("board-ui{}", env::consts::EXE_SUFFIX));
     let mut cmd = Process::new(if beside.is_file() {
         beside
@@ -349,6 +354,9 @@ fn inspector(db: PathBuf, profile: Option<String>, thread: Option<i64>) -> Resul
     }
     if let Some(p) = profile {
         cmd.env("BOARD_PROFILE", p);
+    }
+    if let Some(url) = avatar {
+        cmd.env("BOARD_AVATAR", url);
     }
     let status = cmd
         .status()
@@ -387,8 +395,16 @@ fn run(args: Args) -> Result<()> {
         .as_deref()
         .map(local::profile_name)
         .transpose()?;
+    let editing_profile = matches!(args.cmd, Command::Profile { .. });
+    ensure!(
+        args.avatar.is_none() || profile.is_some() || editing_profile,
+        Kind::Invalid.error(
+            "invalid_profile",
+            "--avatar requires --as (or the profile command)"
+        )
+    );
     if let Command::Inspect { thread } = args.cmd {
-        return inspector(path, profile, thread);
+        return inspector(path, profile, args.avatar, thread);
     }
     let mut board = Board::open(&path).with_context(|| format!("open {}", path.display()))?;
     let actor = if let Some(fixed) = board.bind_env()? {
@@ -404,6 +420,9 @@ fn run(args: Args) -> Result<()> {
             .map(|p| format!("{}/{p}", local::person_name()))
             .unwrap_or_else(local::person_name)
     };
+    if !editing_profile && let Some(url) = args.avatar.as_deref() {
+        board.set_write_avatar(&actor, url)?;
+    }
     let js = args.json;
     match args.cmd {
         Command::Discovery => println!(
@@ -494,12 +513,8 @@ fn run(args: Args) -> Result<()> {
                 println!("{}", safe(&destination.display().to_string()));
             }
         }
-        Command::Profile {
-            handle,
-            name,
-            avatar,
-        } => {
-            board.set_actor_profile_with_avatar(&actor, &handle, &name, avatar.as_deref())?;
+        Command::Profile { handle, name } => {
+            board.set_actor_profile_with_avatar(&actor, &handle, &name, args.avatar.as_deref())?;
             if js {
                 println!("{}", json!({"actor":actor,"handle":handle,"name":name}));
             } else {
@@ -547,7 +562,29 @@ fn run(args: Args) -> Result<()> {
                 println!("{}  {}", safe(&actor), safe(&path.display().to_string()));
             }
         }
+        Command::Channel(input)
+        | Command::Channels {
+            command: Some(ChannelCommand::Create(input)),
+            ..
+        } => {
+            let name = input.name;
+            let mut body = if input.private {
+                json!({"created":true,"grants":board.create_private_channel(&name,&actor)?})
+            } else {
+                json!({"created":board.create_channel_as(&name,&actor)?})
+            };
+            body["channel"] = json!(name);
+            if js {
+                println!("{body}");
+            } else if input.private {
+                println!("Created private channel {}", safe(&name));
+            } else {
+                println!("{}", safe(&name));
+            }
+        }
         Command::Channels {
+            command: None,
+            path_prefix,
             prefix,
             scope,
             after,
@@ -556,7 +593,7 @@ fn run(args: Args) -> Result<()> {
             let (cursor, channels, next) = board.channels_window(
                 after.as_deref().unwrap_or(""),
                 scope.as_deref(),
-                prefix.as_deref(),
+                path_prefix.as_deref().or(prefix.as_deref()),
                 limit,
             )?;
             if js {
@@ -576,14 +613,6 @@ fn run(args: Args) -> Result<()> {
                 if let Some(after) = next {
                     println!("more channels: --after {}", safe(&after));
                 }
-            }
-        }
-        Command::Channel { name } => {
-            let created = board.create_channel_as(&name, &actor)?;
-            if js {
-                println!("{}", json!({"channel":name,"created":created}));
-            } else {
-                println!("{}", safe(&name));
             }
         }
         Command::Post {

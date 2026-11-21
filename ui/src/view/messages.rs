@@ -79,8 +79,25 @@ fn divider(ts: &str, now: chrono::DateTime<chrono::Utc>, inset: f32) -> El {
         .child(label(title, 11.0, 400.0, FAINT).font(font(11., 400.).lh(16.5)))
         .child(el().grow(1.0).h(1.0).fill(c(EDGE)))
 }
-fn transcript(key: &str, body: El, sticky: bool) -> El {
-    col()
+fn transcript(s: &State, thread: bool, body: El, sticky: bool) -> El {
+    let (key, edge, jump) = if thread {
+        ("conversation", &s.browse.thread_edge, "thread-new-messages")
+    } else {
+        ("feed-scroll", &s.browse.feed_edge, "feed-new-messages")
+    };
+    let watch = move |s: &mut State, visible, tx: &mut Tx| {
+        let edge = if thread {
+            &mut s.browse.thread_edge
+        } else {
+            &mut s.browse.feed_edge
+        };
+        let was_behind = edge.show_jump();
+        edge.visible(visible);
+        if was_behind == edge.show_jump() {
+            tx.live_only();
+        }
+    };
+    let list = col()
         .key(key)
         .w_full()
         .grow(1.0)
@@ -90,8 +107,45 @@ fn transcript(key: &str, body: El, sticky: bool) -> El {
         })
         .child(el().grow(1.0))
         .child(body)
+        .child(
+            el().key(format!("{key}-edge"))
+                .w_full()
+                .h(1.)
+                .on_visible(watch),
+        );
+    // The pager above this wrapper disappears after the last prepend. Keep the
+    // viewport's full keyed path stable so Rune can restore the visible row.
+    let panel = col()
+        .key(if thread {
+            "thread-transcript"
+        } else {
+            "feed-transcript"
+        })
+        .w_full()
+        .grow(1.)
+        .min_h(0.)
+        .child(list);
+    if !edge.show_jump() {
+        return panel;
+    }
+    panel.child(
+        row()
+            .w_full()
+            .center()
+            .child(
+                action(jump, "New messages ↓", false).on_press_tx(move |s: &mut State, tx| {
+                    let edge = if thread {
+                        &mut s.browse.thread_edge
+                    } else {
+                        &mut s.browse.feed_edge
+                    };
+                    edge.visible(true);
+                    tx.scroll_to_bottom(key);
+                }),
+            ),
+    )
 }
-fn feed_key(m: &Message) -> String {
+pub(super) fn feed_key(m: &Message) -> String {
     if m.re.is_some() {
         format!("activity-reply-{}", m.id)
     } else {
@@ -127,7 +181,8 @@ fn next_feed(s: &State, key: &Key, id: i64, tx: &mut Tx) -> bool {
 pub(super) fn feed(s: &State, inset: f32) -> El {
     let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
     let is_timeline = s.is_timeline();
-    let mut list = col().w_full().pt(6.0).pb(12.0);
+    // The bottom visibility marker occupies the final point of transcript padding.
+    let mut list = col().w_full().pt(6.0).pb(11.0);
     let mut prev: Option<&Message> = None;
     let mut prev_activity: Option<&str> = None;
     let mut prev_replies = false;
@@ -145,6 +200,8 @@ pub(super) fn feed(s: &State, inset: f32) -> El {
             "No matching tasks"
         } else if s.query.text.is_empty() && !s.browse.has_filters() {
             "No threads yet"
+        } else if is_timeline {
+            "No matching messages"
         } else {
             "No matching threads"
         };
@@ -217,7 +274,7 @@ pub(super) fn feed(s: &State, inset: f32) -> El {
                 ),
         );
     }
-    panel = panel.child(transcript("feed-scroll", list, true));
+    panel = panel.child(transcript(s, false, list, true));
     if s.connected() {
         panel = panel.child(if s.edits_root() {
             composer(s, inset)
@@ -676,7 +733,7 @@ pub(super) fn task_conversation(s: &State, id: i64, inset: f32) -> El {
 
 fn thread_body(s: &State, id: i64, inset: f32, show_task_facts: bool) -> El {
     let now = chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::now());
-    let mut messages = col().w_full().pb(12.);
+    let mut messages = col().w_full().pb(11.);
     let mut previous: Option<&Message> = None;
     for (index, m) in s.thread.iter().enumerate() {
         if previous.is_none_or(|p| !same_day(&p.created_at, &m.created_at)) {
@@ -712,6 +769,56 @@ fn thread_body(s: &State, id: i64, inset: f32, show_task_facts: bool) -> El {
         previous = Some(m);
     }
     let mut content = col().w_full().grow(1.).min_h(0.);
+    if !s.browse.targets.is_empty() {
+        let mut targets = col()
+            .key("thread-destinations")
+            .w_full()
+            .px(inset)
+            .py(4.)
+            .max_h(88.)
+            .scroll(ScrollSpec {
+                stick_bottom: false,
+            });
+        for (i, t) in s.browse.targets.iter().enumerate() {
+            let mut line = row()
+                .w_full()
+                .center_y()
+                .gap(8.)
+                .child(label("sync", 11., 400., FAINT).w(42.))
+                .child(
+                    label(&t.target, 12., 500., INK)
+                        .grow(1.)
+                        .min_w(0.)
+                        .truncate()
+                        .help(&t.source),
+                )
+                .child(
+                    label(
+                        &t.state,
+                        11.,
+                        400.,
+                        if matches!(t.state.as_str(), "failed" | "uncertain") {
+                            ERROR
+                        } else {
+                            MUTED
+                        },
+                    )
+                    .help("Recorded locally; no provider lookup"),
+                );
+            if let Some(url) = t.url.clone() {
+                line = line.child(
+                    tool(
+                        &format!("copy-destination-{i}"),
+                        "Copy recorded destination link",
+                        &glyphs::COPY,
+                    )
+                    .on_press_tx(move |s: &mut State, tx| s.copy_destination(id, &url, tx)),
+                );
+            }
+            targets = targets.child(line);
+        }
+        content = content.child(targets);
+    }
     if show_task_facts && let Some(task) = s.thread.first().and_then(|m| m.task.as_ref()) {
         let tid = task.id;
         content = content.child(
@@ -822,7 +929,8 @@ fn thread_body(s: &State, id: i64, inset: f32, show_task_facts: bool) -> El {
         messages = messages.child(pending_row);
     }
     content = content.child(transcript(
-        "conversation",
+        s,
+        true,
         messages,
         s.browse.position == Position::Latest,
     ));

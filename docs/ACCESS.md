@@ -17,6 +17,19 @@ are not interchangeable. Don't put secrets in command arguments, shell history,
 or checked-in files. The owner can still administer grants after revoking every
 delegated grant.
 
+## Private channels
+
+`board channels create studio/notes --private` (also `board channel studio/notes --private`)
+creates an empty channel and two ordinary grants in one SQLite transaction:
+the creator's person and named profiles get all actions at `studio/notes/`,
+and everyone else gets none there. It does not change siblings. Read and post
+alone are insufficient: the caller must be able to list board-wide grants
+and manage the new subtree. A repeated private request, an existing channel
+at or beneath that path, or a grant targeting it or a descendant is a conflict;
+no channel or partial grant remains. Use normal grants to change access later.
+This is an application access rule, not encryption or protection from the
+person who owns the SQLite file.
+
 ## Issue a credential
 
 ```sh
@@ -182,6 +195,7 @@ credential hashes; protect it accordingly.
 ```sh
 board --as helper profile --handle teammate/helper --name 'Shift helper' --avatar https://example.invalid/helper.png
 board actors --details --query helper
+board --as helper --avatar https://example.invalid/helper.png post ops/log 'Ready'
 ```
 
 `GET /v1/actors` returns IDs and their read-snapshot cursor for scripts. Add `details=true` for records, an
@@ -195,7 +209,11 @@ claimed as independently verified accounts. Avatar URLs, when present, are
 metadata, not a requirement for offline operation. A master-authenticated REST
 request can select its actor's profile with `X-Board-Profile: helper; avatar="https://example.invalid/helper.png"`.
 The bearer of a delegated credential cannot use this to switch identities.
-Named CLI and REST profiles use the same lowercase spelling. Avatar metadata
+Named CLI and REST profiles use the same lowercase spelling. A named profile
+without an explicit handle follows its person's current display handle.
+`BOARD_PROFILE` and `BOARD_AVATAR` are the environment equivalents of
+`--as` and `--avatar`: the avatar accompanies successful writes, not reads.
+Avatar metadata
 (HTTPS, or HTTP loopback) is not fetched; legacy separate avatar/session headers do not
 establish profile identity.
 

@@ -154,6 +154,10 @@ impl State {
     fn connect() -> Result<(Board, Option<String>)> {
         let mut db = Board::open(local::database_path())?;
         let actor = db.bind_env()?;
+        if let Ok(url) = std::env::var("BOARD_AVATAR") {
+            let selected = actor.clone().unwrap_or_else(local::actor_name);
+            db.set_write_avatar(&selected, &url)?;
+        }
         Ok((db, actor))
     }
 
@@ -245,11 +249,7 @@ impl State {
     }
 
     pub fn is_timeline(&self) -> bool {
-        self.channel.is_none()
-            && self.query.text.trim().is_empty()
-            && !self.browse.has_filters()
-            && !self.tasks_only
-            && !self.browse.search_open
+        self.channel.is_none() && !self.tasks_only
     }
 
     fn load(&mut self) -> Result<()> {
@@ -329,8 +329,37 @@ impl State {
             ),
             None => (Vec::new(), Vec::new()),
         };
+        self.browse.targets = match thread.first().filter(|root| !root.deleted) {
+            Some(root) => db.sync_targets(root.id)?.targets,
+            None => vec![],
+        };
+        self.browse.feed_edge.observe(if self.starts.is_empty() {
+            activity_messages.last().map(|m| m.id).or_else(|| {
+                threads
+                    .last()
+                    .map(|t| t.last.as_ref().unwrap_or(&t.message).id)
+            })
+        } else {
+            None
+        });
+        self.browse.thread_edge.observe(
+            thread
+                .last()
+                .filter(|_| self.browse.position == Position::Latest)
+                .map(|m| m.id),
+        );
         self.desk
             .load(db, &self.actor, self.page, self.delegated, &filter)?;
+        if self.browse.adding_channel {
+            self.desk.access.viewer = Some(db.viewer(&self.actor)?);
+            if self.browse.private_channel && !self.desk.access.registry() {
+                // Never reclassify a requested private creation as public on grant loss.
+                self.browse.adding_channel = false;
+                self.browse.private_channel = false;
+                self.browse.channel_name.clear();
+                self.error = Some("Private channel creation is no longer permitted".into());
+            }
+        }
         if self.page == Page::People || self.people.picking {
             self.people.rows = db.actor_directory(Some(self.people.query.text.trim()))?;
             self.people.offset = self
@@ -392,6 +421,9 @@ impl State {
             self.inactive_draft.clear();
             self.thread.clear();
             self.browse.schedules.clear();
+            self.browse.targets.clear();
+            self.browse.adding_channel = false;
+            self.browse.private_channel = false;
             self.preview = None;
             self.typing.clear();
             self.people.rows.clear();

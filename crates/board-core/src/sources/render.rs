@@ -72,3 +72,55 @@ pub(super) fn body(
     );
     Ok(s)
 }
+
+pub(super) fn declined_files(
+    c: &Connection,
+    source: &str,
+    thread: &str,
+    id: i64,
+) -> Result<Vec<i64>> {
+    Ok(c.prepare("SELECT asset FROM sync_file_notes WHERE source=? AND thread=? AND message=? ORDER BY asset")?
+        .query_map(params![source,thread,id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Include the provider's text fallbacks in the fenced send body, so a
+/// preflight cannot publish a stale byline or file note after settings change.
+pub(super) fn outbound(
+    tx: &Transaction<'_>,
+    source: &Source,
+    thread: &str,
+    m: &Message,
+) -> Result<String> {
+    let mut text = body(tx, source, thread, m)?;
+    if source.provider == Provider::Local {
+        return Ok(text);
+    }
+    if source.settings.display_authors {
+        let name: String = m
+            .author
+            .as_ref()
+            .map_or(m.actor.as_str(), |a| a.name.as_str())
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '/'))
+            .take(80)
+            .collect();
+        text.push_str(&format!("\n\nFrom {name} on Board"));
+    }
+    if !m.attachments.is_empty() {
+        let declined = if source.provider == Provider::Slack {
+            declined_files(tx, &source.name, thread, m.id)?
+        } else {
+            Vec::new()
+        };
+        for file in &m.attachments {
+            if source.provider != Provider::Slack || declined.contains(&file.id) {
+                let filename = file.name.replace('`', "'");
+                text.push_str(&format!(
+                    "\n\nFile: `{filename}` ({} bytes; on Board #{})",
+                    file.size, m.id
+                ));
+            }
+        }
+    }
+    Ok(text)
+}

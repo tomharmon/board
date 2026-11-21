@@ -7,7 +7,7 @@ fn body(s: &State, reply: bool) -> El {
     let placeholder = if reply {
         "reply to thread…".into()
     } else if s.channel.is_some() {
-        format!("message #{}…", s.destination.text.trim())
+        format!("message #{}…", s.root_channel())
     } else {
         "start a thread…".into()
     };
@@ -73,17 +73,11 @@ fn body(s: &State, reply: bool) -> El {
         })
 }
 fn send(s: &State) -> El {
-    let enabled = can_send(s);
-    action(
+    submit(
         "send",
         if s.delivery.later { "Schedule" } else { "send" },
-        true,
+        can_send(s),
     )
-    .h(32.)
-    .radius(0.)
-    .px(12.)
-    .disabled(!enabled)
-    .opacity(if enabled { 1. } else { 0.5 })
     .on_press_tx(State::send)
 }
 fn attach(s: &State) -> El {
@@ -143,44 +137,29 @@ fn files(s: &State) -> El {
         .child(list)
 }
 fn channel(s: &State) -> El {
-    col().w_full().px(8.).pt(8.).child(
-        row()
-            .w_full()
-            .max_w(320.)
-            .h(28.)
-            .px(8.)
-            .center_y()
-            .fill(c(PANEL))
-            .child(label("#", 13., 400., FAINT))
-            .child(
-                text_input(&s.destination, font(13., 400.))
-                    .single_line()
-                    .key("destination")
-                    .label("Channel")
-                    .placeholder("channel", c(FAINT))
-                    .grow(1.)
-                    .min_w(0.)
-                    .h(28.)
-                    .no_focus_ring()
-                    .on_edit(|s: &mut State| &mut s.destination)
-                    .on_input_change(|s: &mut State, _| s.draft_changed())
-                    .on_input_key(|_: &mut State, k, tx| {
-                        if k.key == Key::Enter {
-                            tx.focus_when_shown("message-body", true);
-                            true
-                        } else {
-                            false
-                        }
-                    }),
-            ),
-    )
+    let field = short_input(&s.destination, "destination", "Channel", "channel")
+        .on_edit(|s: &mut State| &mut s.destination)
+        .on_input_change(|s: &mut State, _| s.draft_changed())
+        .on_input_key(|s: &mut State, k, tx| {
+            if k.key == Key::Enter && s.destination.preedit().is_none() {
+                tx.focus_when_shown("message-body", true);
+                true
+            } else {
+                false
+            }
+        });
+    col()
+        .w_full()
+        .px(8.)
+        .pt(8.)
+        .child(short_field("destination", &s.destination, Some("#"), field).max_w(320.))
 }
 fn composer_frame(focus: bool) -> El {
     col()
         .w_full()
         .fill(c(if focus { PANEL } else { BG }))
-        .border(1.7, c(EDGE))
-        .border_dash(if focus { 6. } else { 1.5 }, if focus { 4. } else { 2. })
+        .border(1., c(if focus { MUTED } else { CONTROL }))
+        .border_dash(if focus { 6. } else { 3. }, if focus { 3. } else { 2. })
 }
 pub(super) fn edit(s: &State, reply: bool, inset: f32) -> El {
     let mut area = composer_frame(s.body.focused || s.destination.focused)
@@ -354,9 +333,11 @@ pub(super) fn activation(s: &State, inset: f32, root: bool) -> El {
                         .key("feed-channel")
                         .w_full()
                         .max_w(320.)
-                        .h(28.)
+                        .h(30.)
                         .px(8.)
                         .center_y()
+                        .radius(4.)
+                        .border(1., c(CONTROL))
                         .fill(c(PANEL)),
                     "Choose a channel",
                 )
@@ -478,13 +459,7 @@ pub(super) fn activation(s: &State, inset: f32, root: bool) -> El {
                 }),
             )
             .child(el().grow(1.))
-            .child(
-                action(&format!("{prefix}-send"), "send", true)
-                    .h(32.)
-                    .radius(0.)
-                    .opacity(0.5)
-                    .disabled(true),
-            ),
+            .child(submit(&format!("{prefix}-send"), "send", false)),
     );
     col().w_full().px(inset).pb(inset).child(area)
 }

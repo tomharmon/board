@@ -93,18 +93,28 @@ pub(super) async fn save_profile(
 #[serde(deny_unknown_fields)]
 pub(super) struct NewChannel {
     name: String,
+    #[serde(default)]
+    private: bool,
 }
 pub(super) async fn channel(
     State(a): State<App>,
     Json(body): Json<NewChannel>,
 ) -> ApiResult<Response> {
-    let (name, new) = a
+    let (name, new, grants) = a
         .call(move |b, actor| {
-            let new = b.create_channel_as(&body.name, actor)?;
-            Ok((body.name, new))
+            if body.private {
+                let grants = b.create_private_channel(&body.name, actor)?;
+                Ok((body.name, true, Some(grants)))
+            } else {
+                let new = b.create_channel_as(&body.name, actor)?;
+                Ok((body.name, new, None))
+            }
         })
         .await?;
-    let body = json!({"name":name,"created":new});
+    let mut body = json!({"name":name,"created":new});
+    if let Some(grants) = grants {
+        body["grants"] = json!(grants);
+    }
     Ok(if new {
         created(format!("/v1/channels/{name}"), body)
     } else {

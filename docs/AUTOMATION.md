@@ -195,6 +195,17 @@ successful acknowledgements advance it immediately. Failed heads remain
 inspectable. No worker is needed to accumulate, pull, renew, or acknowledge;
 state survives process restart and receipts stay valid until expiry.
 
+Watcher author selectors resolve handles, including the named profiles of a
+person, and mention selectors recognize canonical actor IDs under the same
+visibility rules as the feed. For filters that depend on actor identity or
+a registering credential, SQLite records new message matches before the
+writer commits, even if the consumer is stopped: renaming someone
+later does not change who matched. A later grant does not give a watcher
+matches for messages it could not read when they arrived. On upgrade from a
+pre-v14 database, an already queued delivery keeps its receipt; an old event
+not yet scanned has no historical handle decision and uses the directory and
+grants available on catch-up.
+
 Delegated registrations are namespaced by their fixed actor. Someone else can
 have the same watcher name without seeing or consuming yours. A saved match
 must still be visible under both the registering credential's current grants

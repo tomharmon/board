@@ -16,13 +16,19 @@ struct Mock {
 }
 impl Mock {
     fn new(expected: Vec<(&'static str, u16, Value)>) -> Self {
+        Self::with_hook(expected, |_, _| {})
+    }
+    fn with_hook(
+        expected: Vec<(&'static str, u16, Value)>,
+        mut hook: impl FnMut(usize, &Value) + Send + 'static,
+    ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let requests = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&requests);
         let handle = thread::spawn(move || {
-            for (want, status, response) in expected {
+            for (i, (want, status, response)) in expected.into_iter().enumerate() {
                 let end = Instant::now() + Duration::from_secs(8);
                 let mut stream = loop {
                     match listener.accept() {
@@ -71,6 +77,7 @@ impl Mock {
                 } else {
                     serde_json::from_slice(&body).unwrap()
                 };
+                hook(i, &decoded);
                 seen.lock().unwrap().push((first, decoded));
                 let buf = serde_json::to_vec(&response).unwrap();
                 write!(stream,"HTTP/1.1 {status} response\r\nConnection: close\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",buf.len()).unwrap();
@@ -603,6 +610,60 @@ fn linear_explicit_joins_verify_the_current_team_before_any_mutation() {
     );
     assert!(seen[2].1["query"].as_str().unwrap().starts_with("query "));
     assert!(!seen[2].1.to_string().contains("Do not follow"));
+}
+
+#[test]
+fn a_message_changed_during_the_provider_check_is_never_sent_from_the_old_lease() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("outbox.db");
+    let b = Board::open(&path)?;
+    let writer = Board::open(&path)?;
+    let id = "30facd12-fd14-4bde-aaa1-ba7b616853d2";
+    b.create_source("ada", "test", Provider::Linear, "ENG", "work")?;
+    b.set_outbound("ada", "test", true)?;
+    let (root, _) = b.post_with_targets(
+        "work",
+        "ada",
+        "Private root",
+        &Default::default(),
+        &[format!("test:{id}")],
+    )?;
+    let m = b.reply(root.id, "ada", "withdrawn text", &Default::default())?;
+    let team = json!({"data":{"issue":{"id":id,"identifier":"ENG-7","team":{"key":"ENG"}}}});
+    let mock = Mock::with_hook(
+        vec![
+            ("POST /graphql ", 200, team.clone()),
+            ("POST /graphql ", 200, team),
+            (
+                "POST /graphql ",
+                200,
+                json!({"data":{"commentCreate":{"success":true,"comment":{"id":"final"}}}}),
+            ),
+        ],
+        move |i, req| {
+            if i == 0 {
+                assert!(req["query"].as_str().unwrap().starts_with("query "));
+                writer
+                    .edit(m.id, "ada", "cleared for publication", None)
+                    .unwrap();
+            }
+        },
+    );
+    let api = Connector::new(Provider::Linear, mock.base.clone(), Some("test".into()))?;
+    assert_eq!(api.send_next(&b, "ada", "test")?.unwrap().state, "done");
+    assert!(api.send_next(&b, "ada", "test")?.is_none());
+    let seen = mock.finish();
+    assert!(
+        seen[..2]
+            .iter()
+            .all(|(_, req)| req["query"].as_str().unwrap().starts_with("query "))
+    );
+    assert_eq!(
+        seen[2].1["variables"]["input"],
+        json!({"issueId":id,"body":"cleared for publication"})
+    );
+    assert!(!serde_json::to_string(&seen)?.contains("withdrawn text"));
+    Ok(())
 }
 
 #[test]

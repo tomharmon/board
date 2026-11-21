@@ -5,7 +5,7 @@ Comparison target: reference commit `c2d3324b117adaa8e9a0107e15ea2fca207c95ac`
 docs, inspector, integration code and conformance checks. The reference
 declares 65 protocol methods and 90 static conformance cases (28 core, 2
 paging, 2 search, 2 schedules, 24 tasks, 14 grants, 5 schemas, 3 attachments,
-3 watchers, 7 sync). **These are inventory counts, not Rust test results.**
+3 watchers, 7 sync), plus a discovery handshake. **These are inventory counts, not Rust test results.**
 Resource URLs and JSON shapes differ; an upstream client is not supported.
 See [the verification checklist](../PARITY.md) for tests that actually run.
 
@@ -18,8 +18,19 @@ is mapped to a local handler, not counted as a successful deployment test.
 
 ## Latest pass: findings and fixes
 
+| Previously missing or different | Local behavior | How to check it |
+| --- | --- | --- |
+| Empty channels existed, but a creator could not make a private subtree. | The CLI, REST and inspector commit the creator's family grant, the everyone lock and the new channel together. They refuse existing trees and grants. Direct filesystem owners remain trusted. | [17 outcomes against the original client and local backend](../scripts/compare-private-channels.mjs), [concurrent creators and rollback](../crates/board-core/tests/private_channels.rs), [real CLI and HTTP](../crates/board-cli/tests/delegation.rs). |
+| A schema-looking block in a platform message could be trusted as board data; middleware could repair invalid native data before it was checked. | External text stays literal, including external edits. Native data is checked before and after middleware. Version 14 conservatively removes old imported projections without rewriting message text or IDs. Numerically equivalent JSON schema retries agree. | [Eight direct native/external cases](../scripts/compare-platform-blocks.mjs), [migration and edit tests](../crates/board-core/tests/body_provenance.rs), [schema registry](../crates/board-core/tests/schema_contract.rs). |
+| Named profiles could ignore their person's current handle. An author or mention filter could match differently depending on when a watcher was polled. | Named profiles inherit the current handle unless explicitly overridden; the CLI can attach an avatar to a successful named-profile write. New watcher matches capture scoped author/mention resolution at event time. | [Actor tests](../crates/board-core/tests/actors_and_prose.rs), [watcher rename, restart and visibility tests](../crates/board-core/tests/automation_delivery.rs), [CLI/REST avatar](../crates/board-cli/tests/delegation.rs). |
+| A source could send a leased but superseded body. Imported changes could name the original author as the editor and leave a changed task claimed. | Immediately before arming a send, recheck the current message and renderer. Apply an authoritative provider change as its source-qualified editor, without giving that identity permission to edit arbitrary native posts. | [Real connector interleaving](../crates/board-sync/src/tests.rs), [leases and same-text source changes](../crates/board-core/tests/sync.rs), [actor attribution and task fencing](../crates/board-core/tests/platform_actors.rs). |
+| Home search hid the individual matching reply, a reader could not inspect public delivery status, and a scrolled-back reader had no way to jump to new messages. | Home searches individual messages; channel search groups threads. Readers see authorized recorded destinations without management access. New activity preserves scroll position and offers a jump. | [Scripted native inspector](../ui/tests/inspector/reading.rs), [visual and keyboard checks](INSPECTOR-VISUALS.md). |
+| A fresh Sync screen was a dead end. Settings and composers were hard to read and the sidebar could underlap the macOS title bar. | Create and edit all four source types offline, with explicit confirmation for publishing. Standard window chrome, aligned channel prefixes, distinct Access choices and action, measured contrast and a persistent native zoom control. | [Source setup, revocation, CLI readback](../ui/tests/inspector/source_settings.rs), [before/after renders and actual layout checks](INSPECTOR-VISUALS.md#readability). Live macOS window placement has not been witnessed. |
+
+### Earlier passes
+
 The earlier inventory counted methods that existed but missed differences in
-what callers could actually observe. This pass compared those boundaries again:
+what callers could actually observe. These findings remain covered:
 
 | Finding | Implemented behavior | Regression evidence |
 | --- | --- | --- |
@@ -40,7 +51,7 @@ from the count of reference methods.
 
 | Reference family | Rust coverage | Verification / qualification |
 | --- | --- | --- |
-| discovery, me, channels, createChannel, actors | Discovery/OpenAPI inventory, identity, named boards, hierarchical scopes, paged channel summaries, directory of people, profiles and external authors. | [REST](../crates/board-api/src/tests.rs), [local access](../crates/board-core/tests/access.rs). Local profile verification is not provider account verification. |
+| discovery, me, channels, createChannel, actors | Discovery/OpenAPI inventory, identity, named boards, public/private creation, hierarchical scopes, paged channel summaries, directory of people, profiles and external authors. | [REST](../crates/board-api/src/tests.rs), [local access](../crates/board-core/tests/access.rs), [private creation](../crates/board-core/tests/private_channels.rs). Local profile verification is not provider account verification. |
 | channelMessages, threads, message | Exact parent plus root; whole thread; scope, search, author, resolved mentions, repeated label predicates, cursor and event head for one SQLite snapshot. | [Snapshot, paging and deletion tests](../crates/board-core/tests/messages.rs), [compound REST filters](../crates/board-api/src/tests.rs). |
 | post, posted, edit, delete, react, label | Stable ID, recovered response for actor/target/key, compare-and-set text and labels, newest-only reply, reactions and persistent tombstones. | [Message tests](../crates/board-core/tests/messages.rs) and [processes](../crates/board-cli/tests/processes.rs), including concurrent writes and a fault between mutation and event. |
 | events | Transactional ordered history, event-time filtering, current-view historical tail, long poll/SSE, resume and wait from the posted ID. | [Feed/access tests](../crates/board-core/tests/access.rs), [polling and SSE revocation](../crates/board-api/src/tests.rs). Restore a SQLite snapshot, not a reconstruction from the public feed. |

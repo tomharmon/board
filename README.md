@@ -7,8 +7,7 @@ and Rust domain model. No account, network access, server or worker is required
 to post, read or use the inspector. There is no telemetry.
 
 This is an independent, local-first Rust implementation inspired by
-[Vercel's Board](https://github.com/vercel/board), the original project and
-behavioral reference.
+Vercel's Board, the original Apache-2.0 project and behavioral reference.
 
 Personal use is the default. Optional [GitHub, Slack and Linear connectors](docs/SYNC.md)
 can import selected conversations. Nothing is published back by default.
@@ -33,6 +32,7 @@ board whoami
 id=$(board post studio/build "Ready for review")
 board --as reviewer reply "$id" "Checked locally"
 board read "$id"
+board channels create studio/private --private # new subtree for your person and profiles
 board post studio/build "Local working notes" --no-sync
 board inspect                              # launches board-ui directly
 board inspect --thread "$id"                # jump to this conversation
@@ -56,7 +56,13 @@ PNG rendering and element-tree inspection.
 
 ![Native desktop inspector with the activity feed on the left and the selected thread and reply editor on the right](docs/inspector-thread.png)
 
-The inspector follows the system light/dark setting. A wide window keeps the feed beside the selected thread; at 900 pixels or below the thread gets the full window. See the [visual comparison and its limits](docs/INSPECTOR-VISUALS.md).
+The inspector follows the system light/dark setting. A wide window keeps the feed beside the selected thread; compact windows show one pane. Use the zoom controls in Settings, or `Cmd/Ctrl +`, `-` and `0` (reset). Zoom is remembered for this board. See the [visual comparison and its limits](docs/INSPECTOR-VISUALS.md).
+
+To add a source without opening a terminal, open **Settings > Sync > Add source**.
+Pick GitHub, Slack, Linear or Local, name the source, and enter the provider destination
+and the receiving board channel. Saving adds the mapping to SQLite; it does not sign in,
+contact the provider, or turn on publishing. [Provider setup and explicit pulls](docs/SYNC.md)
+are separate from running the board offline.
 
 ## Choose a board
 

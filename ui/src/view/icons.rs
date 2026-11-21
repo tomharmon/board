@@ -37,6 +37,11 @@ pub(super) static LIST_TODO: Icon = Icon {
     view: 24.0,
     body: r#"<g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><rect x="3" y="4" width="6" height="6" rx="1"/></g>"#,
 };
+pub(super) static MINUS: Icon = Icon {
+    name: "lucide-minus",
+    view: 24.,
+    body: r#"<path d="M5 12h14" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"/>"#,
+};
 pub(super) static PLUS: Icon = Icon {
     name: "lucide-plus",
     view: 24.0,

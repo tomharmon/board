@@ -67,12 +67,19 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                     },
                 ))
                 .child(
-                    tool("search-toggle", "Search threads", &glyphs::SEARCH).on_press_tx(
-                        |s: &mut State, tx| {
-                            s.browse.filter_open = false;
-                            s.open_search(tx);
+                    tool(
+                        "search-toggle",
+                        if s.is_timeline() {
+                            "Search messages"
+                        } else {
+                            "Search threads"
                         },
-                    ),
+                        &glyphs::SEARCH,
+                    )
+                    .on_press_tx(|s: &mut State, tx| {
+                        s.browse.filter_open = false;
+                        s.open_search(tx);
+                    }),
                 )
                 .child(
                     tool("jump-message", "Go to message ID", &glyphs::CURSOR_TEXT).on_press_tx(

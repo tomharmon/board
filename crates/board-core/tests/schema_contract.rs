@@ -128,3 +128,29 @@ fn schema_structure_budgets_ignore_literal_keywords_but_count_every_json_value()
     );
     Ok(())
 }
+#[test]
+fn registry_retries_compare_numeric_values_without_collapsing_large_distinct_integers()
+-> anyhow::Result<()> {
+    let b = Board::memory()?;
+    let initial = serde_json::from_str(
+        r#"{"type":"object","properties":{"x":{"minimum":1,"const":{"n":[0,42,9007199254740993]}}}}"#,
+    )?;
+    let retry = serde_json::from_str(
+        r#"{"properties":{"x":{"const":{"n":[-0.0,4.2e1,9007199254740993]},"minimum":1.000}},"type":"object"}"#,
+    )?;
+    assert!(b.register_schema_as("numbers", 1, "same", &initial, "owner")?);
+    let head = b.cursor()?;
+    assert!(!b.register_schema_as("numbers", 1, "same", &retry, "owner")?);
+    let mut different: serde_json::Value = retry;
+    different["properties"]["x"]["const"]["n"][2] = serde_json::json!(9007199254740992.0);
+    assert_eq!(
+        board_local::errors::classify(
+            &b.register_schema_as("numbers", 1, "same", &different, "owner")
+                .unwrap_err()
+        )
+        .1,
+        "schema_immutable"
+    );
+    assert_eq!(head, b.cursor()?);
+    Ok(())
+}

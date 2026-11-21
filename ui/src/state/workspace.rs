@@ -398,7 +398,7 @@ impl Desk {
                     })
                     .transpose()?;
             }
-            Page::Sources => self.source.list = db.sources(actor)?,
+            Page::Sources => self.source.listing(db, actor)?,
             Page::Inbox => self.next = self.source.load(db, actor, after, PAGE)?,
             Page::Profiles => {
                 let person = local::person_name();
@@ -531,6 +531,11 @@ impl State {
             return;
         }
         // Entering Profiles already parked any active draft under the old actor.
+        if actor != self.actor
+            && let Some(db) = self.board.as_mut()
+        {
+            db.clear_write_avatar();
+        }
         self.actor = actor.to_owned();
         self.desk.source.selected.clear();
         self.desk.source.outgoing = false;

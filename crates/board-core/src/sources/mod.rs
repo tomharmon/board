@@ -33,6 +33,40 @@ pub enum Provider {
     Slack,
     Linear,
 }
+impl Provider {
+    pub fn validate_remote(&self, remote: &str) -> Result<()> {
+        ident(remote)?;
+        match self {
+            Self::Github => {
+                let parts: Vec<_> = remote.split('/').collect();
+                ensure!(
+                    parts.len() == 2
+                        && parts.iter().all(|s| !s.is_empty()
+                            && *s != "."
+                            && *s != ".."
+                            && s.bytes()
+                                .all(|b| b.is_ascii_alphanumeric()
+                                    || matches!(b, b'_' | b'.' | b'-'))),
+                    "expected GitHub OWNER/REPO"
+                );
+            }
+            Self::Slack | Self::Linear => {
+                ensure!(
+                    !remote.contains("://")
+                        && !remote.chars().any(char::is_whitespace)
+                        && ![
+                            "xoxb-", "xoxp-", "xoxa-", "xoxr-", "xoxs-", "xapp-", "lin_api_"
+                        ]
+                        .iter()
+                        .any(|prefix| remote.starts_with(prefix)),
+                    "enter the Slack conversation ID or Linear team key, not a URL or token"
+                );
+            }
+            Self::Local => {}
+        }
+        Ok(())
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Source {
@@ -362,7 +396,7 @@ impl Board {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-'),
             "source name must be lowercase letters, numbers or hyphens"
         );
-        ident(remote)?;
+        provider.validate_remote(remote)?;
         crate::validate_channel(channel)?;
         crate::validate_actor(who)?;
         self.write(|tx| {
@@ -420,7 +454,18 @@ impl Board {
         )
     }
     pub fn patch_source(&self, who: &str, name: &str, patch: &SourcePatch) -> Result<Source> {
+        self.patch_source_if(who, name, None, patch)
+    }
+    /// Do not apply an old settings form over someone else's configuration changes.
+    pub fn patch_source_if(
+        &self,
+        who: &str,
+        name: &str,
+        expected: Option<&Source>,
+        patch: &SourcePatch,
+    ) -> Result<Source> {
         self.write(|tx|{let s=self.authorized_source(tx,name,who)?;
+            ensure!(expected.is_none_or(|old|old==&s),Kind::Conflict.error("source_changed","Source settings changed. Cancel and reopen settings before saving."));
             let enabled=patch.outbound.unwrap_or(s.outbound);
             let settings=SourceSettings {mirror_roots:patch.mirror_roots.unwrap_or(s.settings.mirror_roots),
                 mirror_files:patch.mirror_files.unwrap_or(s.settings.mirror_files),display_authors:patch.display_authors.unwrap_or(s.settings.display_authors),

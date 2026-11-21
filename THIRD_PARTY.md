@@ -1,9 +1,8 @@
 # Third-party materials
 
 Board's Rust implementation is available under [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE). [Vercel's Board](https://github.com/vercel/board), which
-has its own [Apache-2.0 license](https://github.com/vercel/board/blob/main/LICENSE),
-informed the behavior. This repository does not ship the reference project's
+[Apache-2.0](LICENSE). The original project credited in the [README](README.md)
+is separately licensed under Apache-2.0. This repository does not ship its
 implementation, templates, graphics or documentation. The screenshots are
 rendered by this application from a disposable local database.
 

@@ -72,9 +72,11 @@ pub struct Draft {
 }
 
 const CARDS:&str="SELECT k.id,p.handle,p.name,coalesce(p.verified,0),
-  coalesce(sp.source,(SELECT cp.source FROM sync_copies cp JOIN messages seen ON seen.id=cp.message WHERE cp.origin AND seen.actor=k.id LIMIT 1)),
-  sp.name,coalesce(sp.avatar,av.url) FROM known k LEFT JOIN actor_profiles p ON p.id=k.id
-  LEFT JOIN sync_profiles sp ON sp.actor=k.id LEFT JOIN actor_avatars av ON av.id=k.id";
+  coalesce(sp.source,CASE WHEN substr(k.id,1,7)='source:' THEN
+    (SELECT cp.source FROM sync_copies cp JOIN messages seen ON seen.id=cp.message WHERE cp.origin AND seen.actor=k.id LIMIT 1) END),
+  sp.name,coalesce(sp.avatar,av.url),parent.handle FROM known k LEFT JOIN actor_profiles p ON p.id=k.id
+  LEFT JOIN sync_profiles sp ON sp.actor=k.id LEFT JOIN actor_avatars av ON av.id=k.id
+  LEFT JOIN actor_profiles parent ON parent.id=substr(k.id,1,instr(k.id,'/')-1)";
 fn imported_handle(source: &str, name: Option<&str>, fallback: &str) -> String {
     static MARKS: std::sync::LazyLock<regex::Regex> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"\p{M}+").expect("Unicode category"));
@@ -118,12 +120,19 @@ fn card(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActorEntry> {
     let external = source.is_some();
     let profile = id.split_once('/');
     let remote_name: Option<String> = r.get(5)?;
+    let person_handle: Option<String> = r.get(7)?;
     let default_handle = if let Some(source) = &source {
         imported_handle(
             source,
             remote_name.as_deref(),
             profile.map_or(id.as_str(), |p| p.1),
         )
+    } else if let Some((_, suffix)) = profile
+        && let Some(base) = person_handle.as_deref()
+        && !base.contains('/')
+        && base.len() + suffix.len() < 128
+    {
+        format!("{base}/{suffix}")
     } else {
         id.clone()
     };
@@ -141,7 +150,9 @@ fn card(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActorEntry> {
             "person"
         }
         .into(),
-        via: source.or_else(|| profile.map(|(p, _)| p.to_owned())),
+        via: source
+            .or(person_handle)
+            .or_else(|| profile.map(|(p, _)| p.to_owned())),
         avatar: r.get(6)?,
         verified: !external && r.get(3)?,
         local: !external,

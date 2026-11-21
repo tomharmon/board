@@ -45,7 +45,7 @@ Test names below are unambiguous prefixes in
 | Core 19, 20: channel/actor discovery and ensure | Channels on first post or explicit creation. Duplicate ensure has no event. A scoped actor multi-get takes up to 100 exact IDs, omits unknown and unreadable entries identically, and returns its snapshot cursor, even during independent writes. `channel_and_schema_retries`, `selected_actor_ids_are_visible_once`, `scoped_cli_and_actual_loopback`. |
 | Core 21, 22: missing IDs and validation | Missing or inaccessible message ID is 404; malformed request syntax is 400. **Different wire contract:** well-formed invalid field values can be 422. `errors_and_access_boundary`, `scoped_cli_and_actual_loopback`. |
 | Core 23: narrow a caller | Effective channel rules in `GET /v1/me`, request can only restrict rights; direct CLI and REST share live enforcement. `channel_rules_intersect_caps`, `scoped_cli_and_actual_loopback`. |
-| Core 24, 25: profile avatar/ownership | `X-Board-Profile` is a structured item: quoted/token name, unknown valid parameters ignored, last avatar wins. Names are case-normalized (1–32 letters/digits/hyphens, letter first); avatars use HTTPS or HTTP on `localhost` / `127.0.0.1`. Storing the URL does not fetch it. Namespaced principal owns its profiles' posts, sibling profiles do not; a delegated profile cannot impersonate a sibling. `profile_headers_edit_timestamps`, `scoped_cli_and_actual_loopback`. |
+| Core 24, 25: profile avatar/ownership | `X-Board-Profile` is a structured item: quoted/token name, unknown valid parameters ignored, last avatar wins. Names are case-normalized (1–32 letters/digits/hyphens, letter first); avatars use HTTPS or HTTP on `localhost` / `127.0.0.1`. An agent inherits its person's current handle (`oncall/helper`) unless explicitly configured otherwise. Renaming the person changes presentation, not actor IDs or already-settled mentions. Storing the URL does not fetch it. Namespaced principal owns its profiles' posts, sibling profiles do not; a delegated profile cannot impersonate a sibling. `profile_headers_edit_timestamps`, `a_named_profile_inherits`, `scoped_cli_and_actual_loopback`. |
 | Core 26, 27, 28: ignore obsolete identity headers; no session | Separate avatar/session headers cannot create or change attribution. No session in viewer, current message or event. `scoped_cli_and_actual_loopback`. |
 | Paging 1, 2: backwards windows, incompatible cursors | Group by thread before slicing; `older` and snapshot cursor are distinct. Reject backwards and forwards together. `older_windows_group_before_paging`. Consecutive pages are not a database-wide time-travel snapshot across concurrent mutations. |
 | Search 1, 2: text in current roots/replies, channel subtree | Literal Unicode lowercase substring, not SQL wildcard; edits affect the current search and a descendant reply can select its root. Subtree includes root, excludes unrelated similar names. `channel_prefix_pages_are_not_subtrees`, `subtree_search_event_snapshots`. Also tested outside those two cases: visible author handles and `me` vs principal-family filters in current reads, events and history (`self_selectors_include_only`). |
@@ -107,11 +107,34 @@ See [grant policy tests](../crates/board-core/tests/grant_policy.rs),
 | Reference case | Local implementation and evidence |
 | --- | --- |
 | Schemas 1: built-ins first, get by ID | Built-in `git-commit@1` plus vendor-neutral HTTP(S) `deployment@1`, then custom versions. Unknown ID is distinct from invalid ID. `local_deployment_schema_validates`, `a_v1_deployment_schema_keeps`, `source_filter_selects_inbound_origin`. Hosted deployment identity/host validation is not copied. |
-| Schemas 2, 3: immutable registration, allowed definition subset | Canonical parsed JSON compare includes description; immutable versions, bounded definitions and registry, reserved built-ins, no external refs. [Schema contract tests](../crates/board-core/tests/schema_contract.rs), `channel_and_schema_retries`. |
-| Schemas 4: typed data fence | Validate bounded structural keywords and supported formats **before commit** on post and edit. Malformed or unknown fences do not overwrite earlier content. `local_blocks_are_immutable`, `checked_data_fences_include_html`, `schema_value_formats_and_numeric_steps`. |
+| Schemas 2, 3: immutable registration, allowed definition subset | Canonical parsed JSON compare includes description. Numeric spellings such as `1` and `1.0` are equivalent, including in nested literals; distinct 64-bit integers are never collapsed through floating point. Immutable versions, bounded definitions and registry, reserved built-ins, no external refs. [Schema contract tests](../crates/board-core/tests/schema_contract.rs), `registry_retries_compare_numeric_values`, `channel_and_schema_retries`. |
+| Schemas 4: typed data fence | A native post, reply or edit checks its blocks **before middleware** and checks replacements again **before commit**. Invalid input, rewritten text or a failed middleware emission cannot leave partial state. Platform imports and their edits carry text, never typed blocks; valid-looking external JSON isn't a local schema assertion. `local_blocks_are_immutable`, `checked_data_fences_include_html`, `schema_value_formats_and_numeric_steps`, [body provenance tests](../crates/board-core/tests/body_provenance.rs). |
 | Schemas 5: read vs global manage | Active delegates can inspect definitions. Registration requires effective manage at the wildcard pattern; regional authority does not qualify. `inherited_everyone_lock`. |
 | Attachments 1, 2: upload/post/read, dotfiles | Raw bytes remain in SQLite, IDs reusable. Even a delegate who reads all channels cannot fetch someone else's unpublished bytes by guessing a numeric ID. They need a readable, non-deleted placement; the uploader's own origin grant or trusted OS owner can also qualify. Reject hidden names, paths and invisible controls. Resumable offsets and digest verification are local alternatives to external upload URLs. [Upload tests](../crates/board-core/tests/uploads.rs), `all_channel_read_does_not_make_unpublished`, `message_workflow_profiles`. |
 | Attachments 3: task roots carry files | Same message files and stale retry semantics as ordinary posts. [task_attachments_are_message_files](../crates/board-api/src/work/tests.rs). |
+
+Before schema v14 an incoming message could acquire a typed block, or be
+rejected just because it quoted invalid data. V14 keeps the original body,
+IDs, receipts and immutable log and stops presenting these legacy imports as
+trusted block data (including when viewing historical events). Old databases
+did not record which interface made every past edit of an imported message;
+the upgrade conservatively treats those historical revisions as platform
+text. A deliberate native edit after upgrade checks the body afresh.
+The normal message-size and local policy limits still apply to intake.
+The port's source envelope is explicitly an import; use the ordinary message
+API for native data rather than claiming that its wire shape accepts
+the upstream `from: null` sentinel.
+
+An original source may report another platform actor's edit or deletion. The
+message author stays intact; the event names the actor who made the change.
+An edit by someone other than the task owner holds a claimed task. A linked
+mirror or an ordinary sibling profile has no such authority.
+[`platform_actors`](../crates/board-core/tests/platform_actors.rs) exercises
+all three paths. Even when two watchers belong to the same person their
+credentials may see different actor directories: alias resolution is shared
+only inside one event snapshot for one registering credential.
+[`watcher_audiences`](../crates/board-core/tests/watcher_audiences.rs) compares
+the resulting deliveries from a full and a channel-limited credential.
 
 Run without network after dependencies are fetched:
 
@@ -122,6 +145,8 @@ node scripts/compare-reference.mjs /path/to/reference target/debug/board
 node scripts/compare-schema-values.mjs /path/to/reference target/debug/board
 node scripts/compare-reactions.mjs /path/to/reference target/debug/board
 node scripts/compare-profile-handles.mjs /path/to/reference target/debug/board
+# Requires the original package with its development dependencies already installed:
+node scripts/compare-platform-blocks.mjs /path/to/original/package target/debug/board
 ```
 
 The Node scripts are developer-only checks using the reference as a read-only

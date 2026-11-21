@@ -1,6 +1,7 @@
 //! Local credentials bind a fixed actor to a board. Grants can change independently
 //! of a credential; authorization is read in the same SQLite transaction as the data.
 mod policy;
+mod private_channels;
 mod registry;
 pub use registry::{Credential, Decision, Grant, GrantBatch, GrantInput, GrantSpec, Issued};
 
@@ -211,7 +212,7 @@ pub(crate) struct Access {
 }
 
 impl Access {
-    fn owner() -> Self {
+    pub(crate) fn owner() -> Self {
         Self {
             actor: None,
             id: None,
@@ -400,6 +401,7 @@ impl Access {
         ))
     }
     pub(crate) fn view(&self, c: &Connection, mut m: crate::Message) -> Result<crate::Message> {
+        crate::schemas::correct_snapshot(c, &mut m)?;
         if !self.allows(Action::Read, &m.channel) {
             m.links.clear();
             m.file_notices.clear();
@@ -606,6 +608,20 @@ impl Board {
             Err(std::env::VarError::NotPresent) => Ok(None),
             Err(e) => Err(e.into()),
         }
+    }
+    /// Attach profile metadata to successful write transactions, not to reads or failed writes.
+    pub fn set_write_avatar(&mut self, actor: &str, url: &str) -> Result<()> {
+        let (_, profile) = actor
+            .split_once('/')
+            .context("an avatar needs a named profile")?;
+        crate::local::profile_name(profile)?;
+        self.access_on(&self.conn)?.actor(actor)?;
+        crate::actors::valid_avatar(url)?;
+        self.request_avatar = Some((actor.to_owned(), url.to_owned()));
+        Ok(())
+    }
+    pub fn clear_write_avatar(&mut self) {
+        self.request_avatar = None;
     }
     /// Execute one request on a serialized owner connection; restricted callers
     /// cannot rebind it. Domain methods refresh the policy inside their own transactions.
