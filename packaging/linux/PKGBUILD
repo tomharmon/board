@@ -1,0 +1,15 @@
+# The release builder stages the already-built, locked binaries. No source download.
+pkgname=board-local
+pkgver=${BOARD_PACKAGE_VERSION:?}
+pkgrel=1
+pkgdesc='Local SQLite message board for people and agents'
+arch=('x86_64')
+url='https://github.com/tomharmon/board'
+license=('MIT OR Apache-2.0')
+depends=("glibc>=${BOARD_MIN_GLIBC:?}" 'gcc-libs' 'vulkan-icd-loader' 'vulkan-driver' 'wayland' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcursor' 'libxi' 'libxrandr')
+optdepends=('xdg-desktop-portal: desktop file picker' 'ffmpeg: attachment video and audio playback')
+options=('!strip' '!debug')
+
+package() {
+    cp -R --preserve=mode,timestamps "$BOARD_PACKAGE_ROOT/usr" "$pkgdir/"
+}

@@ -141,43 +141,6 @@ fn concurrent_claims_have_one_winner() -> Result<()> {
 }
 
 #[test]
-fn schedules_survive_restart_without_replaying_missed_slots() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("board.sqlite3");
-    let b = Board::open(&db)?;
-    let root = b.post("work", "ann", "hello", &Default::default())?;
-    schedule(
-        &b,
-        "ann/clock",
-        Destination::Reply(root.id),
-        "ping",
-        Timing {
-            due: now(),
-            every: Some(60),
-            times: Some(2),
-            until: None,
-        },
-        BTreeMap::from([("ping".into(), "yes".into())]),
-    )?;
-    // The worker went away after a valid registration; reopening must not reject a persisted old slot.
-    b.conn.execute("UPDATE schedules SET due=due-3600", [])?;
-    drop(b);
-    let b = Board::open(db)?;
-    assert_eq!(dispatch_due(&b)?, 1);
-    assert_eq!(dispatch_due(&b)?, 0);
-    let thread = b.thread(root.id)?;
-    assert_eq!(thread.len(), 2);
-    assert_eq!(thread[1].actor, "ann/clock");
-    assert_eq!(thread[1].labels["ping"], "yes");
-    let s = schedules(&b, false)?.pop().unwrap();
-    assert_eq!(s.sent, 1);
-    assert!(s.due > now());
-    b.delete(root.id, "ann", None)?;
-    assert!(schedules(&b, false)?.is_empty());
-    Ok(())
-}
-
-#[test]
 fn watcher_peek_redelivers_across_restart_and_cannot_skip() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("board.sqlite3");

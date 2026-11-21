@@ -1,38 +1,28 @@
 use super::*;
-use rune::TextEdit;
 use rune_kit::Checkbox;
 
 pub(super) fn options(s: &State) -> El {
-    let active = s.delivery.later || s.delivery.no_sync || !s.delivery.labels.text.is_empty();
+    let active = s.delivery.no_sync || !s.delivery.labels.text.is_empty();
     tool("delivery-options", "Delivery options", &icons::TAG)
         .fill(if active { c(TINT) } else { Color::TRANSPARENT })
         .on_press(State::open_delivery)
 }
-fn input(
-    key: &str,
-    label_: &str,
-    value: &TextEdit,
-    multi: bool,
-    bind: fn(&mut State) -> &mut TextEdit,
-) -> El {
-    let mut field = text_input(value, font(14.0, 450.0))
-        .key(key)
-        .label(label_)
+fn labels(s: &State) -> El {
+    let name = "Labels (one key=value per line)";
+    let field = text_input(&s.delivery.labels, font(14.0, 450.0))
+        .key("compose-labels")
+        .label(name)
         .w_full()
+        .h(74.0)
         .padding(8.0)
         .radius(4.0)
         .border(1.0, c(EDGE))
-        .on_edit(bind)
+        .on_edit(|s: &mut State| &mut s.delivery.labels)
         .on_input_change(|s: &mut State, _| s.draft_changed());
-    field = if multi {
-        field.h(74.0)
-    } else {
-        field.single_line().h(35.0)
-    };
     col()
         .w_full()
         .gap(4.0)
-        .child(label(label_, 13.0, 570.0, INK).w_full().wrap_anywhere())
+        .child(label(name, 13.0, 570.0, INK).w_full().wrap_anywhere())
         .child(field)
 }
 pub(super) fn view(s: &State, inset: f32) -> El {
@@ -67,65 +57,12 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                 .build(&Kit::neutral(dark()))
                 .key("compose-no-sync"),
         )
-        .child(input(
-            "compose-labels",
-            "Labels (one key=value per line)",
-            &d.labels,
-            true,
-            |s| &mut s.delivery.labels,
-        ));
+        .child(labels(s));
     if let Some(choices) = suggestions::labels(s, suggestions::Field::Delivery) {
         form = form.child(choices);
     }
-    form = form.child(
-        Checkbox::new(d.later)
-            .label("Schedule delivery")
-            .on_toggle(|s: &mut State| {
-                s.delivery.later = !s.delivery.later;
-                s.draft_changed();
-            })
-            .build(&Kit::neutral(dark()))
-            .disabled(d.after.is_some())
-            .key("compose-later"),
-    );
     if let Some(id) = d.after {
         form = form.child(guard(id));
-    }
-    if d.later {
-        form = form
-            .child(input(
-                "compose-due",
-                "First send (RFC 3339)",
-                &d.due,
-                false,
-                |s| &mut s.delivery.due,
-            ))
-            .child(
-                row()
-                    .w_full()
-                    .gap(8.0)
-                    .child(col().grow(1.0).min_w(0.0).child(input(
-                        "compose-every",
-                        "Repeat interval (seconds)",
-                        &d.every,
-                        false,
-                        |s| &mut s.delivery.every,
-                    )))
-                    .child(col().grow(1.0).min_w(0.0).child(input(
-                        "compose-times",
-                        "Maximum sends",
-                        &d.times,
-                        false,
-                        |s| &mut s.delivery.times,
-                    ))),
-            )
-            .child(input(
-                "compose-until",
-                "Or repeat until (RFC 3339)",
-                &d.until,
-                false,
-                |s| &mut s.delivery.until,
-            ));
     }
     if s.error.is_some() {
         form = form.child(

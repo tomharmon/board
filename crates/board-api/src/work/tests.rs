@@ -265,11 +265,7 @@ async fn work_pages() {
     assert_eq!(rest.body["watchers"][0]["name"], "two");
     assert_eq!(rest.body["cursor"], head.body["cursor"]); // A failed create left no control event.
     assert!(rest.body["next_after"].is_null());
-    for path in [
-        "/tasks?after=-1",
-        "/watchers?limit=501",
-        "/schedules?limit=0",
-    ] {
+    for path in ["/tasks?after=-1", "/watchers?limit=501"] {
         let rejected = request(&router, "GET", path, Value::Null, &[]).await;
         assert_eq!(rejected.status, StatusCode::BAD_REQUEST, "{path}");
         assert_eq!(
@@ -277,38 +273,49 @@ async fn work_pages() {
             "application/problem+json"
         );
     }
-    let gone = request(&router, "GET", "/schedules/521", Value::Null, &[]).await;
-    assert_eq!(gone.status, StatusCode::NOT_FOUND);
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    for due in [epoch + 500, epoch] {
-        assert_eq!(
-            request(
+}
+
+#[test]
+fn clock_sends_are_not_routable_or_silently_posted_as_messages() {
+    runtime().block_on(async {
+        let router = api(Board::memory().unwrap());
+        for (method, path) in [
+            ("GET", "/schedules"),
+            ("POST", "/schedules"),
+            ("GET", "/schedules/1"),
+            ("DELETE", "/schedules/1"),
+        ] {
+            let response = request(
                 &router,
-                "POST",
-                "/schedules",
-                json!({"channel":"a","text":"hi","due":due}),
-                &[]
+                method,
+                path,
+                json!({"channel":"ops","text":"no timer","due":0}),
+                &[],
             )
-            .await
-            .status,
-            StatusCode::CREATED
+            .await;
+            assert_eq!(response.status, StatusCode::NOT_FOUND, "{method} {path}");
+        }
+        let spec = request(&router, "GET", "/openapi.json", Value::Null, &[]).await;
+        assert!(spec.body["paths"].get("/schedules").is_none());
+        assert!(
+            spec.body["components"]["schemas"]
+                .get("NewSchedule")
+                .is_none()
         );
-    }
-    let page = request(&router, "GET", "/schedules?limit=1", Value::Null, &[]).await;
-    let id = page.body["next_after"].as_i64().unwrap();
-    assert_eq!(page.body["schedules"][0]["due"], epoch + 500); // Ordered by stable ID, not mutable due time.
-    let page = request(
-        &router,
-        "GET",
-        &format!("/schedules?after={id}"),
-        Value::Null,
-        &[],
-    )
-    .await;
-    assert_eq!(page.body["schedules"][0]["due"], epoch);
+        let body = json!({"channel":"ops","text":"only intended for later","due":0});
+        assert!(
+            request(&router, "POST", "/messages", body, &[])
+                .await
+                .status
+                .is_client_error()
+        );
+        assert_eq!(
+            request(&router, "GET", "/messages", Value::Null, &[])
+                .await
+                .body["messages"],
+            json!([])
+        );
+    });
 }
 
 #[test]
@@ -612,7 +619,7 @@ async fn task_round_trip() {
 }
 
 #[test]
-fn schedule_and_watcher_resources_survive_server_and_worker_restart() {
+fn watcher_resources_and_unacknowledged_posts_survive_server_restart() {
     runtime().block_on(automation_round_trip());
 }
 
@@ -875,14 +882,6 @@ async fn automation_round_trip() {
     let made=request(&router,"POST","/watchers",json!({"name":"pings","filter":{"channel":"ops/","labels":{"ping":"yes"}},"kind":"message.posted"}),&[]).await;
     assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
     assert_eq!(made.headers[header::LOCATION], "/v1/watchers/pings");
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    let make_schedule = json!({"channel":"ops/ci","due":epoch-30,"every":60,"times":2,"text":"check","labels":{"ping":"yes"}});
-    let s = request(&router, "POST", "/schedules", make_schedule, &[]).await;
-    assert_eq!(s.status, StatusCode::CREATED, "{}", s.body);
-    let sid = s.body["id"].as_i64().unwrap();
     assert_eq!(
         request(&router, "GET", "/watchers/pings/next", Value::Null, &[])
             .await
@@ -891,15 +890,20 @@ async fn automation_round_trip() {
     );
     drop(router);
 
-    let worker = Board::open(&path).unwrap();
-    assert_eq!(work::dispatch_due(&worker).unwrap(), 1);
-    assert_eq!(work::dispatch_due(&worker).unwrap(), 0);
-    drop(worker);
     let router = api(Board::open(&path).unwrap());
+    let posted = request(
+        &router,
+        "POST",
+        "/messages",
+        json!({"channel":"ops/ci","text":"check","labels":{"ping":"yes"}}),
+        &[],
+    )
+    .await;
+    assert_eq!(posted.status, StatusCode::CREATED);
     let first = request(&router, "GET", "/watchers/pings/next", Value::Null, &[]).await;
     assert_eq!(first.body["type"], "message.posted", "{}", first.body);
     let cursor = first.body["cursor"].as_i64().unwrap();
-    assert_eq!(first.body["payload"]["schedule"]["id"], sid);
+    assert_eq!(cursor, posted.body["id"]);
     drop(router);
     let router = api(Board::open(&path).unwrap());
     assert_eq!(
@@ -962,36 +966,6 @@ async fn automation_round_trip() {
         StatusCode::NO_CONTENT
     );
 
-    assert_eq!(
-        request(
-            &router,
-            "DELETE",
-            &format!("/schedules/{sid}"),
-            Value::Null,
-            &[]
-        )
-        .await
-        .status,
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        request(
-            &router,
-            "GET",
-            &format!("/schedules/{sid}"),
-            Value::Null,
-            &[]
-        )
-        .await
-        .body["state"],
-        "canceled"
-    );
-    assert_eq!(
-        request(&router, "GET", "/schedules", Value::Null, &[])
-            .await
-            .body["schedules"],
-        json!([])
-    );
     assert_eq!(
         request(&router, "DELETE", "/watchers/pings", Value::Null, &[])
             .await

@@ -500,13 +500,10 @@ fn message(
         }
         content = content.child(meta);
     }
-    if m.no_sync || m.schedule.is_some() || m.from.is_some() {
+    if m.no_sync || m.from.is_some() {
         let mut badges = row().w_full().flex_wrap().center_y().gap(4.);
         if m.no_sync {
             badges = badges.child(chip("Local only"));
-        }
-        if let Some(send) = &m.schedule {
-            badges = badges.child(chip(format!("Schedule #{}   Send {}", send.id, send.n)));
         }
         if let Some(origin) = &m.from {
             badges = badges.child(chip(format!("Source: {origin}")));
@@ -877,56 +874,6 @@ fn thread_body(s: &State, id: i64, inset: f32, show_task_facts: bool) -> El {
             );
         }
         content = content.child(paging);
-    }
-    for pending in &s.browse.schedules {
-        let sid = pending.id;
-        let mut pending_row = row().w_full().center_y().gap(5.0).child(
-            mono(
-                format!(
-                    "Scheduled reply #{}   {}",
-                    pending.id,
-                    workspace::utc(pending.due)
-                ),
-                MUTED,
-            )
-            .key(format!("scheduled-reply-{}", pending.id))
-            .py(6.0)
-            .grow(1.0)
-            .min_w(0.0)
-            .wrap_anywhere(),
-        );
-        if pending.actor == s.actor
-            || pending
-                .actor
-                .strip_prefix(&s.actor)
-                .is_some_and(|v| v.starts_with('/'))
-        {
-            pending_row = if s.browse.cancel == Some(sid) {
-                pending_row
-                    .child(
-                        action(&format!("confirm-pending-{sid}"), "Cancel send", false)
-                            .on_press(move |s: &mut State| s.cancel_pending(sid)),
-                    )
-                    .child(
-                        tool(
-                            &format!("keep-pending-{sid}"),
-                            "Keep schedule",
-                            &glyphs::CLOSE,
-                        )
-                        .on_press(|s: &mut State| s.browse.cancel = None),
-                    )
-            } else {
-                pending_row.child(
-                    tool(
-                        &format!("cancel-pending-{sid}"),
-                        "Cancel scheduled reply",
-                        &glyphs::CLOSE,
-                    )
-                    .on_press(move |s: &mut State| s.browse.cancel = Some(sid)),
-                )
-            };
-        }
-        messages = messages.child(pending_row);
     }
     content = content.child(transcript(
         s,

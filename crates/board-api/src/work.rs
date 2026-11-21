@@ -11,7 +11,7 @@ use axum::{
 };
 use board_local::{
     PostOptions,
-    automation::{self as work, ClaimTarget, Destination, Task, TaskAction, TaskTarget, Timing},
+    automation::{self as work, ClaimTarget, Task, TaskAction, TaskTarget},
 };
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
@@ -40,13 +40,6 @@ pub(super) fn routes() -> Router<App> {
         .route("/task-claims/recover", post(recover))
         .route("/task-batches", post(create_batch).get(batch_query))
         .route("/task-batches/{key}", get(batch))
-        .route(
-            "/schedules",
-            get(schedules)
-                .post(schedule)
-                .layer(DefaultBodyLimit::max(56 * 1024 * 1024)),
-        )
-        .route("/schedules/{id}", get(get_schedule).delete(cancel_schedule))
         .route(
             "/watchers",
             get(watchers).post(watcher).put(replace_watchers),
@@ -588,99 +581,6 @@ async fn release(
     })
     .await
     .map_err(conditional_failure)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Default, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct SchedulePage {
-    all: bool,
-    after: Option<i64>,
-    limit: Option<usize>,
-    re: Option<i64>,
-    by: Option<String>,
-    channel: Option<String>,
-}
-async fn schedules(State(app): State<App>, Query(q): Query<SchedulePage>) -> Data {
-    let (after, n) = (after(q.after)?, limit(q.limit)?);
-    let (cursor, mut rows) = app
-        .call(move |b, _| {
-            work::schedule_query_in(
-                b,
-                q.all,
-                q.re,
-                q.by.as_deref(),
-                q.channel.as_deref(),
-                after,
-                (n + 1) as i64,
-                true,
-            )
-        })
-        .await?;
-    let next = continuation(&mut rows, n, |s| s.id);
-    Ok(Json(
-        json!({"cursor":cursor,"next_after":next,"schedules":rows}),
-    ))
-}
-async fn get_schedule(State(app): State<App>, Path(id): Path<i64>) -> Data {
-    Ok(Json(json!(
-        app.call(move |b, _| work::get_schedule(b, id)).await?
-    )))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NewSchedule {
-    #[serde(default)]
-    no_sync: bool,
-    channel: Option<String>,
-    reply_to: Option<i64>,
-    #[serde(default)]
-    text: String,
-    due: i64,
-    every: Option<i64>,
-    times: Option<i64>,
-    until: Option<i64>,
-    #[serde(default)]
-    labels: Labels,
-    #[serde(default)]
-    attachments: Vec<FileInput>,
-    #[serde(default)]
-    attachment_ids: Vec<i64>,
-}
-async fn schedule(State(app): State<App>, Json(body): Json<NewSchedule>) -> ApiResult<Response> {
-    let s = app
-        .call(move |b, a| {
-            let to = match (&body.channel, body.reply_to) {
-                (Some(c), None) => Destination::Channel(c),
-                (None, Some(id)) => Destination::Reply(id),
-                _ => anyhow::bail!("provide exactly one of channel and reply_to"),
-            };
-            work::schedule_post(
-                b,
-                a,
-                to,
-                &body.text,
-                Timing {
-                    due: body.due,
-                    every: body.every,
-                    times: body.times,
-                    until: body.until,
-                },
-                &PostOptions {
-                    no_sync: body.no_sync,
-                    labels: body.labels,
-                    files: decode_files(body.attachments)?,
-                    attachment_ids: body.attachment_ids,
-                    ..Default::default()
-                },
-            )
-        })
-        .await?;
-    Ok(created(format!("/v1/schedules/{}", s.id), json!(s)))
-}
-async fn cancel_schedule(State(app): State<App>, Path(id): Path<i64>) -> ApiResult<StatusCode> {
-    app.call(move |b, a| work::cancel_schedule(b, id, a))
-        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

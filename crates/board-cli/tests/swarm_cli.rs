@@ -203,17 +203,19 @@ fn public_and_dm_syntax_is_unambiguous_and_skill_installs_without_opening_db() {
             .unwrap()
             .starts_with("---\nname: board-swarm\n")
     );
-    for target in ["codex", "claude"] {
+    for (target, dir) in [("codex", ".agents"), ("claude", ".claude")] {
         let installed = parsed(
             b.cmd("", &["skill", "install", target])
                 .env("HOME", b.tmp.path())
+                .env("USERPROFILE", b.tmp.path())
+                .env_remove("CLAUDE_CONFIG_DIR")
                 .output()
                 .unwrap(),
         );
         let expected = b
             .tmp
             .path()
-            .join(format!(".{target}/skills/board-swarm/SKILL.md"));
+            .join(format!("{dir}/skills/board-swarm/SKILL.md"));
         assert_eq!(installed["path"], expected.to_str().unwrap());
         assert_eq!(fs::read(expected).unwrap(), fs::read(&skill).unwrap());
     }

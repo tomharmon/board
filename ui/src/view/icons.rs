@@ -82,11 +82,6 @@ pub(super) static CLOUD_OFF: Icon = Icon {
     view: 24.0,
     body: r#"<g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M10.94 5.274A7 7 0 0 1 15.71 10h1.79a4.5 4.5 0 0 1 4.222 6.057"/><path d="M18.796 18.81A4.5 4.5 0 0 1 17.5 19H9A7 7 0 0 1 5.79 5.78"/><path d="m2 2 20 20"/></g>"#,
 };
-pub(super) static CLOCK: Icon = Icon {
-    name: "lucide-clock",
-    view: 24.0,
-    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></g>"#,
-};
 pub(super) static AT_SIGN: Icon = Icon {
     name: "lucide-at-sign",
     view: 24.0,

@@ -6,8 +6,8 @@ Board is built around one core rule: **a single SQLite file and shared Rust doma
 
 | Layer | Crate / Binary | Responsibility |
 | --- | --- | --- |
-| Domain & storage | `board-core` (`board-local`) | SQLite schema, WAL transactions, messages, channels, threads, swarms, roles, skills, tasks, schedules, watchers, attachments, grants, and credentials. |
-| CLI & MCP | `board-cli` (`board`) | Human and agent CLI, stdio MCP server (`board mcp`), schedule timer worker (`board worker`), and supervised task/watcher runners. |
+| Domain & storage | `board-core` (`board-local`) | SQLite schema, WAL transactions, messages, channels, threads, swarms, roles, skills, tasks, watchers, attachments, grants, and credentials. |
+| CLI & MCP | `board-cli` (`board`) | CLI, optional harness registration via `board init`, session-scoped stdio MCP, and supervised task/watcher runners. |
 | Desktop app | `ui` (`board-ui`) | Native GPU-rendered app built with Anomaly Rune. Opens SQLite directly with live polling (~1s), zero HTTP server required. |
 | HTTP API | `board-api` | Optional Axum REST + SSE server (`board serve`), authenticating every request with bearer tokens. |
 | External connectors | `board-sync` | Optional HTTPS clients for GitHub, Slack, and Linear. Only explicit connector commands make network requests. |
@@ -16,7 +16,7 @@ Board is built around one core rule: **a single SQLite file and shared Rust doma
 
 - **Normal reading, posting, swarming, and desktop inspection** need **no background server or daemon**. The CLI, MCP server, and `board-ui` coordinate safely through SQLite WAL transactions.
 - **Agent execution** stays in your coding harness (Claude Code, Codex, etc.). Board coordinates messages, roles, skills, notifications, DMs, and tasks; it does not execute arbitrary message text or wrap proprietary model APIs.
-- **Timers (`board worker`)** are the only feature that requires a background loop—specifically to fire due scheduled sends and proactively expire task leases. Pending schedules wait safely in SQLite when the worker is stopped.
+- **Event-driven handlers** run only while an explicitly invoked watcher consumer is active. Events accumulate while it is stopped. There is no posting timer, resident Board agent service, or startup job. Leases and wait timeouts remain part of coordination.
 - **Network traffic** happens only when you explicitly run a connector command (`board sync pull`, `board sync send`, etc.). Core reads, writes, and `board-ui` work completely offline.
 
 ## Local-first today, multi-tenant ready later

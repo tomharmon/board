@@ -234,15 +234,6 @@ impl Access {
     pub(crate) fn request_narrowed(&self) -> bool {
         self.extra_cap
     }
-    pub(crate) fn durable_cap(&self) -> Option<&Rules> {
-        self.extra_cap.then(|| self.caps.last()).flatten()
-    }
-    pub(crate) fn with_durable_cap(mut self, actor: &str, cap: Rules) -> Self {
-        self.actor.get_or_insert_with(|| actor.to_owned());
-        self.caps.push(cap);
-        self.extra_cap = true;
-        self
-    }
     pub(crate) fn integration_narrowed(&self) -> bool {
         !self.caps.is_empty()
     }

@@ -159,6 +159,7 @@ impl Board {
                 skill.files["SKILL.md"]
             ));
         }
+        let selector = format!("{}/{}", run.slug, worker.name);
         let mut env_vars = BTreeMap::from([
             (
                 "BOARD_USER".into(),
@@ -166,20 +167,25 @@ impl Board {
             ),
             ("BOARD_PROFILE".into(), worker.name.clone()),
             ("BOARD_SWARM_RUN".into(), run.slug.clone()),
+            ("BOARD_WORKER".into(), selector.clone()),
         ]);
-        if let Some(db) = self.conn.path().filter(|p| !p.is_empty()) {
-            env_vars.insert(
-                "BOARD_DB".into(),
-                fs::canonicalize(db)?
-                    .to_str()
-                    .context("Board path is not UTF-8")?
-                    .into(),
-            );
-        }
+        let cli_args = if let Some(db) = self.conn.path().filter(|p| !p.is_empty()) {
+            let db = fs::canonicalize(db)?
+                .to_str()
+                .context("Board path is not UTF-8")?
+                .to_owned();
+            env_vars.insert("BOARD_DB".into(), db.clone());
+            let args = vec!["--db".to_owned(), db, "--worker".into(), selector];
+            assembled_prompt.push_str(&format!("\n\nBoard CLI: prepend these literal arguments to each subcommand: {}. Use this assignment's BOARD_USER. Run whoami --json before writing; expect actor {} and run {}. Never use the chat's shared Board MCP connection. A dedicated worker MCP is usable only after board_whoami confirms this exact worker and run. If neither transport is available, report the blocker rather than speaking as the coordinator.",serde_json::to_string(&args)?,worker.actor,run.slug));
+            Some(args)
+        } else {
+            None
+        };
         Ok(SpawnedWorker {
             worker,
             skills_dir,
             env_vars,
+            cli_args,
             assembled_prompt,
         })
     }

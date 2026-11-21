@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Board
+GenericName=Local Message Board
+Comment=View messages, tasks, and agent swarms
+Exec=/usr/bin/board-ui
+TryExec=/usr/bin/board-ui
+Icon=org.localboard.Board
+StartupWMClass=org.localboard.Board
+Terminal=false
+Categories=Development;ProjectManagement;

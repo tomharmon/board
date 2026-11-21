@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" UpgradeCode="53DAE612-EA5C-4B43-943E-F513FE7FC8B8" Name="Board" Language="1033" Version="$(var.Version)" Manufacturer="Board">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" InstallPrivileges="limited"/>
+    <MajorUpgrade Schedule="afterInstallInitialize" DowngradeErrorMessage="A newer version of Board is already installed."/>
+    <MediaTemplate EmbedCab="yes"/>
+    <Icon Id="Board.ico" SourceFile="$(var.Icon)"/>
+    <Property Id="ARPPRODUCTICON" Value="Board.ico"/>
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/tomharmon/board"/>
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="LocalAppDataFolder">
+        <Directory Id="UserPrograms" Name="Programs">
+          <Directory Id="INSTALLFOLDER" Name="Board">
+            <Component Id="BoardFiles" Guid="25F9CB93-9CE3-4F76-A975-6D7369B97743" Win64="yes">
+              <RegistryValue Root="HKCU" Key="Software\tomharmon\Board" Name="InstallLocation" Type="string" Value="[INSTALLFOLDER]" KeyPath="yes"/>
+              <File Id="BoardCLI" Source="$(var.BinDir)\board.exe"/>
+              <File Id="BoardUI" Source="$(var.BinDir)\board-ui.exe"/>
+              <File Id="Notices" Source="$(var.Notices)"/>
+              <Environment Id="BoardUserPath" Name="PATH" Value="[INSTALLFOLDER]" Action="set" Part="last" System="no" Permanent="no"/>
+              <RemoveFolder Id="RemoveBoardDir" On="uninstall"/>
+              <RemoveFolder Id="RemoveEmptyUserPrograms" Directory="UserPrograms" On="uninstall"/>
+            </Component>
+          </Directory>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder">
+        <Component Id="BoardLauncher" Guid="735D6C0F-41CA-4C94-94C6-859335824E09" Win64="yes">
+          <Shortcut Id="BoardShortcut" Name="Board" Target="[#BoardUI]" WorkingDirectory="INSTALLFOLDER" Icon="Board.ico" Description="Local message board for people and agents"/>
+          <RegistryValue Root="HKCU" Key="Software\tomharmon\Board" Name="StartMenu" Type="integer" Value="1" KeyPath="yes"/>
+        </Component>
+      </Directory>
+    </Directory>
+    <Feature Id="Board" Title="Board" Level="1">
+      <ComponentRef Id="BoardFiles"/>
+      <ComponentRef Id="BoardLauncher"/>
+    </Feature>
+  </Product>
+</Wix>

@@ -6,4 +6,4 @@ mod stdio;
 mod tools;
 
 pub use router::{ActorContext, handle_request};
-pub use stdio::serve_stdio;
+pub use stdio::{serve_stdio, serve_stdio_bound};

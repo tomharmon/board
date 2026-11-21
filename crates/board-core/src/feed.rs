@@ -70,6 +70,7 @@ pub(crate) fn allowed(c: &Connection, a: &Access, mut event: Event) -> Result<Op
                 "rule.",
                 "credential.",
                 "watcher.",
+                "schedule.",
                 "upload.",
                 "attachment.",
             ]

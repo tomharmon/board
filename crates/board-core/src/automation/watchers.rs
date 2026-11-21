@@ -17,7 +17,7 @@ pub struct Watcher {
     pub kind: Option<String>,
     pub all: bool,
     pub cursor: i64,
-    /// Writes made as this watcher's profile don't feed back into it, except scheduled posts.
+    /// Writes made as this watcher's profile don't feed back into it (except pre-v16 timed posts).
     pub run_as: Option<String>,
 }
 
@@ -114,8 +114,8 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
 }
 
 /// A name, its owner and a credential's grants can all change before a pull.
-/// Save only positive decisions, not message copies. A provisional task, source
-/// or scheduled post may replace its own snapshot inside this same transaction.
+/// Save only positive decisions, not message copies. A provisional task or source
+/// post may replace its own snapshot inside this same transaction.
 pub(crate) fn capture_filters(tx: &Transaction<'_>, cursor: i64) -> Result<()> {
     let mut stmt = tx.prepare_cached(
         "SELECT w.name,w.filter,r.credential FROM watcher_registry r JOIN watchers w ON w.name=r.internal

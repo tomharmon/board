@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 64 64">
+  <title>Board</title>
+  <rect x="3" y="3" width="58" height="58" rx="13" fill="#163c41"/>
+  <path d="M14 16h12v32H14zM30 16h20v13H30z" fill="#f6f8ef"/>
+  <path d="M30 33h20v7H30z" fill="#71cdb4"/>
+  <path d="M30 44h13v4H30z" fill="#f2ac62"/>
+</svg>

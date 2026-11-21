@@ -44,7 +44,6 @@ pub enum Page {
     Swarm(i64),
     Workspace,
     Roles,
-    Schedules,
     Watchers,
     Schemas,
     Access,
@@ -450,7 +449,6 @@ impl State {
             self.activity_messages.clear();
             self.inactive_draft.clear();
             self.thread.clear();
-            self.browse.schedules.clear();
             self.browse.targets.clear();
             self.browse.adding_channel = false;
             self.browse.private_channel = false;

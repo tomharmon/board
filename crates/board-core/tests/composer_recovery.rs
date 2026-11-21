@@ -105,21 +105,20 @@ fn saved_newest_guard_cannot_be_removed_rebased_or_moved_outside_its_thread() ->
         after: Some(seen),
         ..Default::default()
     };
-    for bad in [
-        ComposerSettings {
-            after: Some(outside),
-            ..settings.clone()
-        },
-        ComposerSettings {
-            later: true,
-            ..settings.clone()
-        },
-    ] {
-        assert!(
-            db.save_composer("reader", &scope, None, Some((&draft, &bad)), None)
-                .is_err()
-        );
-    }
+    let outside_thread = ComposerSettings {
+        after: Some(outside),
+        ..settings.clone()
+    };
+    assert!(
+        db.save_composer(
+            "reader",
+            &scope,
+            None,
+            Some((&draft, &outside_thread)),
+            None
+        )
+        .is_err()
+    );
     let stamp = db
         .save_composer("reader", &scope, None, Some((&draft, &settings)), None)?
         .unwrap();

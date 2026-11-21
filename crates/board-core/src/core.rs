@@ -276,7 +276,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 15;
+const DB_VERSION: i64 = 16;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -633,7 +633,7 @@ impl Board {
                     crate::drafts::root_scope(scope, channel),
                     Conflict.error("draft_changed", "draft destination no longer matches")
                 );
-                let draft = self.check_composer_options_on(tx, actor, scope, text, opts, None)?;
+                let draft = self.check_composer_options_on(tx, actor, scope, text, opts)?;
                 ensure!(
                     draft.channel == channel && draft.reply_to.is_none(),
                     Conflict.error("draft_changed", "draft destination no longer matches")
@@ -700,7 +700,7 @@ impl Board {
     ) -> Result<(Message, bool)> {
         self.write(|tx| {
             if let Some((scope, stamp)) = guard {
-                let draft = self.check_composer_options_on(tx, actor, scope, text, opts, None)?;
+                let draft = self.check_composer_options_on(tx, actor, scope, text, opts)?;
                 let root = self.draft_scope(tx, actor, scope)?;
                 ensure!(
                     root.is_some() && draft.reply_to.or(root) == Some(id),
@@ -749,15 +749,6 @@ impl Board {
         opts: &PostOptions,
     ) -> Result<Message> {
         Ok(Self::insert(tx, channel, None, actor, text, opts, WriteOrigin::Platform)?.0)
-    }
-    pub(crate) fn reply_tx(
-        tx: &Transaction,
-        id: i64,
-        actor: &str,
-        text: &str,
-        opts: &PostOptions,
-    ) -> Result<Message> {
-        Ok(Self::insert_reply(tx, id, actor, text, opts, WriteOrigin::Board)?.0)
     }
     pub(crate) fn platform_reply_tx(
         tx: &Transaction<'_>,
@@ -1076,7 +1067,6 @@ impl Board {
             tx.execute(&format!("DELETE FROM {table} WHERE message_id=?"), [id])?;
         }
         Self::changed(tx, "message.deleted", actor, &before, json!({}), true)?;
-        crate::automation::cancel_for_root(tx, id, actor)?;
         Self::get_on(tx, id)
     }
     pub fn label(&self, id: i64, actor: &str, key: &str, value: Option<&str>) -> Result<Message> {

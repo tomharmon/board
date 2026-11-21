@@ -8,19 +8,16 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Raw editor values deliberately survive restart, including an incomplete or past-due time.
+/// Draft values survive restart; posting is always an explicit, immediate action.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComposerSettings {
     pub no_sync: bool,
-    pub later: bool,
+    /// A draft previously intended for delayed delivery needs explicit manual-send review.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub review_before_send: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
-    pub due: String,
-    pub every: String,
-    pub times: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    pub until: String,
     pub labels: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskDraftSettings>,
@@ -61,26 +58,6 @@ impl ComposerSettings {
         }
         Ok(map)
     }
-    pub fn parsed_timing(&self) -> Result<crate::automation::Timing> {
-        let due = chrono::DateTime::parse_from_rfc3339(self.due.trim())
-            .context("Set the first send time in RFC 3339 with timezone")?
-            .timestamp();
-        let parse = |s: &str| {
-            (!s.trim().is_empty())
-                .then(|| s.trim().parse::<i64>())
-                .transpose()
-        };
-        Ok(crate::automation::Timing {
-            due,
-            every: parse(&self.every).context("Repeat interval must be seconds")?,
-            times: parse(&self.times).context("Send count must be numeric")?,
-            until: (!self.until.trim().is_empty())
-                .then(|| chrono::DateTime::parse_from_rfc3339(self.until.trim()))
-                .transpose()
-                .context("Set the repeat stop time in RFC 3339 with timezone")?
-                .map(|t| t.timestamp()),
-        })
-    }
 }
 pub struct SavedComposer {
     pub draft: Draft,
@@ -102,7 +79,13 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
         CREATE TRIGGER IF NOT EXISTS composer_stamp_on_insert AFTER INSERT ON composer_drafts BEGIN
             INSERT INTO composer_settings VALUES(new.actor,new.scope,lower(hex(randomblob(16))),'{}'); END;
         CREATE TRIGGER IF NOT EXISTS composer_stamp_on_update AFTER UPDATE OF body,channel,reply_to ON composer_drafts BEGIN
-            UPDATE composer_settings SET stamp=lower(hex(randomblob(16))) WHERE actor=new.actor AND scope=new.scope; END;")?;
+            UPDATE composer_settings SET stamp=lower(hex(randomblob(16))) WHERE actor=new.actor AND scope=new.scope; END;
+        UPDATE composer_settings SET settings=json_remove(
+                CASE WHEN json_extract(settings,'$.later') THEN json_set(settings,'$.review_before_send',json('true')) ELSE settings END,
+                '$.later','$.due','$.every','$.times','$.until'), stamp=lower(hex(randomblob(16)))
+            WHERE json_type(settings,'$.later') IS NOT NULL OR json_type(settings,'$.due') IS NOT NULL
+               OR json_type(settings,'$.every') IS NOT NULL OR json_type(settings,'$.times') IS NOT NULL
+               OR json_type(settings,'$.until') IS NOT NULL;")?;
     Ok(())
 }
 
@@ -213,9 +196,8 @@ impl Board {
                 validate_channel(&d.channel)?;
                 access.require(Action::Post, &d.channel)?;
             }
-            ensure!(!settings.later || settings.after.is_none(), "A guarded reply cannot be scheduled");
             ensure!(settings.task.is_some() == (scope == "tasks"), "Task routing belongs to a task draft");
-            ensure!(settings.task.is_none() || (!settings.later && settings.after.is_none() && settings.due.is_empty() && settings.every.is_empty() && settings.times.is_empty() && settings.until.is_empty()), "Task drafts cannot be scheduled or reply-guarded");
+            ensure!(settings.task.is_none() || settings.after.is_none(), "Task drafts cannot be reply-guarded");
             for id in [d.reply_to.or(self.draft_scope(tx, actor, scope)?), settings.after].into_iter().flatten() {
                 let channel = access.message(tx, id, Action::Read)?;
                 let root: i64 = tx.query_row(
@@ -258,7 +240,6 @@ impl Board {
         scope: &str,
         text: &str,
         opts: &crate::PostOptions,
-        timing: Option<&crate::automation::Timing>,
     ) -> Result<Draft> {
         let key = self.composer_key(c, actor, scope)?;
         let (draft, settings) = c
@@ -283,22 +264,14 @@ impl Board {
         ensure!(
             draft.body == text
                 && settings.no_sync == opts.no_sync
-                && settings.later == timing.is_some()
+                && !settings.review_before_send
                 && opts.key.is_none()
                 && settings.after == opts.after
-                && (opts.after.is_none() || (timing.is_none() && scope.starts_with("thread:")))
+                && (opts.after.is_none() || scope.starts_with("thread:"))
                 && opts.attachment_ids.is_empty()
                 && settings.parsed_labels()? == opts.labels,
             conflict()
         );
-        if let Some(t) = timing {
-            let saved = settings.parsed_timing()?;
-            ensure!(
-                (t.due, t.every, t.times, t.until)
-                    == (saved.due, saved.every, saved.times, saved.until),
-                conflict()
-            );
-        }
         let mut stmt = c.prepare(
             "SELECT name,data FROM composer_files WHERE actor=? AND scope=? ORDER BY ordinal",
         )?;
@@ -313,7 +286,7 @@ impl Board {
         ensure!(rows.next()?.is_none(), conflict());
         Ok(draft)
     }
-    /// Called inside the same immediate transaction as the post or schedule; every failure rolls this back.
+    /// Called inside the same immediate transaction as the post; every failure rolls this back.
     pub(crate) fn consume_composer_on(
         &self,
         c: &Connection,

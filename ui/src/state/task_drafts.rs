@@ -72,6 +72,10 @@ impl State {
         let mut entry = workspace::TaskEntry::default();
         if let Some(saved) = saved {
             let settings = &saved.settings;
+            anyhow::ensure!(
+                !settings.review_before_send,
+                "This recovered draft cannot be posted as a task"
+            );
             let task = settings
                 .task
                 .as_ref()

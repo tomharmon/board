@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::ensure;
-use board_local::{LabelTerm, automation::Schedule};
+use board_local::LabelTerm;
 
 const REPLIES: usize = 40;
 
@@ -59,9 +59,7 @@ pub struct Browse {
     pub reveal: Option<i64>,
     pub older: bool,
     pub newer: bool,
-    pub schedules: Vec<Schedule>,
     pub targets: Vec<board_local::sources::SyncTarget>,
-    pub cancel: Option<i64>,
     pub feed_edge: ReadingEdge,
     pub thread_edge: ReadingEdge,
 }
@@ -86,9 +84,7 @@ impl Default for Browse {
             reveal: None,
             older: false,
             newer: false,
-            schedules: Vec::new(),
             targets: Vec::new(),
-            cancel: None,
             feed_edge: ReadingEdge::default(),
             thread_edge: ReadingEdge::default(),
         }
@@ -101,9 +97,7 @@ impl Browse {
         self.reveal = None;
         self.older = false;
         self.newer = false;
-        self.schedules.clear();
         self.targets.clear();
-        self.cancel = None;
         self.thread_edge = ReadingEdge::default();
     }
 
@@ -150,7 +144,6 @@ impl Browse {
         };
         replies.truncate(REPLIES);
         self.newer = replies.last().is_some_and(|m| m.id < head);
-        self.schedules = latest.schedules;
         Ok(std::iter::once(latest.message).chain(replies).collect())
     }
     pub fn has_filters(&self) -> bool {
@@ -209,22 +202,6 @@ impl State {
                 self.browse.adding_channel = false;
                 self.browse.private_channel = false;
                 self.select(Some(name));
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
-    }
-    pub fn cancel_pending(&mut self, id: i64) {
-        if self.browse.cancel != Some(id) || !self.browse.schedules.iter().any(|s| s.id == id) {
-            return;
-        }
-        let result = self
-            .db()
-            .and_then(|db| automation::cancel_schedule(db, id, &self.actor));
-        match result {
-            Ok(_) => {
-                self.browse.cancel = None;
-                self.error = None;
-                self.refresh();
             }
             Err(e) => self.error = Some(e.to_string()),
         }

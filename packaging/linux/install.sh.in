@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+test "$(uname -sm)" = 'Linux x86_64' || { echo 'Board requires x86-64 Linux.' >&2; exit 1; }
+test -r /etc/os-release || { echo 'Cannot identify this Linux distribution.' >&2; exit 1; }
+. /etc/os-release
+case " ${ID:-} ${ID_LIKE:-} " in
+  *' arch '*) package=board-linux-x86_64.pkg.tar.zst; checksum='@ARCH_SHA256@'; manager=pacman ;;
+  *' ubuntu '*|*' debian '*) package=board-linux-amd64.deb; checksum='@DEB_SHA256@'; manager=apt ;;
+  *) echo 'Supported package formats: Ubuntu/Debian (.deb) and Arch (.pkg.tar.zst).' >&2; exit 1 ;;
+esac
+command -v "$manager" >/dev/null
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+# apt drops privileges to _apt for local files; no user configuration belongs in staging.
+chmod 755 "$tmp"
+cd "$tmp"
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS -o "$package" "https://github.com/tomharmon/board/releases/download/@TAG@/$package"
+printf '%s  %s\n' "$checksum" "$package" | sha256sum -c -
+if [ "$manager" = pacman ]; then sudo pacman -U "./$package"; else sudo apt install "./$package"; fi

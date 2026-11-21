@@ -7,15 +7,6 @@ use std::{
     thread,
 };
 
-fn due() -> Timing {
-    Timing {
-        due: chrono::Utc::now().timestamp(),
-        every: None,
-        times: None,
-        until: None,
-    }
-}
-
 #[test]
 fn offline_watchers_match_author_families_and_canonical_mentions_at_the_event_not_at_pull()
 -> Result<()> {
@@ -182,235 +173,6 @@ fn conditional_ack_has_one_winner_and_only_its_proof_can_report_no_match_after_r
         board_local::errors::classify(&strict(d.event.cursor, Some(&d.receipt)).unwrap_err()).1,
         "delivery_conflict"
     );
-    Ok(())
-}
-
-#[test]
-fn new_schedule_checks_past_time_but_restart_dispatches_old_persisted_deadlines() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("deadline.db");
-    let b = Board::open(&path)?;
-    let at = chrono::Utc::now().timestamp();
-    let head = b.cursor()?;
-    assert!(
-        schedule(
-            &b,
-            "ada",
-            Destination::Channel("ops"),
-            "too late",
-            Timing {
-                due: at - 61,
-                ..due()
-            },
-            Default::default()
-        )
-        .is_err()
-    );
-    assert_eq!(b.cursor()?, head);
-    let s = schedule(
-        &b,
-        "ada",
-        Destination::Channel("ops"),
-        "due",
-        Timing {
-            due: at - 30,
-            ..due()
-        },
-        Default::default(),
-    )?;
-    drop(b);
-    Connection::open(&path)?.execute(
-        "UPDATE schedules SET due=? WHERE id=?",
-        [at - 7 * 86_400, s.id],
-    )?;
-    let restarted = Board::open(path)?;
-    assert_eq!(dispatch_due(&restarted)?, 1);
-    assert_eq!(dispatch_due(&restarted)?, 0);
-    assert_eq!(get_schedule(&restarted, s.id)?.state, "done");
-    Ok(())
-}
-
-#[test]
-fn failed_schedule_commit_retries_once_even_with_competing_workers() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("board.db");
-    let b = Board::open(&db)?;
-    let root = b.post("inbox", "sam", "issue", &PostOptions::default())?;
-    let detail = b.reply(root.id, "ada", "my follow up", &PostOptions::default())?;
-    let s = schedule(
-        &b,
-        "ada/clock",
-        Destination::Reply(detail.id),
-        "ping",
-        due(),
-        BTreeMap::new(),
-    )?;
-    let high = b.cursor()?;
-    // An error after the message, events, and send identity were inserted must roll everything back.
-    Connection::open(&db)?.execute_batch(
-        "CREATE TRIGGER pause_dispatch BEFORE UPDATE OF sent ON schedules
-       BEGIN SELECT RAISE(ABORT,'storage error'); END",
-    )?;
-    assert!(dispatch_due(&b).is_err());
-    assert_eq!(b.cursor()?, high);
-    assert_eq!(get_schedule(&b, s.id)?.sent, 0);
-    assert_eq!(b.thread(root.id)?.len(), 2);
-    Connection::open(&db)?.execute_batch("DROP TRIGGER pause_dispatch")?;
-    drop(b);
-    let workers = [Board::open(&db)?, Board::open(&db)?];
-    let gate = Arc::new(Barrier::new(2));
-    let runs: Vec<_> = workers
-        .into_iter()
-        .map(|b| {
-            let gate = gate.clone();
-            thread::spawn(move || {
-                gate.wait();
-                dispatch_due(&b)
-            })
-        })
-        .collect();
-    let mut sent = 0;
-    for run in runs {
-        sent += run.join().unwrap()?
-    }
-    assert_eq!(sent, 1);
-    let b = Board::open(db)?;
-    let messages = b.thread(root.id)?;
-    assert_eq!(messages.len(), 3);
-    let m = &messages[2];
-    assert_eq!(m.actor, "ada/clock");
-    assert_eq!(m.re, Some(root.id));
-    assert_eq!(m.reply_to, Some(detail.id));
-    assert_eq!(m.schedule, Some(ScheduledSend { id: s.id, n: 0 }));
-    let posted = b.events(high, 10)?.remove(0);
-    assert_eq!(posted.message.as_ref(), Some(m));
-    assert_eq!(posted.payload["schedule"]["id"], s.id);
-    assert_eq!(get_schedule(&b, s.id)?.state, "done");
-    assert_eq!(dispatch_due(&b)?, 0);
-    Ok(())
-}
-
-#[test]
-fn deleting_either_the_reply_target_or_root_cancels_a_schedule() -> Result<()> {
-    let b = Board::memory()?;
-    let root = b.post("work", "ada", "root", &PostOptions::default())?;
-    let child = b.reply(root.id, "ada", "child", &PostOptions::default())?;
-    let s1 = schedule(
-        &b,
-        "ada",
-        Destination::Reply(child.id),
-        "to child",
-        due(),
-        BTreeMap::new(),
-    )?;
-    b.delete(child.id, "ada", None)?;
-    assert_eq!(get_schedule(&b, s1.id)?.state, "canceled");
-    let other = b.reply(root.id, "ada", "child2", &PostOptions::default())?;
-    let s2 = schedule(
-        &b,
-        "ada/clock",
-        Destination::Reply(other.id),
-        "to other",
-        due(),
-        BTreeMap::new(),
-    )?;
-    let s3 = schedule(
-        &b,
-        "ada/clock",
-        Destination::Reply(root.id),
-        "to root",
-        due(),
-        BTreeMap::new(),
-    )?;
-    b.delete(root.id, "ada", None)?;
-    assert_eq!(get_schedule(&b, s2.id)?.state, "canceled");
-    assert_eq!(get_schedule(&b, s3.id)?.state, "canceled");
-    assert_eq!(dispatch_due(&b)?, 0);
-    assert_eq!(
-        b.events(0, 100)?
-            .iter()
-            .filter(|e| e.kind == "schedule.canceled")
-            .count(),
-        3
-    );
-    Ok(())
-}
-
-#[test]
-fn recurring_sends_keep_ordinal_across_restarts_and_obey_stop_conditions() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("board.db");
-    let b = Board::open(&path)?;
-    let epoch = chrono::Utc::now().timestamp();
-    let late = schedule(
-        &b,
-        "ada",
-        Destination::Channel("digest"),
-        "expired",
-        Timing {
-            due: epoch,
-            every: Some(60),
-            times: None,
-            until: Some(epoch + 600),
-        },
-        BTreeMap::new(),
-    )?;
-    let recurring = schedule(
-        &b,
-        "ada/clock",
-        Destination::Channel("digest"),
-        "status",
-        Timing {
-            due: epoch,
-            every: Some(60),
-            times: Some(2),
-            until: None,
-        },
-        BTreeMap::new(),
-    )?;
-    let clock = Connection::open(&path)?;
-    clock.execute(
-        "UPDATE schedules SET due=due-900,until_at=until_at-900 WHERE id=?",
-        [late.id],
-    )?;
-    clock.execute(
-        "UPDATE schedules SET due=due-120 WHERE id=?",
-        [recurring.id],
-    )?;
-    assert!(cancel_schedule(&b, recurring.id, "other").is_err());
-    assert_eq!(dispatch_due(&b)?, 1);
-    assert_eq!(get_schedule(&b, late.id)?.state, "done");
-    assert_eq!(get_schedule(&b, late.id)?.sent, 0);
-    let first = get_schedule(&b, recurring.id)?;
-    assert_eq!(first.state, "pending");
-    assert_eq!(first.sent, 1);
-    assert_eq!((first.due - epoch) % 60, 0);
-    assert!(first.due > epoch);
-    // Advance to the next slot without sleeping for a minute.
-    Connection::open(&path)?.execute(
-        "UPDATE schedules SET due=? WHERE id=?",
-        [epoch - 60, recurring.id],
-    )?;
-    drop(b);
-    let b = Board::open(path)?;
-    assert_eq!(dispatch_due(&b)?, 1);
-    assert_eq!(dispatch_due(&b)?, 0);
-    let s = get_schedule(&b, recurring.id)?;
-    assert_eq!(s.state, "done");
-    assert_eq!(s.sent, 2);
-    let messages = b.messages(&Filter::default(), 10)?;
-    assert_eq!(messages.len(), 2);
-    for (n, m) in messages.iter().enumerate() {
-        assert_eq!(m.actor, "ada/clock");
-        assert_eq!(
-            m.schedule,
-            Some(ScheduledSend {
-                id: recurring.id,
-                n: n as i64
-            })
-        );
-        assert!(m.re.is_none());
-    }
     Ok(())
 }
 
@@ -587,29 +349,23 @@ fn watcher_lanes_run_independently_and_survive_poison_events() -> Result<()> {
 }
 
 #[test]
-fn watcher_ignores_own_writes_but_delivers_own_scheduled_posts() -> Result<()> {
+fn watcher_can_post_a_reply_to_an_event_without_feeding_back_into_itself() -> Result<()> {
     let db = Board::memory()?;
     let w = add_watcher_as(
         &db,
         "ada/desk",
-        "clock",
+        "responder",
         Filter::default(),
         Some("message.posted"),
     )?;
-    assert_eq!(w.run_as.as_deref(), Some("ada/clock"));
-    db.post("ops", "ada/clock", "not recursive", &Default::default())?;
-    assert!(next_event(&db, "clock")?.is_none());
-    schedule(
-        &db,
-        "ada/clock",
-        Destination::Channel("ops"),
-        "wake me",
-        due(),
-        BTreeMap::new(),
-    )?;
-    assert_eq!(dispatch_due(&db)?, 1);
-    let ev = next_event(&db, "clock")?.unwrap();
-    assert_eq!(ev.message.unwrap().text, "wake me");
+    let actor = w.run_as.unwrap();
+    let trigger = db.post("ops", "sam", "ready for review", &Default::default())?;
+    let event = next_event(&db, "responder")?.unwrap();
+    assert_eq!(event.cursor, trigger.id);
+    let reply = db.reply(trigger.id, &actor, "reviewed", &Default::default())?;
+    ack_event(&db, "responder", event.cursor)?;
+    assert_eq!(db.thread(trigger.id)?.last().unwrap().id, reply.id);
+    assert!(next_event(&db, "responder")?.is_none());
     Ok(())
 }
 

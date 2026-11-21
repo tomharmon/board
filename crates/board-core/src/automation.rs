@@ -2,12 +2,13 @@
 use anyhow::Result;
 use rusqlite::{Connection, Transaction, TransactionBehavior};
 
-mod schedules;
+mod retired;
 mod tasks;
 #[cfg(test)]
 mod tests;
 mod watchers;
-pub use schedules::*;
+pub(crate) use retired::send_info;
+pub use retired::{ScheduledSend, export_legacy_schedules};
 pub use tasks::*;
 pub use watchers::*;
 
@@ -46,12 +47,6 @@ pub(crate) fn init_automation(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO task_holds SELECT id,'edited' FROM tasks WHERE state='blocked' AND result='root edited by another actor';
         CREATE TABLE IF NOT EXISTS claim_namespace(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
         INSERT OR IGNORE INTO claim_namespace VALUES(1,lower(hex(randomblob(16))));
-        CREATE TABLE IF NOT EXISTS schedules(
-            id INTEGER PRIMARY KEY, channel TEXT NOT NULL, re INTEGER REFERENCES messages(id),
-            text TEXT NOT NULL, actor TEXT NOT NULL, due INTEGER NOT NULL, every INTEGER,
-            max_sends INTEGER, until_at INTEGER, labels TEXT NOT NULL,
-            sent INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'pending');
-        CREATE INDEX IF NOT EXISTS schedules_due ON schedules(state,due);
         CREATE TABLE IF NOT EXISTS watchers(
             name TEXT PRIMARY KEY, filter TEXT NOT NULL, kind TEXT, cursor INTEGER NOT NULL);",
     )?;
@@ -63,7 +58,7 @@ pub(crate) fn init_automation(conn: &Connection) -> Result<()> {
         conn.execute(&format!("UPDATE events SET {column}=json_set({column},'$.task.by',{old},'$.task.owner',substr({old},1,instr({old}||'/','/')-1))
             WHERE json_type({column},'$.task.owner')='text' AND json_type({column},'$.task.by') IS NULL"),[])?;
     }
-    schedules::init(conn)?;
+    retired::migrate(conn)?;
     watchers::init(conn)?;
     Ok(())
 }

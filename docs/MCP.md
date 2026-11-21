@@ -6,11 +6,17 @@ Board includes a built-in [Model Context Protocol (MCP)](https://modelcontextpro
 
 `board mcp` runs over **stdio** directly against your local SQLite database—no background daemon, open port, or token setup required.
 
+For Codex and Claude Code, run `board init` after installing Board. It detects supported executables on PATH, uses their native user-scoped registration commands, and checks the installed executable with a real MCP initialization and `tools/list` against a temporary database. It does not touch your board to verify setup. `board init --dry-run` previews changes; `board --json init` reports each result. Rerun after installing another harness. Review any conflicting entry yourself; setup never replaces a foreign or customized registration. A harness, policy or project can still disable tools for a particular chat.
+
+Codex's user skill goes in `~/.agents/skills/board-swarm`; Claude's goes in its user skills directory (normally `~/.claude/skills/board-swarm`). A customized current skill is retained; review its worker instructions yourself. When init upgrades a recognized older stock copy, its original text is kept in a private `.board-skill-backup-*/coordinator.previous` beside the skill folder. Ambiguous or customized legacy installations are reported rather than overwritten or shadowed.
+
+For other clients, use the absolute executable path and stdio arguments printed by `board init` in the client's own user settings. Install the one coordinator skill with `board skill install path --dest PATH-TO-USER-SKILLS`. For example (replace the path, and omit the optional environment to use your default board):
+
 ```json
 {
   "mcpServers": {
     "board": {
-      "command": "board",
+      "command": "/absolute/path/to/board",
       "args": ["mcp"],
       "env": {
         "BOARD_DB": "/path/to/board.sqlite3"
@@ -21,6 +27,8 @@ Board includes a built-in [Model Context Protocol (MCP)](https://modelcontextpro
 ```
 
 Each MCP server process inherits the standard Board environment variables (`BOARD_DB`, `BOARD_NAME`, `BOARD_USER`, `BOARD_PROFILE`, `BOARD_SWARM_RUN`, and optional `BOARD_TOKEN` for restricted actors), and uses the exact same `board-core` domain and permission rules as the CLI and REST API.
+
+The registered connection is for the coordinator chat, not its subagents. Pass each worker the exact CLI arguments from `swarm_add` on a shared harness. The roster determines its actor; inherited chat profile or run defaults do not override that assignment, and an incompatible credential is rejected. For a dedicated worker process use `board --db PATH --worker RUN/NAME mcp`; `board_whoami` must match the expected database, run and actor before the worker writes. Dedicated worker connections do not advertise coordinator lifecycle tools.
 
 ## Tool groups
 
@@ -36,6 +44,7 @@ Each MCP server process inherits the standard Board environment variables (`BOAR
 - `roles_list` / `roles_show` — Inspect the owner-side library of built-in and custom roles and their attached skills. A scoped worker receives its pinned assignment, not access to the whole library.
 
 ### Messaging & search
+- `board_whoami`: Inspect the actual actor and optional bound worker on this connection. No tool accepts an actor override.
 - `board_post` / `board_reply` — Post a thread or reply in any channel.
 - `board_read` — Read channels, threads, or filtered message history.
 - `board_channels` — List channels.

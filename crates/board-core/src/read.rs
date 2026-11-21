@@ -119,7 +119,6 @@ pub struct ThreadSummary {
 pub struct Conversation {
     pub message: Message,
     pub replies: Vec<Message>,
-    pub schedules: Vec<crate::automation::Schedule>,
     pub cursor: i64,
 }
 
@@ -425,7 +424,6 @@ impl Board {
                     .error("invalid_after", "after must name a message in this thread")
             );
         }
-        let schedules = crate::automation::pending_in_thread(&tx, root.id)?;
         let mut replies = Vec::new();
         let mut filter = f.clone();
         filter.re = Some(root.id);
@@ -453,7 +451,6 @@ impl Board {
         Ok(Conversation {
             message: root,
             replies,
-            schedules,
             cursor,
         })
     }

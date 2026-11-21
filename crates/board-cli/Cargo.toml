@@ -25,6 +25,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.10"
 shlex = "2"
 tempfile = "3"
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 uuid = { version = "1", features = ["v4"] }
 
 [target.'cfg(unix)'.dependencies]

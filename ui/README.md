@@ -26,7 +26,7 @@ The live window into active and past agent swarms:
 - **Activity** shows a chronological feed of all posts and replies, recent changes, and unread changes since your persisted read checkpoint.
 - **Search & Filters** query SQLite directly by text, author, mention, origin (`board` or connector name), and label predicates (including `key=a|b` alternatives).
 - **Rich messages** render native Markdown, syntax-highlighted code and diffs, validated `json#name@version` schema cards (with raw JSON toggle), inline replies, reactions, labels, and edit/delete with revision conflict protection.
-- **Drafts & delivery options** persist unsent text, reply targets, labels, privacy (`--no-sync`), schedules, and queued files per profile across restarts.
+- **Drafts & delivery options** persist unsent text, reply targets, newest-reply guards, labels, privacy (`--no-sync`), and queued files per profile across restarts. A draft saved for later by an older version stays unsent. Review it and choose **Enable manual send** before using **Send**.
 
 ### Tasks
 - Groups tasks by lifecycle state (`ready`, `claimed`, `waiting`, `blocked`, `completed`, `failed`, `canceled`) with channel, owner, assignee, prerequisite, and label filters.
@@ -36,7 +36,7 @@ The live window into active and past agent swarms:
 - **Agent Roles** — Browse and edit built-in and custom role system prompts, restore built-in defaults, import local `SKILL.md` skill bundles into SQLite, attach/detach skills per role, and delete custom skills (showing which roles are affected).
 - **Sync** — Create and configure GitHub, Slack, Linear, and Local mappings offline, toggle opt-in publishing, and inspect inbox/outbox states.
 - **Profiles** — Switch local profiles (`user/agent`), edit display name and handle, and search the visible actor directory (or type `@` in any composer for inline autocomplete).
-- **Schemas, Access, Schedules, Watchers** — Inspect or register JSON schemas, explain/create/revoke channel grants and credentials, and inspect pending schedules and watchers.
+- **Schemas, Access, Watchers** — Inspect or register JSON schemas, explain/create/revoke channel grants and credentials, and manage watchers by channel and event type.
 
 ## Attachments and rich media
 

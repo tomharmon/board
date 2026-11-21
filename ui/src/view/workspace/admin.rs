@@ -7,21 +7,9 @@ fn open_form(s: &mut State) {
     }
     s.desk.enter(s.page);
     s.desk.editing = true;
-    match s.page {
-        Page::Schemas => {
-            s.desk.form.value = TextEdit::new("1");
-            s.desk.form.body = TextEdit::new("{\n  \"type\": \"object\",\n  \"properties\": {}\n}");
-        }
-        Page::Schedules => {
-            if let Some(ts) = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()
-                .and_then(|d| chrono::DateTime::from_timestamp(d.as_secs() as i64 + 3600, 0))
-            {
-                s.desk.form.name = TextEdit::new(ts.to_rfc3339());
-            }
-        }
-        _ => (),
+    if s.page == Page::Schemas {
+        s.desk.form.value = TextEdit::new("1");
+        s.desk.form.body = TextEdit::new("{\n  \"type\": \"object\",\n  \"properties\": {}\n}");
     }
     s.refresh();
 }
@@ -32,7 +20,6 @@ pub(super) fn add_resource(s: &State) -> Option<El> {
     let kind = match s.page {
         Page::Workspace | Page::Access if s.desk.access.registry() => "grant",
         Page::Schemas => "schema",
-        Page::Schedules => "schedule",
         Page::Watchers => "watcher",
         _ => return None,
     };
@@ -56,45 +43,6 @@ fn form(s: &State) -> El {
     let d = &s.desk;
     let mut fields = col().w_full().gap(11.0);
     let submit = match s.page {
-        Page::Schedules => {
-            fields = fields
-                .child(field(
-                    "resource-channel",
-                    "Channel or #message ID",
-                    &d.form.channel,
-                    |s| &mut s.desk.form.channel,
-                    false,
-                ))
-                .child(field(
-                    "resource-name",
-                    "First send (RFC 3339)",
-                    &d.form.name,
-                    |s| &mut s.desk.form.name,
-                    false,
-                ))
-                .child(field(
-                    "resource-body",
-                    "Message",
-                    &d.form.body,
-                    |s| &mut s.desk.form.body,
-                    true,
-                ))
-                .child(field(
-                    "resource-value",
-                    "Repeat seconds (optional)",
-                    &d.form.value,
-                    |s| &mut s.desk.form.value,
-                    false,
-                ))
-                .child(field(
-                    "resource-extra",
-                    "Maximum sends (optional)",
-                    &d.form.extra,
-                    |s| &mut s.desk.form.extra,
-                    false,
-                ));
-            "Schedule"
-        }
         Page::Watchers => {
             fields = fields
                 .child(field(
@@ -518,86 +466,6 @@ pub(super) fn view(s: &State) -> El {
         return out.child(form(s));
     }
     match s.page {
-        Page::Schedules => {
-            if d.schedules.is_empty() {
-                out = out.child(empty("No schedules"));
-            }
-            for sched in &d.schedules {
-                let mut item = col()
-                    .key(format!("schedule-{}", sched.id))
-                    .w_full()
-                    .gap(3.0)
-                    .child(
-                        row()
-                            .w_full()
-                            .gap(8.0)
-                            .center_y()
-                            .child(
-                                mono(
-                                    format!(
-                                        "#{}    {}    #{}",
-                                        sched.id, sched.state, sched.channel
-                                    ),
-                                    MUTED,
-                                )
-                                .max_w(190.0)
-                                .wrap_anywhere(),
-                            )
-                            .child(
-                                label(&sched.text, 12.5, 450.0, INK)
-                                    .grow(1.0)
-                                    .min_w(0.0)
-                                    .wrap_anywhere(),
-                            ),
-                    )
-                    .child(
-                        mono(
-                            format!(
-                                "{}    {}    sent {}{}",
-                                sched.actor,
-                                utc(sched.due),
-                                sched.sent,
-                                if sched.no_sync { "    board only" } else { "" }
-                            ),
-                            MUTED,
-                        )
-                        .w_full()
-                        .wrap_anywhere(),
-                    );
-                if let Some(n) = sched.every {
-                    let stop = sched
-                        .max_sends
-                        .map(|n| format!("up to {n} sends"))
-                        .or_else(|| sched.until.map(|n| format!("until {}", utc(n))))
-                        .unwrap_or_else(|| "until canceled".into());
-                    item = item.child(mono(format!("Every {n}s, {stop}"), MUTED));
-                }
-                if let Some(end) = &sched.canceled {
-                    item = item.child(
-                        mono(format!("{}: {}", end.by, end.reason), MUTED)
-                            .w_full()
-                            .wrap_anywhere(),
-                    );
-                }
-                if let Some(reply) = sched.re {
-                    item = item.child(
-                        action(
-                            &format!("schedule-target-{}", sched.id),
-                            &format!("Reply to #{reply}"),
-                            false,
-                        )
-                        .on_press(move |s: &mut State| {
-                            // A scheduled reply can point at a non-root message.
-                            s.open_message_thread(reply);
-                        }),
-                    );
-                }
-                if sched.state == "pending" && board_local::owned_by(&sched.actor, &s.actor) {
-                    item = item.child(remove(s, sched.id.to_string(), "Cancel"));
-                }
-                out = out.child(item).child(rule());
-            }
-        }
         Page::Watchers => {
             if d.watchers.is_empty() {
                 out = out.child(empty("No watchers"));

@@ -417,23 +417,13 @@ fn strict_ack_over_loopback_and_cli_shares_the_proven_outcome_but_default_put_re
 }
 
 #[test]
-fn read_only_sync_lookups_and_schedule_scopes_observe_live_cli_and_rest_data() {
-    use board_local::{
-        Board,
-        access::Rules,
-        automation::{Destination, Timing, schedule},
-        sources::Provider,
-    };
+fn read_only_sync_lookups_observe_live_cli_and_rest_grants() {
+    use board_local::{Board, access::Rules, sources::Provider};
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("board.sqlite");
     let owner = Board::open(&db).unwrap();
     let mut examples = vec![];
-    for (name, ch) in [
-        ("hidden", "work/secret"),
-        ("open", "work/public"),
-        ("second", "work/public/sub"),
-        ("near", "work/public-other"),
-    ] {
+    for (name, ch) in [("hidden", "work/secret"), ("open", "work/public")] {
         let url = format!("https://test.invalid/{name}");
         let root = owner
             .post(ch, "owner", "root", &Default::default())
@@ -444,21 +434,7 @@ fn read_only_sync_lookups_and_schedule_scopes_observe_live_cli_and_rest_data() {
         owner
             .attach_source("owner", name, "t", "r", root.id, Some(&url))
             .unwrap();
-        let row = schedule(
-            &owner,
-            "owner",
-            Destination::Channel(ch),
-            "Later",
-            Timing {
-                due: chrono::Utc::now().timestamp() + 3600,
-                every: None,
-                times: None,
-                until: None,
-            },
-            Default::default(),
-        )
-        .unwrap();
-        examples.push((root.id, row.id));
+        examples.push(root.id);
     }
     owner
         .set_grant(
@@ -480,51 +456,36 @@ fn read_only_sync_lookups_and_schedule_scopes_observe_live_cli_and_rest_data() {
         &["sync", "locate", "https://test.invalid/open"],
         Some(token),
     );
-    assert_eq!(locate["message"], examples[1].0);
+    assert_eq!(locate["message"], examples[1]);
     assert_eq!(
         get("links?url=https%3A%2F%2Ftest.invalid%2Fopen"),
         (200, locate)
     );
     let targets = cli(
         &db,
-        &["sync", "targets", &examples[1].0.to_string()],
+        &["sync", "targets", &examples[1].to_string()],
         Some(token),
     );
     assert_eq!(targets["targets"][0]["state"], "confirmed");
     assert_eq!(
-        get(&format!("messages/{}/sync", examples[1].0)),
+        get(&format!("messages/{}/sync", examples[1])),
         (200, targets)
     );
     let hidden = get("links?url=https%3A%2F%2Ftest.invalid%2Fhidden");
     assert_eq!(hidden.0, 404);
     assert_eq!(hidden.1["code"], "message_not_found");
     assert_eq!(get("links?url=https%3A%2F%2Ftest.invalid%2Fabsent"), hidden);
-    assert_eq!(get(&format!("messages/{}/sync", examples[0].0)).0, 404);
+    assert_eq!(get(&format!("messages/{}/sync", examples[0])).0, 404);
     assert!(matches!(get("sources/open/inbox").0, 403 | 404));
-    let (s, page) = get("schedules?channel=work%2F&limit=1");
-    assert_eq!(s, 200);
-    assert_eq!(page["schedules"][0]["id"], examples[1].1);
-    assert_eq!(page["next_after"], examples[1].1);
-    let next = get(&format!(
-        "schedules?channel=work%2F&limit=1&after={}",
-        page["next_after"]
-    ))
-    .1;
-    assert_eq!(next["schedules"][0]["id"], examples[2].1);
-    assert!(next["next_after"].is_null());
-    let exact = get("schedules?channel=work%2Fpublic").1;
-    assert_eq!(exact["schedules"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        cli(&db, &["schedules", "--channel", "work/public"], Some(token)),
-        exact["schedules"]
-    );
-    assert_eq!(
-        cli(&db, &["schedules", "--channel", "work/"], Some(token)),
-        json!([page["schedules"][0], next["schedules"][0]])
-    );
-    assert_eq!(
-        get("schedules?channel=work%2Fsecret").1["schedules"],
-        json!([])
+    let export = board(&db)
+        .env("BOARD_TOKEN", token)
+        .args(["migrate", "export-schedules"])
+        .output()
+        .unwrap();
+    assert!(!export.status.success());
+    assert!(
+        export.stdout.is_empty(),
+        "no archive bytes before authorization"
     );
 }
 

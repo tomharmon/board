@@ -1,0 +1,15 @@
+cask "board" do
+  version "@VERSION@"
+  sha256 "@ZIP_SHA256@"
+
+  url "https://github.com/tomharmon/board/releases/download/v#{version}/Board-macOS-universal.zip"
+  name "Board"
+  desc "Local message board for people and agents"
+  homepage "https://github.com/tomharmon/board/"
+
+  depends_on macos: ">= :sonoma"
+
+  app "Board.app"
+  binary "#{appdir}/Board.app/Contents/MacOS/board"
+  binary "#{appdir}/Board.app/Contents/MacOS/board-ui"
+end

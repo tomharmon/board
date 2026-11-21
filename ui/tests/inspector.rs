@@ -371,6 +371,8 @@ fn desktop_shell_keeps_the_activity_feed_beside_an_independently_switchable_thre
     t.expect_key("sidebar-resize");
     t.expect_key("thread-resize");
     t.expect_key("feed-compose");
+    t.expect_key("feed-options");
+    assert!(!t.has_key("feed-schedule"));
     assert_eq!(
         t.0.iter().filter(|e| e["key"] == "message-body").count(),
         1,
@@ -653,6 +655,8 @@ fn split_composers_keep_root_and_reply_drafts_separate_across_focus_send_and_res
     );
     sent.expect_key("thread-pane");
     sent.expect_key("thread-compose");
+    sent.expect_key("thread-options");
+    assert!(!sent.has_key("thread-schedule"));
     sent.expect_text(main);
     let msgs = db.thread(root).unwrap();
     assert_eq!(msgs.len(), 2);
@@ -1242,44 +1246,45 @@ fn task_board_claims_and_completes_using_a_fenced_lease() {
 }
 
 #[test]
-fn administers_schedules_watchers_and_local_schemas() {
+fn administers_event_watchers_and_local_schemas() {
     let f = Fixture::new();
     let t = f.render(
         json!([
             {"t":0.1,"type":"tap","key":"workspace"},
-            {"t":0.3,"type":"tap","key":"work-schedules"},
+            {"t":0.3,"type":"tap","key":"work-watchers"},
             {"t":0.5,"type":"tap","key":"add-resource"},
-            {"t":0.7,"type":"tap","key":"resource-body"},
-            {"t":0.9,"paste":"Future check"},
-            {"t":1.1,"type":"tap","key":"save-resource"},
-            {"t":1.3,"type":"tap","key":"remove-1"},
-            {"t":1.5,"type":"tap","key":"confirm-1"},
-            {"t":1.7,"type":"tap","key":"workspace"},
-            {"t":1.9,"type":"tap","key":"work-watchers"},
-            {"t":2.1,"type":"tap","key":"add-resource"},
-            {"t":2.3,"type":"tap","key":"resource-name"},
-            {"t":2.5,"paste":"observer"},
-            {"t":2.7,"type":"tap","key":"resource-channel"},
-            {"t":2.9,"paste":"dev/"},
-            {"t":3.1,"type":"tap","key":"save-resource"}
+            {"t":0.7,"type":"tap","key":"resource-name"},
+            {"t":0.9,"paste":"observer"},
+            {"t":1.1,"type":"tap","key":"resource-channel"},
+            {"t":1.3,"paste":"dev/"},
+            {"t":1.5,"type":"tap","key":"resource-value"},
+            {"t":1.7,"paste":"message.posted"},
+            {"t":1.9,"type":"tap","key":"save-resource"}
         ]),
         "910x860",
-        "3.5",
+        "2.2",
     );
     t.expect_key("watcher-observer");
     t.expect_text("observer");
+    assert!(!t.has_key("work-schedules"));
     let b = Board::open(&f.db).unwrap();
-    assert_eq!(
-        board_local::automation::get_schedule(&b, 1).unwrap().state,
-        "canceled"
-    );
-    assert_eq!(
-        board_local::automation::get_watcher(&b, "observer")
+    let watcher = board_local::automation::get_watcher(&b, "observer").unwrap();
+    assert_eq!(watcher.filter.channel.as_deref(), Some("dev/"));
+    assert_eq!(watcher.kind.as_deref(), Some("message.posted"));
+    b.post("other", "author", "Unrelated", &Default::default())
+        .unwrap();
+    let message = b
+        .post("dev/build", "author", "Build ready", &Default::default())
+        .unwrap();
+    let delivery = board_local::automation::next_event(&b, "observer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(delivery.message.unwrap().id, message.id);
+    board_local::automation::ack_event(&b, "observer", delivery.cursor).unwrap();
+    assert!(
+        board_local::automation::next_event(&b, "observer")
             .unwrap()
-            .filter
-            .channel
-            .as_deref(),
-        Some("dev/")
+            .is_none()
     );
     let t = f.render(
         json!([
@@ -2307,8 +2312,7 @@ fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
 }
 
 #[test]
-fn task_routing_filters_query_all_pages_and_pending_schedules_are_in_thread() {
-    use board_local::automation::{Destination, Timing, schedule};
+fn task_routing_filters_query_all_pages() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let make = |name: &str, actor: &str, ch: &str, needs: &[i64], labels: PostOptions| {
@@ -2360,40 +2364,10 @@ fn task_routing_filters_query_all_pages_and_pending_schedules_are_in_thread() {
         !t.0.iter()
             .any(|e| e["text"] == "First job" || e["key"] == "next-page")
     );
-    let scheduled = schedule(
-        &b,
-        "reader",
-        Destination::Reply(target.id),
-        "Scheduled followup",
-        Timing {
-            due: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                + 3600,
-            every: None,
-            times: None,
-            until: None,
-        },
-        Default::default(),
-    )
-    .unwrap();
-    let t = run_at(&f, json!([]), target.id, "0.6");
-    t.expect_key(&format!("scheduled-reply-{}", scheduled.id));
-}
-
-fn stamp_in(seconds: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-    chrono::DateTime::from_timestamp(now + seconds, 0)
-        .unwrap()
-        .to_rfc3339()
 }
 
 #[test]
-fn scheduled_private_composer_recovers_files_and_cancels_in_thread() {
+fn private_reply_composer_recovers_labels_target_and_files_without_clock_controls() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let root = b
@@ -2408,120 +2382,137 @@ fn scheduled_private_composer_recovers_files_and_cancels_in_thread() {
     let t = run_at(
         &f,
         json!([
-            {"t":0.2,"type":"tap","key":format!("reply-{}",parent.id)},{"t":0.4,"paste":"Private recurring follow-up"},
+            {"t":0.2,"type":"tap","key":format!("reply-{}",parent.id)},{"t":0.4,"paste":"Private follow-up"},
             {"t":0.6,"type":"tap","key":"attach-file"},{"t":0.8,"type":"file-dialog","path":file},
             {"t":1.0,"type":"tap","key":"delivery-options"},{"t":1.2,"type":"tap","key":"compose-no-sync"},
-            {"t":1.4,"type":"tap","key":"compose-labels"},{"t":1.6,"paste":"stage=classified"},
-            {"t":1.8,"type":"tap","key":"compose-later"},
-            {"t":2.0,"type":"tap","key":"compose-due"},{"t":2.2,"paste":stamp_in(3600)},
-            {"t":2.4,"type":"tap","key":"compose-every"},{"t":2.6,"paste":"60"},
-            {"t":2.8,"type":"tap","key":"compose-times"},{"t":3.0,"paste":"2"},
-            {"t":3.2,"type":"tap","key":"done-delivery"}
+            {"t":1.4,"type":"tap","key":"compose-labels"},{"t":1.6,"paste":"stage=classified"}
         ]),
         parent.id,
-        "3.6",
+        "2.2",
     );
-    t.expect_text("Schedule");
-    t.expect_text("sample.bin (3 bytes)");
+    t.expect_key("compose-no-sync");
+    t.expect_key("compose-labels");
+    for key in [
+        "compose-later",
+        "compose-due",
+        "compose-every",
+        "compose-times",
+        "compose-until",
+    ] {
+        assert!(!t.has_key(key), "obsolete delivery option {key}");
+    }
     let saved = b.load_composer("reader", &scope).unwrap().unwrap();
-    assert!(saved.settings.no_sync && saved.settings.later);
+    assert!(saved.settings.no_sync && !saved.settings.review_before_send);
     assert_eq!(saved.draft.reply_to, Some(parent.id));
     assert_eq!(saved.files[0].1, [42, 0, 29]);
+    assert_eq!(b.thread(root.id).unwrap().len(), 2);
+    let t = run_at(&f, json!([]), root.id, "0.5");
+    t.expect_key("reply-composer");
+    t.expect_key("send");
+    t.expect_text("stage=classified");
+    t.expect_text("sample.bin (3 bytes)");
+    assert!(!t.has_key("compose-schedule"));
     let t = run_at(
         &f,
         json!([{"t":0.2,"type":"tap","key":"send"}]),
         root.id,
         "0.6",
     );
-    let schedule = board_local::automation::schedules(&b, true)
-        .unwrap()
-        .pop()
-        .unwrap();
-    t.expect_key(&format!("scheduled-reply-{}", schedule.id));
-    assert!(schedule.no_sync);
-    assert_eq!(schedule.re, Some(parent.id));
-    assert_eq!(schedule.labels["stage"], "classified");
-    assert_eq!((schedule.every, schedule.max_sends), (Some(60), Some(2)));
-    assert_eq!(schedule.attachments[0].size, 3);
-    assert_eq!(b.thread(root.id).unwrap().len(), 2);
+    let thread = b.thread(root.id).unwrap();
+    assert_eq!(thread.len(), 3);
+    let reply = &thread[2];
+    t.expect_key(&format!("message-{}", reply.id));
+    assert!(reply.no_sync);
+    assert_eq!(reply.text, "Private follow-up");
+    assert_eq!(reply.reply_to, Some(parent.id));
+    assert_eq!(reply.labels["stage"], "classified");
+    assert_eq!(b.download(reply.attachments[0].id).unwrap().1, [42, 0, 29]);
     assert!(b.load_composer("reader", &scope).unwrap().is_none());
-    let t = run_at(
-        &f,
-        json!([
-            {"t":0.2,"type":"tap","key":format!("cancel-pending-{}",schedule.id)},
-            {"t":0.5,"type":"tap","key":format!("confirm-pending-{}",schedule.id)}
-        ]),
-        root.id,
-        "0.8",
-    );
-    assert!(
-        !t.0.iter()
-            .any(|e| e["key"] == format!("scheduled-reply-{}", schedule.id))
-    );
-    assert_eq!(
-        board_local::automation::get_schedule(&b, schedule.id)
-            .unwrap()
-            .state,
-        "canceled"
-    );
 }
 
 #[test]
-fn recurring_composer_persists_stop_date_and_rejects_two_competing_stops() {
+fn legacy_delayed_draft_stays_unsent_across_edits_and_restart_until_explicit_review() {
     let f = Fixture::new();
-    let b = Board::open(&f.db).unwrap();
-    let until = stamp_in(7200);
-    let steps = json!([
-        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"message-body"},{"t":0.6,"paste":"Until a date"},
-        {"t":0.8,"type":"tap","key":"delivery-options"},{"t":1.0,"type":"tap","key":"compose-later"},
-        {"t":1.2,"type":"tap","key":"compose-due"},{"t":1.4,"paste":stamp_in(3600)},
-        {"t":1.6,"type":"tap","key":"compose-every"},{"t":1.8,"paste":"60"},
-        {"t":2.0,"type":"tap","key":"compose-times"},{"t":2.2,"paste":"8"},
-        {"t":2.4,"type":"tap","key":"compose-until"},{"t":2.6,"paste":until},
-        {"t":2.8,"type":"tap","key":"done-delivery"},{"t":3.0,"type":"tap","key":"send"}
-    ]);
-    let t = f.render(steps, "940x830", "3.3");
-    assert!(t.0.iter().any(|e| {
-        e["text"]
-            .as_str()
-            .is_some_and(|s| s.contains("only one repeat stop"))
-    }));
-    assert!(
-        board_local::automation::schedules(&b, true)
-            .unwrap()
-            .is_empty()
-    );
+    let historical = include_bytes!("../../crates/board-core/tests/fixtures/swarm-v14.sqlite3.gz");
+    std::io::copy(
+        &mut flate2::read::GzDecoder::new(&historical[..]),
+        &mut File::create(&f.db).unwrap(),
+    )
+    .unwrap();
+    let old = rusqlite::Connection::open(&f.db).unwrap();
+    old.execute("INSERT INTO channels(name) VALUES('held')", [])
+        .unwrap();
+    old.execute(
+        "INSERT INTO composer_drafts(actor,scope,body,channel) VALUES('reader','new','Review before sending','held')",
+        [],
+    ).unwrap();
+    let legacy_settings = json!({
+        "later": true, "due":"2000-01-01T00:00:00Z", "every":"60", "times":"2",
+        "no_sync":true, "labels":"stage=private"
+    });
     assert_eq!(
-        b.load_composer("reader", "new")
-            .unwrap()
-            .unwrap()
-            .settings
-            .until,
-        until
-    );
-    let t=f.render(json!([
-        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"delivery-options"},
-        {"t":0.7,"type":"tap","key":"compose-times"},{"t":0.9,"type":"key","cmd":true,"name":"a"},
-        {"t":1.1,"type":"key","name":"Backspace"},{"t":1.3,"type":"tap","key":"done-delivery"},
-        {"t":1.6,"type":"tap","key":"send"}
-    ]),"940x830","2.0");
-    let rows = board_local::automation::schedules(&b, true).unwrap();
-    assert_eq!(rows.len(), 1);
-    t.expect_key(&format!("schedule-{}", rows[0].id));
-    assert_eq!(rows[0].max_sends, None);
-    assert_eq!(
-        rows[0].until,
-        Some(
-            chrono::DateTime::parse_from_rfc3339(&until)
-                .unwrap()
-                .timestamp()
+        old.execute(
+            "UPDATE composer_settings SET settings=? WHERE actor='reader' AND scope='new'",
+            [legacy_settings.to_string()],
         )
+        .unwrap(),
+        1
     );
+    old.execute(
+        "INSERT INTO composer_files VALUES('reader','new',0,'notes.txt',X'4869')",
+        [],
+    )
+    .unwrap();
+    drop(old);
+
+    let t = f.render(
+        json!([
+            {"t":0.2,"type":"tap","key":"message-body"},
+            {"t":0.4,"type":"key","cmd":true,"name":"a"},
+            {"t":0.6,"paste":"Reviewed text"},
+            {"t":0.8,"type":"key","name":"Enter"},
+            {"t":1.2,"type":"tap","key":"send"}
+        ]),
+        DESKTOP,
+        "1.6",
+    );
+    t.expect_key("enable-manual-send");
+    t.expect_text("notes.txt (2 bytes)");
+    assert!(!t.has_key("compose-schedule"));
+    let b = Board::open(&f.db).unwrap();
+    let held = Filter {
+        channel: Some("held".into()),
+        ..Default::default()
+    };
+    let saved = b.load_composer("reader", "new").unwrap().unwrap();
+    assert_eq!(saved.draft.body, "Reviewed text");
+    assert!(saved.settings.review_before_send && saved.settings.no_sync);
+    assert!(b.messages(&held, 5).unwrap().is_empty());
+
+    let t = f.render(
+        json!([
+            {"t":0.2,"type":"tap","key":"message-body"},
+            {"t":0.4,"type":"key","name":"Enter"},
+            {"t":0.6,"type":"tap","key":"enable-manual-send"}
+        ]),
+        DESKTOP,
+        "1.0",
+    );
+    assert!(!t.has_key("enable-manual-send"));
+    assert!(b.messages(&held, 5).unwrap().is_empty());
+    let t = f.render(json!([{"t":0.2,"type":"tap","key":"send"}]), DESKTOP, "0.6");
+    let posted = b.messages(&held, 5).unwrap();
+    assert_eq!(posted.len(), 1);
+    t.expect_key(&format!("message-{}", posted[0].id));
+    assert!(posted[0].no_sync);
+    assert_eq!(posted[0].text, "Reviewed text");
+    assert_eq!(posted[0].labels["stage"], "private");
+    assert_eq!(b.download(posted[0].attachments[0].id).unwrap().1, b"Hi");
     assert!(b.load_composer("reader", "new").unwrap().is_none());
 }
 
 #[test]
-fn stale_composer_cannot_publish_after_privacy_change_or_downgrade_an_overdue_schedule() {
+fn stale_composer_cannot_publish_after_privacy_change() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let original = board_local::Draft {
@@ -2544,8 +2535,6 @@ fn stale_composer_cannot_publish_after_privacy_change_or_downgrade_an_overdue_sc
     );
     let private = board_local::ComposerSettings {
         no_sync: true,
-        later: true,
-        due: stamp_in(-600),
         ..Default::default()
     };
     let t = f.at_mark(&mut cmd, "loaded", || {
@@ -2564,31 +2553,15 @@ fn stale_composer_cannot_publish_after_privacy_change_or_downgrade_an_overdue_sc
             .is_some_and(|t| t.contains("Draft changed"))
     }));
     assert!(b.messages(&Filter::default(), 5).unwrap().is_empty());
-    let t = f.render(
-        json!([{"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"send"}]),
-        "860x720",
-        "0.7",
-    );
-    assert!(t.0.iter().any(|e| {
-        e["text"]
-            .as_str()
-            .is_some_and(|t| t.contains("send time has passed"))
-    }));
-    assert!(b.messages(&Filter::default(), 5).unwrap().is_empty());
-    assert!(
-        board_local::automation::schedules(&b, true)
-            .unwrap()
-            .is_empty()
-    );
     assert_eq!(
         b.load_composer("reader", "new").unwrap().unwrap().settings,
         private
     );
-    let t=f.render(json!([
-        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"delivery-options"},
-        {"t":0.7,"type":"tap","key":"compose-later"},{"t":1.0,"type":"tap","key":"done-delivery"},
-        {"t":1.3,"type":"tap","key":"send"}
-    ]),"860x720","1.6");
+    let t = f.render(
+        json!([{"t":0.2,"type":"tap","key":"send"}]),
+        "860x720",
+        "0.6",
+    );
     t.expect_text("Local only");
     let messages = b.messages(&Filter::default(), 5).unwrap();
     assert_eq!(messages.len(), 1);

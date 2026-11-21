@@ -1,5 +1,4 @@
 use super::*;
-use anyhow::ensure;
 use board_local::ComposerSettings;
 
 pub struct Delivery {
@@ -7,12 +6,8 @@ pub struct Delivery {
     pub(super) instance: std::sync::Arc<()>,
     pub open: bool,
     pub no_sync: bool,
-    pub later: bool,
+    pub review_before_send: bool,
     pub after: Option<i64>,
-    pub due: TextEdit,
-    pub every: TextEdit,
-    pub times: TextEdit,
-    pub until: TextEdit,
     pub labels: TextEdit,
     pub stamp: Option<String>,
     files_dirty: bool,
@@ -23,12 +18,8 @@ impl From<ComposerSettings> for Delivery {
             instance: std::sync::Arc::new(()),
             open: false,
             no_sync: d.no_sync,
-            later: d.later,
+            review_before_send: d.review_before_send,
             after: d.after,
-            due: TextEdit::new(d.due),
-            every: TextEdit::new(d.every),
-            times: TextEdit::new(d.times),
-            until: TextEdit::new(d.until),
             labels: TextEdit::new(d.labels),
             stamp: None,
             files_dirty: false,
@@ -44,24 +35,11 @@ impl Delivery {
     fn settings(&self) -> ComposerSettings {
         ComposerSettings {
             no_sync: self.no_sync,
-            later: self.later,
+            review_before_send: self.review_before_send,
             after: self.after,
-            due: self.due.text.clone(),
-            every: self.every.text.clone(),
-            times: self.times.text.clone(),
-            until: self.until.text.clone(),
             labels: self.labels.text.clone(),
             task: None,
         }
-    }
-    fn timing(&self) -> Result<automation::Timing> {
-        let timing = self.settings().parsed_timing()?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
-        ensure!(
-            timing.due > now,
-            "The draft's send time has passed; choose a future time or explicitly turn off scheduling"
-        );
-        Ok(timing)
     }
 }
 impl State {
@@ -154,12 +132,22 @@ impl State {
     pub fn open_delivery(&mut self) {
         self.delivery.open = true;
     }
-    pub fn guard_reply(&mut self, id: i64, tx: &mut Tx) {
-        if !self.activate_draft(false) {
+    pub fn enable_manual_send(&mut self) {
+        if !self.delivery.review_before_send {
             return;
         }
-        if self.delivery.later {
-            self.error = Some("Turn off scheduled delivery before pinning a guarded reply".into());
+        self.delivery.review_before_send = false;
+        self.draft_changed();
+        match self.flush_draft() {
+            Ok(()) => self.error = None,
+            Err(e) => {
+                self.delivery.review_before_send = true;
+                self.error = Some(format!("Draft not saved: {e:#}"));
+            }
+        }
+    }
+    pub fn guard_reply(&mut self, id: i64, tx: &mut Tx) {
+        if !self.activate_draft(false) {
             return;
         }
         self.delivery.after = Some(id);
@@ -247,11 +235,10 @@ impl State {
         }
     }
     pub fn send(&mut self, tx: &mut Tx) {
-        enum Sent {
-            Now(Box<Message>),
-            Later,
+        if self.delivery.review_before_send {
+            return;
         }
-        let mut run = || -> Result<Sent> {
+        let mut run = || -> Result<Message> {
             let scope = self.draft_scope().context("No active composer")?;
             self.flush_draft()?;
             let stamp = self.delivery.stamp.as_deref().context("Nothing to send")?;
@@ -262,47 +249,28 @@ impl State {
                 labels: self.delivery.settings().parsed_labels()?,
                 ..Default::default()
             };
-            let dest = if self.edits_root() {
-                automation::Destination::Channel(self.root_channel())
-            } else if let Some(root) = self.page.thread_id() {
-                automation::Destination::Reply(self.reply_to.unwrap_or(root))
-            } else {
-                anyhow::bail!("No active composer")
-            };
             let db = self.db()?;
-            if self.delivery.later {
-                automation::schedule_draft(
-                    db,
+            if self.edits_root() {
+                db.post_scoped_composer(
+                    self.root_channel(),
                     &self.actor,
-                    dest,
                     &self.body.text,
-                    self.delivery.timing()?,
                     &options,
                     (&scope, stamp),
-                )?;
-                Ok(Sent::Later)
+                )
             } else {
-                let m = match dest {
-                    automation::Destination::Channel(ch) => db.post_scoped_composer(
-                        ch,
-                        &self.actor,
-                        &self.body.text,
-                        &options,
-                        (&scope, stamp),
-                    )?,
-                    automation::Destination::Reply(id) => db.reply_composer(
-                        id,
-                        &self.actor,
-                        &self.body.text,
-                        &options,
-                        (&scope, stamp),
-                    )?,
-                };
-                Ok(Sent::Now(Box::new(m)))
+                let root = self.page.thread_id().context("No active composer")?;
+                db.reply_composer(
+                    self.reply_to.unwrap_or(root),
+                    &self.actor,
+                    &self.body.text,
+                    &options,
+                    (&scope, stamp),
+                )
             }
         };
-        let outcome = match run() {
-            Ok(o) => o,
+        let m = match run() {
+            Ok(m) => m,
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 return;
@@ -315,36 +283,26 @@ impl State {
         self.draft_dirty = false;
         self.delivery = Delivery::default();
         self.browse.reset_thread();
-        match outcome {
-            Sent::Later if self.edits_root() => self.go(Page::Schedules),
-            Sent::Later => {
-                self.error = None;
-                self.refresh();
-                tx.scroll_to_bottom("conversation");
-            }
-            Sent::Now(m) => {
-                let root = m.re.unwrap_or(m.id);
-                if self.edits_root() {
-                    self.channel = None;
-                    self.query.clear();
-                    self.tasks_only = false;
-                    self.reset_feed();
-                    if self.db().is_ok_and(|db| db.get(root).is_ok()) {
-                        self.channel = Some(m.channel);
-                    } else {
-                        self.go(Page::Feed);
-                        return;
-                    }
-                }
-                if self.page == Page::Task(root) {
-                    self.error = None;
-                    self.refresh();
-                } else {
-                    self.go(Page::Thread(root));
-                }
-                tx.scroll_to_bottom("conversation");
+        let root = m.re.unwrap_or(m.id);
+        if self.edits_root() {
+            self.channel = None;
+            self.query.clear();
+            self.tasks_only = false;
+            self.reset_feed();
+            if self.db().is_ok_and(|db| db.get(root).is_ok()) {
+                self.channel = Some(m.channel);
+            } else {
+                self.go(Page::Feed);
+                return;
             }
         }
+        if self.page == Page::Task(root) {
+            self.error = None;
+            self.refresh();
+        } else {
+            self.go(Page::Thread(root));
+        }
+        tx.scroll_to_bottom("conversation");
     }
 }
 impl Drop for State {

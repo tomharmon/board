@@ -118,6 +118,41 @@ pub struct SpawnedWorker {
     pub assembled_prompt: String,
     pub skills_dir: PathBuf,
     pub env_vars: BTreeMap<String, String>,
+    /// Arguments before the subcommand. An in-memory board cannot be shared between processes.
+    pub cli_args: Option<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkerBinding {
+    pub run: String,
+    pub run_id: i64,
+    pub name: String,
+    pub actor: String,
+}
+impl WorkerBinding {
+    pub fn selector(s: &str) -> Result<(&str, &str)> {
+        s.split_once('/')
+            .filter(|(r, n)| valid_slug(r, 64) && valid_slug(n, 24))
+            .context(Invalid.error("invalid_worker", "expected an assigned RUN/NAME"))
+    }
+    pub fn select_run(&self, requested: Option<&str>) -> Result<String> {
+        ensure!(
+            requested.is_none_or(|r| r == self.run
+                || r.strip_prefix('#').and_then(|i| i.parse::<i64>().ok()) == Some(self.run_id)),
+            Forbidden.error(
+                "worker_run_mismatch",
+                "the worker assignment is for a different run"
+            )
+        );
+        Ok(self.run.clone())
+    }
+    pub fn coordinator_only() -> anyhow::Error {
+        Forbidden
+            .error(
+                "swarm_coordinator_required",
+                "this command is not available from a worker assignment",
+            )
+            .into()
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmPostResult {
@@ -216,6 +251,26 @@ fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
 }
 
 impl Board {
+    pub fn worker_binding(&self, selector: &str) -> Result<WorkerBinding> {
+        let (slug, name) = WorkerBinding::selector(selector)?;
+        let tx = self.conn.unchecked_transaction()?;
+        // Select from the roster, not the caller's inherited chat profile. A scoped session
+        // must match the actor AND be allowed to read the run before anything is returned.
+        let access = self.access_on(&tx)?;
+        access.require(Action::Read, &format!("swarms/{slug}"))?;
+        let (actor,run_id):(String,i64)=tx.query_row(
+            "SELECT w.actor,w.run_id FROM swarm_workers w JOIN swarm_runs r ON r.id=w.run_id WHERE r.slug=? AND w.name=?",
+            params![slug,name], |r|Ok((r.get(0)?,r.get(1)?))).optional()?
+            .context(Forbidden.error("worker_identity_mismatch","no matching worker assignment for this actor and run"))?;
+        access.actor(&actor)?;
+        tx.commit()?;
+        Ok(WorkerBinding {
+            run: slug.into(),
+            run_id,
+            name: name.into(),
+            actor,
+        })
+    }
     fn swarm_record(
         &self,
         c: &Connection,

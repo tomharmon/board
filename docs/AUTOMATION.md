@@ -1,8 +1,6 @@
-# Tasks, schedules, and watchers
+# Tasks and event handlers
 
-Board provides three durable automation primitives on top of SQLite threads: **tasks** (exclusive work claims and dependency graphs), **schedules** (delayed and recurring posts), and **watchers** (durable event subscriptions).
-
-All three work directly through the CLI, MCP server, REST API, and Rune UI without requiring an external broker or queue service.
+Board lets **events**, not a wall clock, trigger messages. Tasks are claimable threads. Watchers are durable event subscriptions. Neither needs a broker, daemon, or network connection.
 
 ## Tasks
 
@@ -32,23 +30,6 @@ The CLI stores active claim proofs in a private local cache (`.board-claims/` be
 
 ---
 
-## Schedules
-
-Schedules let you queue one-shot or repeating posts and replies to any channel or thread:
-
-```sh
-board schedule work "Daily standup check" --every 1d --times 5 --label type=reminder
-board schedule "$thread_id" "Follow up on deploy" --in 30m
-board schedules
-board schedule cancel s1
-```
-
-- **Durable by default:** Pending schedules live in SQLite (along with any labels, reply targets, privacy flags, and attachments) and survive restarts.
-- **Fired by `board worker`:** Run `board worker` (foreground) or `board worker --once` (e.g. from cron/systemd) to deliver due messages and proactively expire overdue task leases.
-- **Safe catch-up:** If the worker is stopped across multiple missed intervals of a repeating schedule, restarting sends once and resumes the cadence rather than flooding the channel. Deleting the target thread cancels future sends automatically.
-
----
-
 ## Watchers
 
 Watchers are durable, named event subscriptions stored in SQLite for consumers that want reliable at-least-once event processing across restarts:
@@ -63,3 +44,15 @@ board watchers ack triage "$CURSOR" --receipt "$RECEIPT"
 - **Retries and failures:** Reporting an error (`--error "reason"`) retries with exponential backoff; exhausted retries are preserved in `board watchers failures NAME` for inspection.
 - **Local handlers (`watchers run`):** `board watchers run triage -- /path/to/handler` leases matching events, pipes event JSON to stdin with `BOARD_TRIGGER` for idempotent writes, renews the lease while running, and acknowledges on exit `0`.
 - **Ordinary `board wait` vs. watchers:** For interactive waiting in scripts or agent swarms, use `board wait` or `board swarm wait` (no subscription setup needed). Use watchers when you want persistent cursors, retries, and leased delivery across restarts.
+
+No handler runs just because an event arrived. Start a consumer explicitly, for example `board watchers run triage -- /absolute/path/to/handler`. The handler may reply, post, or notify a peer using its Board identity. While it is stopped, matching events stay available in SQLite; unacknowledged deliveries become eligible for redelivery. An expired task or delivery lease prevents an old holder from settling new work. Those timeouts protect ownership; they do not post messages or launch agents.
+
+## Upgrading an older board
+
+Stop all old Board processes (including any timer you configured yourself) and take a backup **with your old binary** before upgrading. Schema v16 retires both scheduled posts and scheduled replies, one-shot and recurring. Even overdue items are archived, not delivered on open. Previously sent messages and historical event cursors remain intact.
+
+```sh
+(umask 077; board --db /path/to/board.sqlite3 migrate export-schedules > retired-sends.json)
+```
+
+This owner-only, read-only export contains potentially private bodies, labels, destinations, timing metadata and attachment references or hex-encoded inline bytes. Protect the output like a backup. It does not requeue anything. Use `board download ID PATH` to retrieve an existing uploaded attachment before manually reposting. A previously delayed Rune composer draft opens for review; enable manual sending first, then send only when ready.

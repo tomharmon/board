@@ -3,6 +3,7 @@ mod attachments;
 mod automation_cli;
 mod cli;
 mod conformance;
+mod init;
 mod roles_cli;
 mod skill_install;
 mod swarm_cli;
@@ -10,6 +11,7 @@ mod sync_cli;
 
 use anyhow::{Context, Result, bail, ensure};
 use board_local::errors::{Kind, classify};
+use board_local::swarm::WorkerBinding;
 use board_local::{Board, Filter, Message, PostOptions, local};
 use clap::Parser;
 use cli::{Args, Body, ChannelCommand, Command, Query, SchemaCommand, WriteOptions};
@@ -363,12 +365,56 @@ fn inspector(
     }
     let status = cmd
         .status()
-        .context("could not start board-ui; install it with cargo install --path ui --locked")?;
+        .context("could not start board-ui; reinstall the Board desktop package")?;
     ensure!(status.success(), "inspector exited with {status}");
     Ok(())
 }
 
-fn run(args: Args) -> Result<()> {
+fn accepts_worker(cmd: &Command) -> bool {
+    use Command::*;
+    matches!(
+        cmd,
+        Swarm { .. }
+            | Mcp
+            | Whoami
+            | Discovery
+            | Commands
+            | Typing { .. }
+            | Channels { .. }
+            | Channel(_)
+            | Actors { .. }
+            | Profile { .. }
+            | Post { .. }
+            | Posted { .. }
+            | Read { .. }
+            | Reply { .. }
+            | Edit { .. }
+            | Delete { .. }
+            | React { .. }
+            | Label { .. }
+            | Download { .. }
+            | Upload { .. }
+            | Tail { .. }
+            | Wait { .. }
+            | Automation(_)
+            | Roles {
+                command: roles_cli::Roles::List | roles_cli::Roles::Show { .. }
+            }
+            | Skills {
+                command: roles_cli::Skills::List | roles_cli::Skills::Show { .. }
+            }
+            | Schemas {
+                cmd: None | Some(SchemaCommand::List | SchemaCommand::Inspect { .. })
+            }
+    )
+}
+fn run(mut args: Args) -> Result<()> {
+    if args.worker.is_some() && !accepts_worker(&args.cmd) {
+        return Err(WorkerBinding::coordinator_only());
+    }
+    if let Command::Init(opts) = args.cmd {
+        return init::run(opts, args.json);
+    }
     if let Command::Skill { command } = args.cmd {
         return skill_install::run(command, args.json);
     }
@@ -397,10 +443,28 @@ fn run(args: Args) -> Result<()> {
         .or_else(|| args.name.as_deref().map(local::named_database_path))
         .unwrap_or_else(local::database_path);
     let in_swarm = matches!(args.cmd, Command::Swarm { .. } | Command::Mcp)
+        || args.worker.is_some()
         || env::var_os("BOARD_SWARM_RUN").is_some();
+    if args.worker.is_none() {
+        if args.profile.is_none() {
+            args.profile = local::identity_env("BOARD_PROFILE")?;
+        }
+        args.avatar = args.avatar.or_else(|| env::var("BOARD_AVATAR").ok());
+    }
+    let assigned = args
+        .worker
+        .as_deref()
+        .map(WorkerBinding::selector)
+        .transpose()?
+        .map(|(_, name)| name);
+    ensure!(
+        assigned.is_none() || args.profile.as_deref().is_none_or(|p| Some(p) == assigned),
+        Kind::Forbidden.error("actor_mismatch", "--as conflicts with the assigned worker")
+    );
     let profile = args
         .profile
         .as_deref()
+        .or(assigned)
         .map(|name| {
             if in_swarm {
                 local::agent_profile_name(name)
@@ -421,7 +485,15 @@ fn run(args: Args) -> Result<()> {
         return inspector(path, profile, args.avatar, thread);
     }
     let mut board = Board::open(&path).with_context(|| format!("open {}", path.display()))?;
-    let actor = if let Some(fixed) = board.bind_env()? {
+    let fixed = board.bind_env()?;
+    let binding = args
+        .worker
+        .as_deref()
+        .map(|s| board.worker_binding(s))
+        .transpose()?;
+    let actor = if let Some(binding) = &binding {
+        binding.actor.clone()
+    } else if let Some(fixed) = fixed {
         ensure!(
             profile
                 .as_ref()
@@ -439,11 +511,16 @@ fn run(args: Args) -> Result<()> {
     }
     let js = args.json;
     match args.cmd {
-        Command::Skill { .. } => unreachable!(),
-        Command::Swarm { command } => swarm_cli::run(&board, &actor, command, js)?,
+        Command::Init(_) | Command::Skill { .. } => unreachable!(),
+        Command::Swarm { mut command } => {
+            command.select_run(binding.as_ref())?;
+            swarm_cli::run(&board, &actor, command, js)?;
+        }
         Command::Roles { command } => roles_cli::roles(&board, &actor, command, js)?,
         Command::Skills { command } => roles_cli::skills(&board, &actor, command, js)?,
-        Command::Mcp => return board_mcp::serve_stdio(&board, &actor),
+        Command::Mcp => {
+            return board_mcp::serve_stdio_bound(&board, &actor, args.worker.as_deref());
+        }
         Command::Discovery => println!(
             "{}",
             serde_json::to_string_pretty(&board_api::discovery_document())?
@@ -489,6 +566,9 @@ fn run(args: Args) -> Result<()> {
                 println!("{}", safe(&destination.display().to_string()));
             }
         }
+        Command::Migrate {
+            command: cli::Migration::ExportSchedules,
+        } => board_local::automation::export_legacy_schedules(&board, std::io::stdout().lock())?,
         Command::Profile { handle, name } => {
             board.set_actor_profile_with_avatar(&actor, &handle, &name, args.avatar.as_deref())?;
             if js {
@@ -533,6 +613,7 @@ fn run(args: Args) -> Result<()> {
             if js {
                 let mut me = json!(board.viewer(&actor)?);
                 me["database"] = json!(path);
+                me["worker"] = json!(binding);
                 println!("{me}");
             } else {
                 println!("{}  {}", safe(&actor), safe(&path.display().to_string()));
@@ -741,9 +822,6 @@ fn run(args: Args) -> Result<()> {
                     show_message(&thread.message);
                     for m in &thread.replies {
                         show_message(m);
-                    }
-                    for schedule in &thread.schedules {
-                        println!("    {}", safe(&automation_cli::sched_line(schedule)));
                     }
                     println!("cursor {}", thread.cursor);
                 }

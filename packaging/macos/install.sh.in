@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+test "$(uname -s)" = Darwin || { echo 'This Homebrew cask is for macOS.' >&2; exit 1; }
+command -v brew >/dev/null || { echo 'Install Homebrew first: https://brew.sh' >&2; exit 1; }
+tap=tomharmon/board-release-local
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cd "$tmp"
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS -o board.rb 'https://github.com/tomharmon/board/releases/download/@TAG@/board.rb'
+printf '%s  board.rb\n' '@CASK_SHA256@' | shasum -a 256 -c -
+dir=$(brew --repository "$tap")
+if [ ! -d "$dir" ]; then
+    brew tap-new --no-git "$tap"
+    touch "$dir/.board-release-local"
+elif [ ! -f "$dir/.board-release-local" ]; then
+    echo "Refusing to modify a tap not created by this installer: $dir" >&2; exit 1
+fi
+mkdir -p "$dir/Casks"
+install -m 644 board.rb "$dir/Casks/board.rb"
+if brew list --cask "$tap/board" >/dev/null 2>&1; then
+    brew upgrade --cask "$tap/board"
+else
+    brew install --cask "$tap/board"
+fi

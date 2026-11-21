@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::{bail, ensure};
-use automation::{Schedule, Task, Watcher};
+use automation::{Task, Watcher};
 use board_local::{Event, Schema};
 
 const PAGE: usize = 40;
@@ -134,7 +134,6 @@ pub struct Desk {
     pub task_entry: TaskEntry,
     pub access: AccessReview,
     pub criteria: automation::TaskFilter,
-    pub schedules: Vec<Schedule>,
     pub watchers: Vec<Watcher>,
     pub schemas: Vec<Schema>,
     pub grants: Vec<board_local::access::Grant>,
@@ -180,7 +179,6 @@ impl Desk {
         self.task_rows.clear();
         self.access.viewer = None;
         self.access.decision = None;
-        self.schedules.clear();
         self.watchers.clear();
         self.schemas.clear();
         self.grants.clear();
@@ -226,8 +224,6 @@ impl Desk {
         self.source.expanded = None;
         if page == Page::NewTask && self.task_entry.form.channel.text.is_empty() {
             self.task_entry.form.channel = TextEdit::new("general");
-        } else if page == Page::Schedules {
-            self.form.channel = TextEdit::new("general");
         }
     }
 
@@ -350,14 +346,6 @@ impl Desk {
                 } else {
                     self.selected_task = None;
                 }
-            }
-            Page::Schedules => {
-                let (_, mut rows) = automation::schedules_page(db, true, after, PAGE + 1)?;
-                if rows.len() > PAGE {
-                    rows.truncate(PAGE);
-                    self.next = rows.last().map(|s| s.id);
-                }
-                self.schedules = rows;
             }
             Page::Watchers => {
                 let (_, mut rows) = automation::watchers_page(
@@ -830,42 +818,6 @@ impl State {
                 )
                 .map(|_| ())
             }
-            Page::Schedules => {
-                let target = f.channel.text.trim();
-                let destination = if let Some(id) = target.strip_prefix('#') {
-                    automation::Destination::Reply(
-                        id.parse()
-                            .context("Reply target must be # followed by its message ID")?,
-                    )
-                } else {
-                    automation::Destination::Channel(target)
-                };
-                let due = chrono::DateTime::parse_from_rfc3339(f.name.text.trim())
-                    .context("Use an RFC 3339 timestamp with its UTC offset")?
-                    .timestamp();
-                let every = (!f.value.text.trim().is_empty())
-                    .then(|| f.value.text.trim().parse())
-                    .transpose()
-                    .context("Repeat interval must be seconds")?;
-                let times = (!f.extra.text.trim().is_empty())
-                    .then(|| f.extra.text.trim().parse())
-                    .transpose()
-                    .context("Count must be a number")?;
-                automation::schedule(
-                    b,
-                    actor,
-                    destination,
-                    &f.body.text,
-                    automation::Timing {
-                        due,
-                        every,
-                        times,
-                        until: None,
-                    },
-                    BTreeMap::new(),
-                )
-                .map(|_| ())
-            }
             Page::Schemas => {
                 let version = f
                     .value
@@ -897,9 +849,6 @@ impl State {
                 "Confirmation required"
             );
             match self.page {
-                Page::Schedules => {
-                    automation::cancel_schedule(db, key.parse()?, &self.actor).map(|_| ())
-                }
                 Page::Watchers => automation::remove_watcher_as(db, &self.actor, key),
                 Page::Access | Page::Workspace if self.desk.access.registry() => {
                     if let Some(id) = key.strip_prefix("grant-") {

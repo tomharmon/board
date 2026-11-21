@@ -119,17 +119,9 @@ fn cli_retry_wait_resume_and_online_backup() {
     );
     assert_eq!(rest["messages"][0]["id"], reply["message"]["id"]);
     let backup = tmp.path().join("archive.db");
-    let reminder = ok(&db, &["schedule", &id, "Check the handoff", "--in", "30m"]);
-    assert_eq!(
-        ok(&db, &["read", &first])["schedules"][0]["id"],
-        reminder["id"]
-    );
+    assert!(ok(&db, &["read", &first]).get("schedules").is_none());
     ok(&db, &["backup", backup.to_str().unwrap()]);
     ok(&db, &["delete", &id]);
-    assert_eq!(
-        ok(&db, &["read", &first])["schedules"],
-        serde_json::json!([])
-    );
     assert!(
         !ok(&backup, &["read", &first])["replies"][0]["deleted"]
             .as_bool()
@@ -334,61 +326,39 @@ fn waits_resume_the_same_identity_and_filters_and_skip_bookkeeping_unless_reques
 }
 
 #[test]
-fn scheduled_schema_is_validated_and_timer_is_addressable_after_cancel() {
-    let tmp = tempfile::tempdir().unwrap();
-    let db = tmp.path().join("board.db");
-    ok(
-        &db,
-        &[
-            "schemas",
-            "create",
-            "note@1",
-            "--data",
-            r#"{"type":"object","required":["n"],"properties":{"n":{"type":"integer"}}}"#,
-        ],
-    );
-    assert!(
-        !invoke(
-            &db,
-            &[
-                "schedule",
-                "ops/south",
-                "{}",
-                "--schema",
-                "note@1",
-                "--in",
-                "2h"
-            ]
-        )
-        .status
-        .success()
-    );
-    let s = ok(
-        &db,
-        &[
-            "schedule",
-            "ops/south",
-            r#"{"n":1}"#,
-            "--schema",
-            "note@1",
-            "--in",
-            "2h",
-        ],
-    );
-    ok(&db, &["schedule", "elsewhere", "other", "--in", "1h"]);
-    let list = ok(&db, &["schedules", "--channel", "ops/"]);
-    assert_eq!(list.as_array().unwrap().len(), 1);
-    assert_eq!(list[0]["id"], s["id"]);
-    let key = format!("s{}", s["id"]);
+fn clock_sends_are_neither_advertised_nor_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("board.db");
+    let index = ok(&db, &["commands"]);
+    let commands = index["commands"].as_array().unwrap();
+    for command in ["schedule", "schedules", "worker"] {
+        assert!(!commands.iter().any(|entry| entry["name"] == command));
+        err(&db, &[command], 2, "invalid_arguments");
+    }
     err(
         &db,
-        &["schedule", "cancel", &key, "--in", "1h"],
+        &["post", "ops", "not later", "--in", "1h"],
         2,
-        "invalid_request",
+        "invalid_arguments",
     );
-    assert_eq!(ok(&db, &["schedules", &key])["state"], "pending");
-    ok(&db, &["schedule", "cancel", &key]);
-    assert_eq!(ok(&db, &["schedules", &key])["state"], "canceled");
+    err(
+        &db,
+        &["reply", "1", "not later", "--every", "1h"],
+        2,
+        "invalid_arguments",
+    );
+    let discovery = ok(&db, &["discovery"]);
+    assert!(
+        !discovery["features"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f == "schedules")
+    );
+    assert_eq!(
+        ok(&db, &["migrate", "export-schedules"])["schedules"],
+        serde_json::json!([])
+    );
 }
 
 #[test]
@@ -521,7 +491,7 @@ fn independent_processes_cannot_share_or_reuse_a_claim() {
 }
 
 #[test]
-fn schedules_and_unacknowledged_deliveries_outlive_processes() {
+fn restarted_watcher_runs_an_event_driven_reply_without_a_worker() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("board.db");
     ok(
@@ -537,32 +507,37 @@ fn schedules_and_unacknowledged_deliveries_outlive_processes() {
             "job=sample",
         ],
     );
-    let s = ok(
+    assert!(ok(&db, &["watchers", "next", "inbox"]).is_null());
+    let sent = ok(
         &db,
         &[
-            "schedule",
+            "post",
             "lab/bench",
             "Read the sample",
-            "--in",
-            "0s",
             "--label",
             "job=sample",
         ],
     );
-    assert!(ok(&db, &["watchers", "next", "inbox"]).is_null());
-    assert_eq!(ok(&db, &["worker", "--once"])["sent"], 1);
-    assert_eq!(ok(&db, &["worker", "--once"])["sent"], 0);
+    let id = sent["message"]["id"].to_string();
     let event = ok(&db, &["watchers", "next", "inbox"]);
     assert_eq!(event["message"]["text"], "Read the sample");
     assert_eq!(ok(&db, &["watchers", "next", "inbox"]), event);
-    ok(
-        &db,
-        &["watchers", "ack", "inbox", &event["cursor"].to_string()],
-    );
-    assert!(ok(&db, &["watchers", "next", "inbox"]).is_null());
-    let persisted = ok(&db, &["schedules", "--all"]);
-    assert_eq!(persisted[0]["id"], s["id"]);
-    assert_eq!(persisted[0]["sent"], 1);
+    let handler = [
+        env!("CARGO_BIN_EXE_board"),
+        "reply",
+        &id,
+        "Sample reviewed",
+        "--label",
+        "job=sample",
+    ];
+    let mut run = vec!["watchers", "run", "inbox", "--once", "--"];
+    run.extend(handler);
+    assert_eq!(ok(&db, &run)["cursor"], event["cursor"]);
+    assert!(ok(&db, &run).is_null());
+    let read = ok(&db, &["read", &id]);
+    assert_eq!(read["replies"].as_array().unwrap().len(), 1);
+    assert_eq!(read["replies"][0]["text"], "Sample reviewed");
+    assert_eq!(read["replies"][0]["actor"], "ada/inbox");
 }
 
 #[test]

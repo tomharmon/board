@@ -1,4 +1,4 @@
-//! Local defaults shared by the CLI, worker, and native inspector.
+//! Local defaults shared by the CLI and native inspector.
 use std::{
     env,
     path::{Path, PathBuf},
@@ -19,11 +19,31 @@ fn var(key: &str) -> Option<String> {
     env::var(key).ok().filter(|s| !s.trim().is_empty())
 }
 
+/// Never turn a present but unreadable identity setting into the ordinary local person.
+pub fn identity_env(key: &str) -> anyhow::Result<Option<String>> {
+    match env::var(key) {
+        Ok(value) => Ok(Some(value)),
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(env::VarError::NotUnicode(_)) => Err(crate::errors::Kind::Invalid
+            .error("invalid_identity", format!("{key} must be a UTF-8 string"))
+            .into()),
+    }
+}
+
 fn board_dir() -> PathBuf {
-    let base = var("XDG_DATA_HOME")
+    if let Some(dir) = var("XDG_DATA_HOME")
         .map(PathBuf::from)
-        .or_else(|| var("HOME").map(|p| PathBuf::from(p).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
+        .filter(|p| p.is_absolute())
+    {
+        return dir.join("board");
+    }
+    #[cfg(windows)]
+    let base = var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| var("USERPROFILE").map(|p| PathBuf::from(p).join("AppData/Local")));
+    #[cfg(not(windows))]
+    let base = var("HOME").map(|p| PathBuf::from(p).join(".local/share"));
+    let base = base.unwrap_or_else(|| PathBuf::from("."));
     base.join("board")
 }
 pub fn named_database_path(name: &str) -> PathBuf {

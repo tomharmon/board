@@ -65,91 +65,6 @@ fn large_plans_checkpoint_chunks_and_allow_repairs_only_to_uncommitted_items() -
     Ok(())
 }
 
-#[test]
-fn blind_schedules_only_reveal_ones_created_blind_and_retain_temporary_caps() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("blind.db");
-    let mut b = Board::open(&db)?;
-    let policy = Rules::parse("private=read,post")?;
-    b.set_grant("owner", None, "ada/bot", &policy)?;
-    let credential = b.issue_credential("owner", "ada/bot", None, None)?;
-    let other = b.post("private", "other", "not public", &Default::default())?;
-    let visible = b.with_request(Some(&credential.token), "owner", None, |b, actor| {
-        schedule(
-            b,
-            actor,
-            Destination::Channel("private"),
-            "originally readable",
-            due(),
-            Default::default(),
-        )
-    })?;
-    let blind = b.with_request(
-        Some(&credential.token),
-        "owner",
-        Some("post"),
-        |b, actor| {
-            assert!(
-                schedule(
-                    b,
-                    actor,
-                    Destination::Reply(other.id),
-                    "no thread access",
-                    due(),
-                    Default::default()
-                )
-                .is_err()
-            );
-            let blind = schedule(
-                b,
-                actor,
-                Destination::Channel("private"),
-                "blind",
-                due(),
-                Default::default(),
-            )?;
-            let c = schedule(
-                b,
-                actor,
-                Destination::Channel("private"),
-                "will cancel",
-                due(),
-                Default::default(),
-            )?;
-            cancel_schedule(b, c.id, actor)?;
-            assert_eq!(
-                schedules(b, false)?
-                    .iter()
-                    .map(|s| s.id)
-                    .collect::<Vec<_>>(),
-                vec![blind.id]
-            );
-            assert!(get_schedule(b, visible.id).is_err());
-            assert!(cancel_schedule(b, visible.id, actor).is_err());
-            Ok(blind)
-        },
-    )?;
-    drop(b);
-    let mut b = Board::open(&db)?;
-    assert_eq!(dispatch_due(&b)?, 2);
-    let root = b
-        .messages(&board_local::Filter::default(), 100)?
-        .into_iter()
-        .find(|m| m.schedule.as_ref().is_some_and(|s| s.id == blind.id))
-        .unwrap();
-    b.with_request(
-        Some(&credential.token),
-        "owner",
-        Some("post"),
-        |b, actor| {
-            assert!(b.get(other.id).is_err());
-            // The original cap, not the worker's local-owner authority, marked the send as blind.
-            b.edit(root.id, actor, "my correction", None)?;
-            Ok(())
-        },
-    )?;
-    Ok(())
-}
 fn lease(token: &str) -> ClaimRequest<'_> {
     ClaimRequest {
         lease_seconds: 30,
@@ -161,14 +76,6 @@ fn new<'a>(channel: &'a str, options: &'a PostOptions) -> TaskTarget<'a> {
         channel,
         text: "work",
         options,
-    }
-}
-fn due() -> Timing {
-    Timing {
-        due: chrono::Utc::now().timestamp(),
-        every: None,
-        times: None,
-        until: None,
     }
 }
 
@@ -282,75 +189,6 @@ fn creation_adoption_and_claim_are_atomic_and_lost_responses_recover_after_resta
         classify(&recover_claim(&b, "ann", PROOF).unwrap_err()).1,
         "claim_lost"
     );
-    Ok(())
-}
-
-#[test]
-fn scheduled_files_survive_restart_and_permission_loss_cancels_only_revoked_sends() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("board.db");
-    let owner = Board::open(&db)?;
-    let root = owner.post("ops", "ann", "root", &Default::default())?;
-    let child = owner.reply(root.id, "ann", "exact reply", &Default::default())?;
-    owner.set_grant(
-        "ann",
-        None,
-        "ann/worker",
-        &Rules::parse("ops=read,post,label")?,
-    )?;
-    let issued = owner.issue_credential("ann", "ann/worker", None, None)?;
-    let mut agent = Board::open(&db)?;
-    agent.bind_token(&issued.token)?;
-    let reusable = agent.upload("ann/worker", "ops", "reused.txt", "text/plain", b"reusable")?;
-    let opts = PostOptions {
-        files: vec![("bytes.bin".into(), vec![0, 255, 4])],
-        attachment_ids: vec![reusable.id],
-        ..Default::default()
-    };
-    let s = schedule_post(
-        &agent,
-        "ann/worker",
-        Destination::Reply(child.id),
-        "",
-        due(),
-        &opts,
-    )?;
-    assert_eq!(s.attachments[0].id, Some(reusable.id));
-    assert_eq!(s.attachments[1].size, 3);
-    assert_eq!(
-        schedule_query(&agent, false, Some(root.id), Some("ann"), 0, 100, false)?.1[0].id,
-        s.id
-    );
-    assert!(dispatch_due(&agent).is_err());
-    drop(agent);
-    drop(owner);
-    let owner = Board::open(&db)?;
-    assert_eq!(dispatch_due(&owner)?, 1);
-    let reply = owner.thread(root.id)?.pop().unwrap();
-    assert_eq!(reply.reply_to, Some(child.id));
-    assert_eq!(reply.attachments[0].id, reusable.id);
-    assert_eq!(owner.download(reply.attachments[1].id)?.1, vec![0, 255, 4]);
-    let mut agent = Board::open(&db)?;
-    agent.bind_token(&issued.token)?;
-    let revoked = schedule_post(
-        &agent,
-        "ann/worker",
-        Destination::Channel("ops"),
-        "",
-        due(),
-        &opts,
-    )?;
-    owner.revoke_credential("ann", &issued.credential.id)?;
-    schedule(
-        &owner,
-        "ann",
-        Destination::Channel("other"),
-        "ok",
-        due(),
-        Default::default(),
-    )?;
-    assert_eq!(dispatch_due(&owner)?, 1);
-    assert_eq!(get_schedule(&owner, revoked.id)?.state, "revoked");
     Ok(())
 }
 
@@ -594,8 +432,7 @@ fn delegated_watchers_use_private_names_and_recheck_both_registered_and_pulling_
 }
 
 #[test]
-fn loss_of_board_admission_fences_a_due_schedule_and_offline_watcher_even_with_everyone_grants()
--> Result<()> {
+fn loss_of_board_admission_fences_an_offline_watcher_even_with_everyone_grants() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("admission.db");
     let owner = Board::open(&path)?;
@@ -612,19 +449,6 @@ fn loss_of_board_admission_fences_a_due_schedule_and_offline_watcher_even_with_e
         board_local::Filter::default(),
         Some("message.posted"),
     )?;
-    let later = schedule(
-        &client,
-        "triage",
-        Destination::Channel("work/inbox"),
-        "must not fire",
-        Timing {
-            due: chrono::Utc::now().timestamp(),
-            every: None,
-            times: None,
-            until: None,
-        },
-        Default::default(),
-    )?;
     owner.revoke_grant("owner", admission.id)?;
     assert_eq!(classify(&client.cursor().unwrap_err()).1, "no_access");
     owner.post(
@@ -633,8 +457,6 @@ fn loss_of_board_admission_fences_a_due_schedule_and_offline_watcher_even_with_e
         "outside membership",
         &Default::default(),
     )?;
-    assert_eq!(dispatch_due(&owner)?, 0);
-    assert_eq!(get_schedule(&owner, later.id)?.state, "revoked");
     owner.set_grant("owner", None, "triage", &rules)?;
     let admitted = owner.post("work/inbox", "owner", "admitted again", &Default::default())?;
     assert_eq!(

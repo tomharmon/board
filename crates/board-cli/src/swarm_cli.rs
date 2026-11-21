@@ -32,7 +32,7 @@ pub enum Swarm {
     /// Register a worker and render the pinned prompt and environment for your harness.
     Add {
         worker_name: String,
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
         #[arg(long)]
         role: Option<String>,
@@ -44,7 +44,6 @@ pub enum Swarm {
         branch: Option<String>,
     },
     Status {
-        #[arg(env = "BOARD_SWARM_RUN")]
         run: Option<String>,
     },
     List {
@@ -57,7 +56,7 @@ pub enum Swarm {
     Post {
         #[command(flatten)]
         body: Body,
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
         #[arg(long,num_args=0..=1,default_missing_value="",require_equals=false)]
         diff: Option<String>,
@@ -71,11 +70,11 @@ pub enum Swarm {
         text: Option<String>,
         #[arg(long, conflicts_with = "text")]
         file: Option<PathBuf>,
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
     },
     Read {
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
         #[arg(long, default_value_t = 0)]
         after: i64,
@@ -84,7 +83,7 @@ pub enum Swarm {
     },
     /// Sleep until notified, timeout, or stop. Omit --after to use your saved read position.
     Wait {
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
         #[arg(long)]
         after: Option<i64>,
@@ -93,18 +92,54 @@ pub enum Swarm {
     },
     Done {
         summary: Option<String>,
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
     },
     Stop {
-        #[arg(env = "BOARD_SWARM_RUN")]
         run: Option<String>,
     },
     SetLimit {
-        #[arg(long, env = "BOARD_SWARM_RUN")]
+        #[arg(long)]
         run: Option<String>,
         limit: i64,
     },
+}
+impl Swarm {
+    pub(crate) fn select_run(
+        &mut self,
+        binding: Option<&board_local::swarm::WorkerBinding>,
+    ) -> Result<()> {
+        if binding.is_some()
+            && matches!(
+                self,
+                Self::Start { .. }
+                    | Self::Add { .. }
+                    | Self::SetLimit { .. }
+                    | Self::Stop { .. }
+                    | Self::List { .. }
+            )
+        {
+            return Err(board_local::swarm::WorkerBinding::coordinator_only());
+        }
+        let run = match self {
+            Self::Post { run, .. }
+            | Self::Dm { run, .. }
+            | Self::Read { run, .. }
+            | Self::Wait { run, .. }
+            | Self::Done { run, .. }
+            | Self::Status { run }
+            | Self::Add { run, .. }
+            | Self::SetLimit { run, .. }
+            | Self::Stop { run } => run,
+            Self::Start { .. } | Self::List { .. } => return Ok(()),
+        };
+        if let Some(binding) = binding {
+            *run = Some(binding.select_run(run.as_deref())?);
+        } else if run.is_none() {
+            *run = std::env::var("BOARD_SWARM_RUN").ok();
+        }
+        Ok(())
+    }
 }
 fn reference(run: Option<&str>) -> Result<&str> {
     run.context(

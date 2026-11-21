@@ -42,8 +42,9 @@ pub fn run(js: bool) -> Result<()> {
                 .is_empty()
     );
     checks.push("event resume");
-    add_watcher(
+    add_watcher_as(
         &b,
+        "probe",
         "posted",
         Filter {
             channel: Some("checks/local".into()),
@@ -84,19 +85,6 @@ pub fn run(js: bool) -> Result<()> {
     let f = next_event(&b, "posted")?
         .context("expected watcher match")?
         .cursor;
-    schedule(
-        &b,
-        "probe",
-        Destination::Reply(root.id),
-        "alarm",
-        Timing {
-            due: chrono::Utc::now().timestamp(),
-            every: None,
-            times: None,
-            until: None,
-        },
-        BTreeMap::new(),
-    )?;
     drop(peer);
     drop(b);
     let b = Board::open(&path)?;
@@ -108,12 +96,10 @@ pub fn run(js: bool) -> Result<()> {
     );
     ack_event(&b, "posted", f)?;
     checks.push("watcher redelivery");
-    ensure!(
-        dispatch_due(&b)? == 1
-            && dispatch_due(&b)? == 0
-            && b.thread(root.id)?.last().is_some_and(|m| m.text == "alarm")
-    );
-    checks.push("schedule restart");
+    let response = b.reply(f, "probe/posted", "received", &Default::default())?;
+    ensure!(b.thread(f)?.last().is_some_and(|m| m.id == response.id));
+    ensure!(next_event(&b, "posted")?.is_none());
+    checks.push("event-driven reply");
     if js {
         println!(
             "{}",

@@ -1,5 +1,7 @@
 # Implementation plan
 
+This is the original swarm work plan. For the current install paths, harness registration, assigned worker identities and event-only automation, see [Install Board](INSTALL.md), [MCP](MCP.md), and [Tasks and event handlers](AUTOMATION.md).
+
 Detailed engineering blueprint for implementing the architecture documented in [AGENT-ROLES.md](AGENT-ROLES.md), [MCP.md](MCP.md), [SYNC.md](SYNC.md), and [ui/README.md](../ui/README.md).
 
 Execute workstreams in order (1 → 6). Each workstream ends with concrete verification criteria and keeps `cargo test --workspace` green.
@@ -32,7 +34,7 @@ Execute workstreams in order (1 → 6). Each workstream ends with concrete verif
    - Remove `Sources::Renderer` from `crates/board-cli/src/sync_cli.rs` and its handler.
    - Remove Rhai rule tests from `crates/board-cli/tests/delegation.rs`.
 
-### 1.2 Retire 1:1 Vercel parity tracking files
+### 1.2 Retire 1:1 upstream parity tracking files
 
 Delete these obsolete parity-audit artifacts (they no longer reflect project direction):
 - `PARITY.md`

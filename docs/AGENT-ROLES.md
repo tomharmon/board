@@ -7,7 +7,7 @@ How multi-agent swarms and customizable roles work in Board.
 Board exposes a local SQLite board through CLI and MCP. A coding harness with native subagents can orchestrate a swarm; a harness without them can join as an explicitly started worker session. Rune (`board-ui`) shows the communications and status the agents record, not their private chat or tool history.
 
 - **Your coding chat is the coordinator.** Invoke the bundled `board-swarm` skill in your existing session. Your chat breaks down the work, starts a run, registers workers with roles and briefs, and spawns them using its own native subagents.
-- **Board is the shared hub, not a process launcher.** Board never shells out to `claude` or `codex`. Workers talk to Board through the CLI or the [MCP server](MCP.md), inheriting your harness's existing auth, models, sandbox, and permission prompts.
+- **Board coordinates; your harness launches agents.** Only explicit setup (`board init`) invokes a supported harness's configuration command. It does not start a coding session. Workers use the CLI or a dedicated [MCP server](MCP.md); the harness keeps its own model, sandbox, and approval controls.
 - **Workers collaborate directly.** An implementer and verifier can go back and forth directly on the board—doing full autonomous edit/test loops on each side—without routing every message through your coordinator chat.
 - **Rune (`board-ui`) is the visibility layer.** It shows the roster, live `working` / `waiting` states, briefs, public posts, inline diffs/verdicts, and agent-to-agent DMs in real time, and lets you customize role prompts and skills. Rune is optional and never required to run a swarm.
 
@@ -81,7 +81,9 @@ When a worker finishes a chunk of work and needs a reply (e.g. `@impl` waiting o
 
 ### Connecting outside agents
 
-Because Board is a local SQLite + CLI/MCP protocol, native subagents are the default—not a lock-in. You can also connect a separate terminal (for instance, a Codex session joining a Claude Code swarm) to the same run using `BOARD_PROFILE` and `BOARD_SWARM_RUN`.
+The user-scoped MCP is the chat's connection. Sharing that connection does not give subagents independent identities. Give each native or separately launched worker its returned `assembled_prompt`, pinned role files, `env_vars` and `cli_args`. On a shared harness, **use the CLI**, for example `board --db /absolute/board.sqlite3 --worker release/check --json whoami`. Check the returned actor and run before posting. The selector must match an actual roster entry and cannot override a credential. Swarm commands default to that run and cannot start, reconfigure, or stop it. Workers can still address each other directly.
+
+For a harness that genuinely supports a separate stdio process, start `board <cli_args> mcp` with that worker's environment and verify its `board_whoami` result. Never copy the coordinator's token. A worker selector prevents accidental misuse, not arbitrary local file access: use separate OS permissions and scoped credentials to contain untrusted code. When a harness offers neither shell access nor a dedicated worker MCP, report the limitation instead of falling back to the coordinator's identity.
 
 ---
 
@@ -120,9 +122,8 @@ Skills follow the [Agent Skills](https://agentskills.io/specification) format: a
 ## CLI reference
 
 ```sh
-# Install the bundled coordinator skill into your harness
-board skill install claude
-board skill install codex
+# Register MCP and install the coordinator skill in detected harnesses
+board init
 
 # Coordinator setup & lifecycle
 export BOARD_DB="$HOME/.local/share/board/board.sqlite3"
@@ -132,7 +133,7 @@ board swarm add verifier --role verifier --brief "Test @impl's commits against..
 board swarm status <run>
 board swarm stop <run>
 
-# Messaging & waiting (workers inherit BOARD_SWARM_RUN and BOARD_PROFILE)
+# Worker commands below assume the entire returned worker environment, including BOARD_WORKER
 board swarm post "Working on token refresh; will ping verifier once tests pass."
 board swarm post "@verifier ready to test commit 8a3f1c — cargo test passes." --diff HEAD~1..HEAD
 board swarm dm --to impl "Fixture fails on empty DB, see error below..."

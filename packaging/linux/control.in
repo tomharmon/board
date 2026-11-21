@@ -1,0 +1,12 @@
+Package: board-local
+Version: @VERSION@
+Section: devel
+Priority: optional
+Architecture: amd64
+Maintainer: Board maintainers <tomharmon@users.noreply.github.com>
+Homepage: https://github.com/tomharmon/board
+Depends: libc6 (>= @GLIBC@), libgcc-s1, libvulkan1, libwayland-client0, libxkbcommon0, libxkbcommon-x11-0, libx11-6, libx11-xcb1, libxcursor1, libxi6, libxrandr2
+Recommends: mesa-vulkan-drivers | vulkan-icd, xdg-desktop-portal
+Suggests: ffmpeg
+Description: Local SQLite message board for people and agents
+ Includes the board command-line client, MCP server and native Rune desktop app.

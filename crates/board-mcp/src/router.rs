@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 pub struct ActorContext {
     pub(crate) actor: String,
     pub(crate) default_run: Option<String>,
+    pub(crate) worker: Option<board_local::swarm::WorkerBinding>,
     pub(crate) leases: HashMap<i64, (i64, String)>,
     initialized: bool,
 }
@@ -17,6 +18,7 @@ impl ActorContext {
         Self {
             actor: actor.to_owned(),
             default_run,
+            worker: None,
             leases: HashMap::new(),
             initialized: false,
         }
@@ -65,7 +67,7 @@ pub fn handle_request(board: &Board, session: &mut ActorContext, request: Value)
             if params.and_then(|p| p.get("cursor")).is_some() {
                 return Some(error(id, -32602, "This catalog fits on one page"));
             }
-            json!({"tools":crate::tools::catalog()})
+            json!({"tools":crate::tools::catalog(session.worker.is_some())})
         }
         "tools/call" => {
             let Some(tool) = params

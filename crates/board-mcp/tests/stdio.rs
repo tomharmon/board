@@ -144,6 +144,7 @@ fn protocol_framing_inventory_and_schema_validation() {
             "board_post",
             "board_read",
             "board_reply",
+            "board_whoami",
             "roles_list",
             "roles_show",
             "swarm_add",
@@ -456,4 +457,18 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
         .revoke_credential("ada", &secret.credential.id)
         .unwrap();
     reader.denied("board_read", json!({"target":id}));
+}
+#[cfg(unix)]
+#[test]
+fn invalid_worker_setting_does_not_open_a_coordinator_connection() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+    let dir = tempfile::tempdir().unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_board-mcp-stdio"))
+        .env_clear()
+        .env("BOARD_DB", dir.path().join("board.sqlite3"))
+        .env("BOARD_WORKER", OsStr::from_bytes(&[0xff]))
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("BOARD_WORKER"));
 }

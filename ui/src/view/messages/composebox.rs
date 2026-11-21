@@ -1,7 +1,7 @@
 use super::*;
 
 fn can_send(s: &State) -> bool {
-    !s.body.text.trim().is_empty() || !s.files.is_empty()
+    !s.delivery.review_before_send && (!s.body.text.trim().is_empty() || !s.files.is_empty())
 }
 fn body(s: &State, reply: bool) -> El {
     let placeholder = if reply {
@@ -73,12 +73,7 @@ fn body(s: &State, reply: bool) -> El {
         })
 }
 fn send(s: &State) -> El {
-    submit(
-        "send",
-        if s.delivery.later { "Schedule" } else { "send" },
-        can_send(s),
-    )
-    .on_press_tx(State::send)
+    submit("send", "send", can_send(s)).on_press_tx(State::send)
 }
 fn attach(s: &State) -> El {
     tool("attach-file", "Attach file", &icons::PAPERCLIP)
@@ -197,6 +192,31 @@ pub(super) fn edit(s: &State, reply: bool, inset: f32) -> El {
     if let Some(id) = s.delivery.after {
         area = area.child(delivery::guard(id));
     }
+    if s.delivery.review_before_send {
+        area = area.child(
+            row()
+                .w_full()
+                .px(8.)
+                .pt(6.)
+                .gap(6.)
+                .center_y()
+                .child(
+                    label(
+                        "Originally saved for later. This draft has not been sent.",
+                        12.,
+                        450.,
+                        INK,
+                    )
+                    .grow(1.)
+                    .min_w(0.)
+                    .wrap_anywhere(),
+                )
+                .child(
+                    action("enable-manual-send", "Enable manual send", false)
+                        .on_press(State::enable_manual_send),
+                ),
+        );
+    }
     let mut labels = s
         .delivery
         .labels
@@ -295,18 +315,7 @@ pub(super) fn edit(s: &State, reply: bool, inset: f32) -> El {
                 .on_press(|s: &mut State| s.go(Page::NewTask)),
         );
     }
-    footer = footer
-        .child(
-            tool(
-                "compose-schedule",
-                "Schedule and delivery settings",
-                &icons::CLOCK,
-            )
-            .on_press(State::open_delivery),
-        )
-        .child(mention())
-        .child(el().grow(1.))
-        .child(send(s));
+    footer = footer.child(mention()).child(el().grow(1.)).child(send(s));
     col().w_full().px(inset).pb(inset).child(area.child(footer))
 }
 pub(super) fn composer(s: &State, inset: f32) -> El {
@@ -444,22 +453,10 @@ pub(super) fn activation(s: &State, inset: f32, root: bool) -> El {
                 .on_press(|s: &mut State| s.go(Page::NewTask)),
         );
     }
-    area = area.child(
-        tools
-            .child(
-                tool(
-                    &format!("{prefix}-schedule"),
-                    "Schedule and delivery settings",
-                    &icons::CLOCK,
-                )
-                .on_press_tx(move |s: &mut State, tx| {
-                    if begin(s, tx) {
-                        s.open_delivery();
-                    }
-                }),
-            )
-            .child(el().grow(1.))
-            .child(submit(&format!("{prefix}-send"), "send", false)),
-    );
+    area = area.child(tools.child(el().grow(1.)).child(submit(
+        &format!("{prefix}-send"),
+        "send",
+        false,
+    )));
     col().w_full().px(inset).pb(inset).child(area)
 }

@@ -32,29 +32,15 @@ pub(super) fn models() -> Value {
     ] {
         p.insert(k.into(), v);
     }
-    let mut task = obj(properties.clone(), &[]);
+    let mut task = obj(properties, &[]);
     task["oneOf"] = json!([{"required":["channel"]},{"required":["thread_id"]}]);
-    let mut schedule = post.clone();
-    schedule["properties"]
-        .as_object_mut()
-        .unwrap()
-        .remove("after");
-    schedule["properties"]
-        .as_object_mut()
-        .unwrap()
-        .remove("sync_targets");
-    for k in ["due", "every", "times", "until"] {
-        schedule["properties"][k] = n.clone();
-    }
-    schedule["properties"]["attachment_ids"] = arr(n.clone());
-    schedule["required"] = json!(["due"]);
     json!({
         "Problem":{"type":"object","required":["status","code","detail"],"properties":{"status":n,"code":s,"detail":s}},
         "Message":{"type":"object","required":["id","channel","text","version","revision","deleted"],"properties":{"id":n,"re":{"type":["integer","null"]},"reply_to":{"type":["integer","null"]},"channel":s,"actor":s,"text":s,"revision":n,"version":n,"deleted":b,"no_sync":b,"labels":labels,"links":arr(reference("LinkSnapshot")),"file_notices":arr(reference("FileNotice")),"reactions":{"type":"object","additionalProperties":arr(s.clone())}}},
         "LinkSnapshot":{"type":"object","properties":{"url":s,"message":{"type":["integer","null"]},"text":{"type":["string","null"]},"author":{"type":["string","null"]},"reason":{"type":["string","null"]}}},
         "FileNotice":{"type":"object","properties":{"name":s,"size":{"type":["integer","null"]},"reason":s}},
         "InlineFile":obj(json!({"name":s,"data_base64":{"type":"string","contentEncoding":"base64"}}),&["name","data_base64"]),
-        "NewMessage":post,"NewTask":task,"NewSchedule":schedule,
+        "NewMessage":post,"NewTask":task,
         "Edit":obj(json!({"text":s,"if_revision":n}),&["text"]),
         "LabelPatch":obj(json!({"set":labels,"unset":arr(s.clone()),"conditions":{"type":"object","additionalProperties":{"type":["string","null"]}}}),&[]),
         "Source":obj(json!({"name":s,"channel":s,"provider":{"enum":["github","slack","linear","local"]},"remote":s}),&["name","channel","provider","remote"]),
@@ -80,7 +66,6 @@ pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
                 "kind", "all", "last", "wait_ms",
             ],
             "/links" => &["url"],
-            "/schedules" => &["channel", "by", "re", "all", "after", "limit"],
             _ => &[],
         };
         if !filters.is_empty() {
@@ -105,7 +90,6 @@ pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
         ("/messages/{id}", "patch") => "Edit",
         ("/messages/{id}/labels", "patch") => "LabelPatch",
         ("/tasks", "post") => "NewTask",
-        ("/schedules", "post") => "NewSchedule",
         ("/sources", "post") => "Source",
         ("/sources/{name}", "patch") => "SourcePatch",
         ("/sources/{name}/thread-links", "put") => "JoinThread",

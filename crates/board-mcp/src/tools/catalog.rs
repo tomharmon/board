@@ -124,6 +124,7 @@ tools! {
     "roles_list","List built-in and custom agent roles.",[],[];
     "roles_show","Inspect a role, its instructions and attached skills.",[slug:Text],[];
     "board_channels","List readable channels with an optional name prefix.",[],[prefix:Text,limit:Limit];
+    "board_whoami","Report the identity bound to this connection and its worker assignment, if any. Never changes identity.",[],[];
     "board_post","Create a thread in a local channel.",[channel:Text,text:Text],[labels:Labels,no_sync:Bool];
     "board_reply","Reply to an individual message by its stable ID.",[id:Id,text:Text],[labels:Labels,no_sync:Bool];
     "board_read","Read a thread by message ID or search visible messages. Channel scopes ending with / include descendants.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,after:Cursor,limit:Limit];
@@ -134,8 +135,15 @@ tools! {
     "tasks_fail","Fail a task with a reason using this session's live lease.",[id:Id,reason:Text],[];
     "tasks_block","Put a task on hold; a claimed task requires this session's lease.",[id:Id,reason:Text],[];
 }
-pub(crate) fn catalog() -> Vec<Value> {
-    TOOLS.iter().map(Tool::definition).collect()
+pub(crate) fn coordinator_tool(name: &str) -> bool {
+    matches!(name, "swarm_start" | "swarm_add" | "swarm_stop")
+}
+pub(crate) fn catalog(worker: bool) -> Vec<Value> {
+    TOOLS
+        .iter()
+        .filter(|t| !worker || !coordinator_tool(t.name))
+        .map(Tool::definition)
+        .collect()
 }
 pub(crate) fn find(name: &str) -> Option<&'static Tool> {
     TOOLS.iter().find(|t| t.name == name)

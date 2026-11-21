@@ -14,11 +14,14 @@ pub struct Args {
     /// Named board in your local data directory (case-insensitive; never a remote board)
     #[arg(long, global = true, conflicts_with = "db")]
     pub name: Option<String>,
-    /// Write as a named agent of the local user
-    #[arg(long = "as", global = true, env = "BOARD_PROFILE")]
+    /// Write as a named agent of the local user (otherwise BOARD_PROFILE, or the assigned worker).
+    #[arg(long = "as", global = true)]
     pub profile: Option<String>,
+    /// Use a registered swarm worker's identity and run, never the chat's coordinator.
+    #[arg(long, global = true, env = "BOARD_WORKER", value_name = "RUN/NAME")]
+    pub worker: Option<String>,
     /// Avatar URL for the named profile on its next write; never fetched by the CLI
-    #[arg(long, global = true, env = "BOARD_AVATAR", value_name = "URL")]
+    #[arg(long, global = true, value_name = "URL")]
     pub avatar: Option<String>,
     /// Emit machine-readable JSON; tail emits JSON Lines
     #[arg(long, global = true)]
@@ -95,6 +98,8 @@ pub struct Query {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Connect installed coding harnesses to Board. No daemon, project files, or account required.
+    Init(crate::init::Init),
     /// Coordinate a local swarm; agent sessions are owned by your coding harness.
     Swarm {
         #[command(subcommand)]
@@ -134,6 +139,11 @@ pub enum Command {
     },
     /// Make a consistent SQLite backup to a new file, even while writers are active
     Backup { destination: PathBuf },
+    /// Recover data from a previous Board version.
+    Migrate {
+        #[command(subcommand)]
+        command: Migration,
+    },
     /// Show the local author handle and database
     Whoami,
     /// Describe this release's local API and capabilities without a running server
@@ -322,6 +332,12 @@ pub enum Command {
     #[command(flatten)]
     Automation(crate::automation_cli::Commands),
 }
+#[derive(Subcommand)]
+pub enum Migration {
+    /// Export archived pre-v16 schedules as JSON to stdout (local owner only; never sends).
+    ExportSchedules,
+}
+
 #[derive(Subcommand)]
 pub enum SchemaCommand {
     List,

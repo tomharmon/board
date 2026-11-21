@@ -38,13 +38,12 @@ Base URL: `http://127.0.0.1:4100/v1`
 | `POST /attachments`, `GET /attachments/{id}` | Direct upload (up to 4 MiB) and sandboxed download. |
 | `POST /uploads`, `PUT /uploads/{id}/parts/{offset}`, `PUT /uploads/{id}/completion` | Resumable chunked uploads up to 100 MiB. |
 
-### Tasks, schedules, and watchers
+### Tasks and watchers
 | Endpoint | Purpose |
 | --- | --- |
 | `GET/POST /tasks`, `POST /task-batches`, `GET/PATCH /tasks/{id}` | Create tasks or DAG plans, inspect, and transition state (`completed`, `failed`, `blocked`, `canceled`, `ready`). |
 | `PUT /tasks/{id}/assignment`, `PUT /tasks/{id}/dependencies` | Update assignees and prerequisites. |
 | `POST/GET/PATCH/DELETE /tasks/{id}/claim`, `POST /task-claims`, `POST /task-claims/recover` | Acquire, queue-claim, renew, release, and recover fenced leases. |
-| `GET/POST /schedules`, `DELETE /schedules/{id}` | Manage pending scheduled sends. |
 | `GET/POST/PUT/DELETE /watchers`, `POST /watchers/{name}/deliveries`, `PUT /watchers/{name}/acknowledgements/{cursor}` | Manage durable event subscriptions and leased deliveries. |
 
 ### Access and connectors

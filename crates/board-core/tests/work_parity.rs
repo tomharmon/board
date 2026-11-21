@@ -105,68 +105,11 @@ fn saved_task_submission_fences_private_routing_files_and_double_submits_after_r
     Ok(())
 }
 
-#[test]
-fn scheduled_channel_draft_cannot_be_sent_to_another_destination_or_consume_the_all_channel_slot()
--> Result<()> {
-    use board_local::{ComposerSettings, Draft};
-    let b = Board::memory()?;
-    let t = due();
-    let opts = ComposerSettings {
-        later: true,
-        due: chrono::DateTime::from_timestamp(t.due, 0)
-            .unwrap()
-            .to_rfc3339(),
-        ..Default::default()
-    };
-    let d = Draft {
-        body: "Hold meeting".into(),
-        channel: "studio".into(),
-        reply_to: None,
-    };
-    let global = b
-        .save_composer("ana", "new", None, Some((&d, &opts)), None)?
-        .unwrap();
-    let stamp = b
-        .save_composer("ana", "channel:studio", None, Some((&d, &opts)), None)?
-        .unwrap();
-    let send = |ch, guard| {
-        schedule_draft(
-            &b,
-            "ana",
-            Destination::Channel(ch),
-            &d.body,
-            Timing {
-                due: t.due,
-                every: None,
-                times: None,
-                until: None,
-            },
-            &Default::default(),
-            guard,
-        )
-    };
-    assert!(send("other", ("channel:studio", &stamp)).is_err());
-    assert!(send("studio", ("new", &stamp)).is_err());
-    let s = send("studio", ("channel:studio", &stamp))?;
-    assert_eq!(s.channel, "studio");
-    assert!(b.load_composer("ana", "channel:studio")?.is_none());
-    assert_eq!(b.load_composer("ana", "new")?.unwrap().stamp, global);
-    Ok(())
-}
-
 fn new<'a>(channel: &'a str, text: &'a str, options: &'a PostOptions) -> TaskTarget<'a> {
     TaskTarget::New {
         channel,
         text,
         options,
-    }
-}
-fn due() -> Timing {
-    Timing {
-        due: chrono::Utc::now().timestamp(),
-        every: None,
-        times: None,
-        until: None,
     }
 }
 fn lease(b: &Board, id: i64) -> Result<Task> {
@@ -175,48 +118,6 @@ fn lease(b: &Board, id: i64) -> Result<Task> {
 fn grant(b: &Board, actor: &str, rules: &str) -> Result<String> {
     b.set_grant("root", None, actor, &Rules::parse(rules)?)?;
     Ok(b.issue_credential("root", actor, None, None)?.token)
-}
-
-#[test]
-fn schedule_filters_combine_actor_handles_exact_channels_subtrees_and_history() -> Result<()> {
-    let board = Board::memory()?;
-    board.set_actor_profile("ava", "editor", "Ava")?;
-    let mut ids = Vec::new();
-    for (ch, writer) in [
-        ("work", "ava"),
-        ("work/sub", "ava/agent"),
-        ("work/second", "sam"),
-        ("workbench", "ava"),
-    ] {
-        ids.push(
-            schedule(
-                &board,
-                writer,
-                Destination::Channel(ch),
-                "Later",
-                due(),
-                Default::default(),
-            )?
-            .id,
-        );
-    }
-    let rows = |ch: &str, by: Option<&str>, all| -> Result<Vec<i64>> {
-        Ok(
-            schedule_query_in(&board, all, None, by, Some(ch), 0, 10, true)?
-                .1
-                .into_iter()
-                .map(|s| s.id)
-                .collect(),
-        )
-    };
-    assert_eq!(rows("work/", Some("EDITOR"), false)?, ids[..2]);
-    assert_eq!(rows("work/", Some("@[ava]"), false)?, vec![ids[0]]);
-    assert_eq!(rows("work", None, false)?, vec![ids[0]]);
-    assert!(rows("work//", None, false).is_err());
-    cancel_schedule(&board, ids[0], "ava")?;
-    assert_eq!(rows("work/", Some("editor"), false)?, vec![ids[1]]);
-    assert_eq!(rows("work/", Some("editor"), true)?, ids[..2]);
-    Ok(())
 }
 
 #[test]
@@ -590,35 +491,26 @@ fn watcher_set_replacement_preserves_leases_and_checkpoints_and_temporary_caps_c
 }
 
 #[test]
-fn scheduled_text_and_sync_policy_are_fixed_at_registration() -> Result<()> {
+fn local_only_posts_keep_their_settled_mentions_and_cannot_start_a_mirror() -> Result<()> {
     let b = Board::memory()?;
     b.post("ops", "ada", "here", &Default::default())?;
-    let s = schedule_post(
-        &b,
+    let posted = b.post(
+        "ops",
         "ada",
-        Destination::Channel("ops"),
         "notify @nobody and @ada",
-        due(),
         &PostOptions {
             no_sync: true,
             ..Default::default()
         },
     )?;
     assert!(
-        s.mentions
+        posted
+            .mentions
             .iter()
             .any(|m| m.written == "@nobody" && m.actor.is_none())
     );
-    assert!(s.text.contains("@[ada]"));
     b.post("ops", "nobody", "here later", &Default::default())?;
-    assert_eq!(dispatch_due(&b)?, 1);
-    assert_eq!(dispatch_due(&b)?, 0);
-    let posted = b
-        .events(0, 100)?
-        .into_iter()
-        .filter_map(|e| e.message)
-        .find(|m| m.schedule.as_ref().is_some_and(|s2| s2.id == s.id))
-        .unwrap();
+    let posted = b.get(posted.id)?;
     assert_eq!(posted.text, "notify @nobody and @[ada]");
     assert!(posted.no_sync);
     b.create_source(
@@ -656,8 +548,6 @@ fn scheduled_text_and_sync_policy_are_fixed_at_registration() -> Result<()> {
         .len(),
         1
     );
-    assert_eq!(get_schedule(&b, s.id)?.last, Some(posted.id));
-    assert_eq!(s.first, s.next);
     Ok(())
 }
 
@@ -920,110 +810,5 @@ fn legacy_profile_task_snapshots_retain_the_original_creator_without_new_events(
         (id, "ada", "ada/triage")
     );
     assert_eq!(ev.payload["task"]["by"], "ada/triage");
-    Ok(())
-}
-
-#[test]
-fn scheduling_a_saved_draft_is_atomic_with_retirement_including_failure_and_stale_windows()
--> Result<()> {
-    use board_local::{ComposerSettings, Draft};
-    let d = tempfile::tempdir()?;
-    let path = d.path().join("composer.db");
-    let b = Board::open(&path)?;
-    let draft = Draft {
-        body: "pending reminder".into(),
-        channel: "ops".into(),
-        reply_to: None,
-    };
-    let at = chrono::Utc::now().timestamp() + 600;
-    let options = ComposerSettings {
-        no_sync: true,
-        later: true,
-        labels: "phase=private".into(),
-        due: chrono::DateTime::from_timestamp(at, 0)
-            .unwrap()
-            .to_rfc3339(),
-        ..Default::default()
-    };
-    let send = PostOptions {
-        no_sync: true,
-        labels: [("phase".into(), "private".into())].into(),
-        files: vec![("private.txt".into(), b"original".to_vec())],
-        ..Default::default()
-    };
-    let stamp = b
-        .save_composer(
-            "ada",
-            "new",
-            None,
-            Some((&draft, &options)),
-            Some(&send.files),
-        )?
-        .unwrap();
-    let raw = rusqlite::Connection::open(&path)?;
-    let submit = |stamp: &str, opts: &PostOptions, due: i64| {
-        schedule_draft(
-            &b,
-            "ada",
-            Destination::Channel("ops"),
-            &draft.body,
-            Timing {
-                due,
-                every: None,
-                times: None,
-                until: None,
-            },
-            opts,
-            ("new", stamp),
-        )
-    };
-    let head = b.cursor()?;
-    for changed in [
-        PostOptions {
-            no_sync: false,
-            ..send.clone()
-        },
-        PostOptions {
-            labels: Default::default(),
-            ..send.clone()
-        },
-        PostOptions {
-            files: vec![("private.txt".into(), b"replaced".to_vec())],
-            ..send.clone()
-        },
-    ] {
-        assert_eq!(
-            classify(&submit(&stamp, &changed, at).unwrap_err()).1,
-            "draft_changed"
-        );
-    }
-    assert_eq!(
-        classify(&submit(&stamp, &send, at + 60).unwrap_err()).1,
-        "draft_changed"
-    );
-    raw.execute_batch("CREATE TRIGGER stop_draft_schedule BEFORE INSERT ON schedules BEGIN SELECT RAISE(ABORT,'fixture: schedule storage failed'); END;")?;
-    assert!(
-        format!("{:#}", submit(&stamp, &send, at).unwrap_err())
-            .contains("fixture: schedule storage failed")
-    );
-    assert_eq!(b.cursor()?, head);
-    assert_eq!(b.load_composer("ada", "new")?.unwrap().stamp, stamp);
-    assert!(schedules(&b, true)?.is_empty());
-    raw.execute_batch("DROP TRIGGER stop_draft_schedule")?;
-    assert_eq!(
-        classify(&submit("stale-window", &send, at).unwrap_err()).1,
-        "draft_changed"
-    );
-    let s = submit(&stamp, &send, at)?;
-    assert!(s.no_sync);
-    assert_eq!(s.first, Some(at));
-    assert_eq!(s.attachments[0].name, "private.txt");
-    assert!(b.load_composer("ada", "new")?.is_none());
-    assert!(submit(&stamp, &send, at).is_err());
-    drop(b);
-    let b = Board::open(&path)?;
-    assert!(b.load_composer("ada", "new")?.is_none());
-    assert_eq!(schedules(&b, true)?.len(), 1);
-    assert_eq!(get_schedule(&b, s.id)?.text, "pending reminder");
     Ok(())
 }

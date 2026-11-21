@@ -60,7 +60,8 @@ def exercise(path, bindir):
     cli, ui = bindir / "board", bindir / "board-ui"
     env = {**os.environ, "BOARD_DB": str(path / "board.sqlite3"), "BOARD_USER": "ada",
            "BOARD_API_TOKEN": secrets.token_hex(24), "RUNE_DIRS_ROOT": str(path / "rune")}
-    for key in ("BOARD_PROFILE", "BOARD_TOKEN", "BOARD_CAN", "BOARD_NAME", "BOARD_CLAIMS_DIR"):
+    for key in ("BOARD_PROFILE", "BOARD_TOKEN", "BOARD_CAN", "BOARD_NAME", "BOARD_CLAIMS_DIR",
+                "BOARD_SWARM_RUN", "BOARD_WORKER", "BOARD_AVATAR"):
         env.pop(key, None)
     swift = Path("/usr/lib/chromium/vk_swiftshader_icd.json")
     if not Path("/dev/dri").exists() and swift.is_file() and "VK_ICD_FILENAMES" not in env:

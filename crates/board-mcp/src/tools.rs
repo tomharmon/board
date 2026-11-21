@@ -35,6 +35,9 @@ pub(crate) fn execute(
     p: &Value,
 ) -> Result<Value> {
     tool.validate(p)?;
+    if ctx.worker.is_some() && catalog::coordinator_tool(tool.name) {
+        return Err(board_local::swarm::WorkerBinding::coordinator_only());
+    }
     let actor = ctx.actor.as_str();
     let s = |k: &str| p[k].as_str();
     let required = |k: &str| s(k).with_context(|| format!("missing {k}"));
@@ -43,6 +46,9 @@ pub(crate) fn execute(
     let after = p["after"].as_i64();
     let size = p["limit"].as_u64().unwrap_or(50) as usize;
     let run = || {
+        if let Some(binding) = &ctx.worker {
+            return binding.select_run(reference(&p["run"]).as_deref());
+        }
         reference(&p["run"])
             .or_else(|| ctx.default_run.clone())
             .context("set run or BOARD_SWARM_RUN")
@@ -109,6 +115,9 @@ pub(crate) fn execute(
         "swarm_stop" => value(b.swarm_stop(actor, &run()?)?),
         "roles_list" => value(b.roles_list()?),
         "roles_show" => value(b.role_show(required("slug")?)?),
+        "board_whoami" => Ok(
+            json!({"actor":actor, "worker":ctx.worker, "database":b.database_file(), "default_run":ctx.default_run}),
+        ),
         "board_channels" => {
             let (cursor, channels, next) = b.channels_window("", None, s("prefix"), size)?;
             Ok(json!({"cursor":cursor,"channels":channels,"next":next}))

@@ -68,7 +68,7 @@ pub(super) fn queue_asset(
 }
 
 impl Board {
-    /// A local retry ledger. No provider bytes are fetched by core or the background Board worker.
+    /// A local retry ledger. No provider bytes are fetched by core.
     pub fn pending_media(&self, who: &str, name: &str, failed: bool) -> Result<Vec<MediaRequest>> {
         let tx = self.conn.unchecked_transaction()?;
         self.authorized_source(&tx, name, who)?;

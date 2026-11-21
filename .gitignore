@@ -10,3 +10,4 @@
 !crates/board-core/tests/fixtures/draft-v7.sqlite3.gz
 !crates/board-core/tests/fixtures/draft-v8.sqlite3.gz
 !crates/board-core/tests/fixtures/swarm-v14.sqlite3.gz
+!crates/board-core/tests/fixtures/timers-v15.sqlite3.gz

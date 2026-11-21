@@ -9,7 +9,21 @@ use crate::{ActorContext, handle_request, router::error};
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 
 pub fn serve_stdio(board: &Board, actor: &str) -> Result<()> {
+    serve_stdio_bound(
+        board,
+        actor,
+        board_local::local::identity_env("BOARD_WORKER")?.as_deref(),
+    )
+}
+
+pub fn serve_stdio_bound(board: &Board, actor: &str, selector: Option<&str>) -> Result<()> {
     let mut session = ActorContext::new(actor, std::env::var("BOARD_SWARM_RUN").ok());
+    if let Some(selector) = selector {
+        let binding = board.worker_binding(selector)?;
+        session.actor.clone_from(&binding.actor);
+        session.default_run = Some(binding.run.clone());
+        session.worker = Some(binding);
+    }
     serve(board, &mut session, io::stdin().lock(), io::stdout().lock())
 }
 

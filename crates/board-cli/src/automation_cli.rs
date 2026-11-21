@@ -1,9 +1,8 @@
 mod cache;
 mod runner;
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Context, Result, ensure};
 use board_local::{Board, Filter, PostOptions, automation::*};
 use cache::Cache;
-use chrono::{DateTime, Utc};
 use clap::{Args, Subcommand};
 pub(crate) use runner::RunExit;
 use serde::Serialize;
@@ -17,29 +16,10 @@ use std::{
 pub enum Commands {
     /// Create, route and lease work on threads.
     Tasks(Box<TaskArgs>),
-    /// Send a message or reply later. Use "schedule cancel ID" to stop it.
-    Schedule(ScheduleArgs),
-    /// List pending schedules.
-    Schedules {
-        #[arg(long)]
-        all: bool,
-        /// A message ID lists its thread's timers; s<ID> shows one timer in any state.
-        target: Option<String>,
-        #[arg(long)]
-        by: Option<String>,
-        /// Exact channel, or a subtree ending in /.
-        #[arg(long)]
-        channel: Option<String>,
-    },
     /// Durable named event subscriptions.
     Watchers {
         #[command(subcommand)]
-        action: WatchCmd,
-    },
-    /// Deliver due schedules and expire leases while running.
-    Worker {
-        #[arg(long)]
-        once: bool,
+        action: Box<WatchCmd>,
     },
 }
 
@@ -237,39 +217,6 @@ enum TaskCmd {
     },
 }
 
-#[derive(Debug, Args)]
-pub struct ScheduleArgs {
-    #[arg(long)]
-    no_sync: bool,
-    /// Channel, message ID, or cancel.
-    target: String,
-    #[arg(conflicts_with = "file")]
-    text: Option<String>,
-    #[arg(long)]
-    file: Option<PathBuf>,
-    /// Treat the text or file as JSON for a local name@version schema
-    #[arg(long)]
-    schema: Option<String>,
-    #[arg(long = "attach", value_name = "FILE")]
-    attachments: Vec<PathBuf>,
-    #[arg(long = "attachment-id")]
-    attachment_ids: Vec<String>,
-    #[arg(long = "in", conflicts_with = "at")]
-    delay: Option<String>,
-    #[arg(long)]
-    at: Option<String>,
-    #[arg(long)]
-    every: Option<String>,
-    #[arg(long,requires="every",conflicts_with_all=["until","span"])]
-    times: Option<i64>,
-    #[arg(long, requires = "every", conflicts_with = "span")]
-    until: Option<String>,
-    #[arg(long = "for", requires = "every")]
-    span: Option<String>,
-    #[arg(long = "label")]
-    labels: Vec<String>,
-}
-
 #[derive(Debug, Subcommand)]
 pub enum WatchCmd {
     /// Lease independent thread heads from all registrations visible to this actor.
@@ -357,9 +304,6 @@ fn secs(s: &str) -> Result<i64> {
     let d = humantime::parse_duration(s)?;
     ensure!(d.subsec_nanos() == 0, "duration must be whole seconds");
     Ok(i64::try_from(d.as_secs())?)
-}
-fn date(s: &str) -> Result<i64> {
-    Ok(DateTime::parse_from_rfc3339(s)?.timestamp())
 }
 fn poll_next<T>(wait: Duration, mut pull: impl FnMut() -> Result<Option<T>>) -> Result<Option<T>> {
     let start = Instant::now();
@@ -689,137 +633,12 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
         }
     })
 }
-pub(crate) fn sched_line(s: &Schedule) -> String {
-    format!(
-        "s{}  {:8}  {}  {}  {}",
-        s.id,
-        s.state,
-        s.channel,
-        DateTime::<Utc>::from_timestamp(s.due, 0)
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_default(),
-        s.text
-    )
-}
 
 impl Commands {
     pub fn run(self, board: &mut Board, actor: &str, json: bool, path: &Path) -> Result<()> {
         match self {
             Self::Tasks(cmd) => task_command(*cmd, board, actor, json, path),
-            Self::Schedule(a) => {
-                let s = if a.target == "cancel" {
-                    ensure!(
-                        !a.no_sync
-                            && a.file.is_none()
-                            && a.schema.is_none()
-                            && a.attachments.is_empty()
-                            && a.attachment_ids.is_empty()
-                            && a.delay.is_none()
-                            && a.at.is_none()
-                            && a.every.is_none()
-                            && a.labels.is_empty(),
-                        "schedule cancel takes only a schedule ID"
-                    );
-                    let key = a.text.as_deref().context("cancel requires a schedule ID")?;
-                    cancel_schedule(
-                        board,
-                        crate::parse_id(key.strip_prefix('s').unwrap_or(key))
-                            .map_err(anyhow::Error::msg)?,
-                        actor,
-                    )?
-                } else {
-                    let now = Utc::now().timestamp();
-                    let every = a.every.as_deref().map(secs).transpose()?;
-                    let due = if let Some(at) = a.at {
-                        date(&at)?
-                    } else {
-                        now.checked_add(
-                            a.delay
-                                .as_deref()
-                                .map(secs)
-                                .transpose()?
-                                .or(every)
-                                .ok_or_else(|| anyhow!("provide --in, --at or --every"))?,
-                        )
-                        .ok_or_else(|| anyhow!("time overflow"))?
-                    };
-                    let until = if let Some(span) = a.span {
-                        Some(
-                            due.checked_add(secs(&span)?)
-                                .ok_or_else(|| anyhow!("time overflow"))?,
-                        )
-                    } else {
-                        a.until.as_deref().map(date).transpose()?
-                    };
-                    let dest = crate::message_id(&a.target)
-                        .map_or(Destination::Channel(&a.target), Destination::Reply);
-                    let text = crate::Body {
-                        text: a.text,
-                        file: a.file,
-                        schema: a.schema,
-                    }
-                    .read()?;
-                    schedule_post(
-                        board,
-                        actor,
-                        dest,
-                        &text,
-                        Timing {
-                            due,
-                            every,
-                            times: a.times,
-                            until,
-                        },
-                        &PostOptions {
-                            no_sync: a.no_sync,
-                            labels: crate::pairs(&a.labels, false)?,
-                            ..crate::attachments::placements(
-                                board,
-                                actor,
-                                &a.target,
-                                &a.attachments,
-                                &a.attachment_ids,
-                            )?
-                        },
-                    )?
-                };
-                print(&s, json, || sched_line(&s))
-            }
-            Self::Schedules {
-                all,
-                target,
-                by,
-                channel,
-            } => {
-                if let Some(id) = target.as_deref().and_then(|s| s.strip_prefix('s')) {
-                    ensure!(
-                        !all && by.is_none() && channel.is_none(),
-                        "a single schedule does not take list filters"
-                    );
-                    let s = get_schedule(board, crate::parse_id(id).map_err(anyhow::Error::msg)?)?;
-                    return print(&s, json, || sched_line(&s));
-                }
-                let thread = target
-                    .as_deref()
-                    .map(crate::parse_id)
-                    .transpose()
-                    .map_err(anyhow::Error::msg)?;
-                let s = schedule_query_in(
-                    board,
-                    all,
-                    thread,
-                    by.as_deref(),
-                    channel.as_deref(),
-                    0,
-                    i64::MAX,
-                    true,
-                )?
-                .1;
-                print(&s, json, || {
-                    s.iter().map(sched_line).collect::<Vec<_>>().join("\n")
-                })
-            }
-            Self::Watchers { action } => match action {
+            Self::Watchers { action } => match *action {
                 WatchCmd::Matches { limit, lease } => {
                     let found = lease_matches(board, limit, secs(&lease)?)?;
                     print(&found, json, || {
@@ -977,21 +796,6 @@ impl Commands {
                     remove_watcher_as(board, actor, &name)?;
                     print(&name, json, || format!("removed {name}"))
                 }
-            },
-            Self::Worker { once } => loop {
-                let expired = expire_leases(board)?;
-                let sent = dispatch_due(board)?;
-                if once || expired + sent > 0 {
-                    print(
-                        &serde_json::json!({"sent":sent,"expired":expired}),
-                        json,
-                        || format!("sent {sent}, expired {expired}"),
-                    )?;
-                }
-                if once {
-                    break Ok(());
-                }
-                sleep(Duration::from_secs(1));
             },
         }
     }

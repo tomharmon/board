@@ -52,7 +52,6 @@ fn settings(page: Page) -> bool {
             | Page::Access
             | Page::Roles
             | Page::Schemas
-            | Page::Schedules
             | Page::Watchers
             | Page::Sources
             | Page::Inbox
@@ -74,7 +73,6 @@ fn settings_tabs(s: &State, inset: f32) -> El {
     for (key, title, page) in [
         ("work-access", "access", Page::Access),
         ("work-schemas", "schemas", Page::Schemas),
-        ("work-schedules", "schedules", Page::Schedules),
         ("work-watchers", "watchers", Page::Watchers),
         ("work-sources", "sync", Page::Sources),
         ("work-profiles", "profiles", Page::Profiles),
@@ -447,10 +445,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
         Page::NewTask => tasks::new_task(s),
         _ => admin::view(s),
     };
-    let paged = matches!(
-        s.page,
-        Page::Activity | Page::Schedules | Page::Watchers | Page::Inbox
-    );
+    let paged = matches!(s.page, Page::Activity | Page::Watchers | Page::Inbox);
     let mut panel = col().w_full().grow(1.0).min_h(0.0);
     if settings(s.page) {
         panel = panel.child(settings_tabs(s, inset))

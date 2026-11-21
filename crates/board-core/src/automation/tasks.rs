@@ -437,7 +437,7 @@ fn create_task_inner(
         else {
             return Err(mismatch().into());
         };
-        let saved = board.check_composer_options_on(&tx, actor, "tasks", text, options, None)?;
+        let saved = board.check_composer_options_on(&tx, actor, "tasks", text, options)?;
         let route = board
             .composer_settings_on(&tx, actor, "tasks")?
             .task

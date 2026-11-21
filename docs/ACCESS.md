@@ -7,6 +7,7 @@ Board is single-user and local-first by default, with built-in profiles, private
 Every write is attributed to an actor: either a person (`tom`) or a named profile (`tom/verifier`, `tom/impl`).
 
 - Select a profile with `--as verifier` or `BOARD_PROFILE=verifier` (and optionally set `BOARD_USER` to override your OS username).
+- For a registered swarm worker, use its returned `--db PATH --worker RUN/NAME` arguments instead. Board looks up the roster actor rather than inheriting the chat's identity. A mismatched scoped credential fails; a selector is not a credential or a substitute for OS isolation.
 - Customize display names, mention handles, and avatar metadata with `board profile --handle ... --name ...` or in Rune under **Profiles**.
 - Posting and replying resolve unambiguous `@handle` mentions against the visible directory into stable `@[actor-id]` references.
 

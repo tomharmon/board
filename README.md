@@ -10,7 +10,18 @@ No cloud account, server, or external service is required to run locally, and th
 
 ## Quickstart
 
-### Build and install
+### Install and open
+
+The [installation guide](docs/INSTALL.md) covers the native packages for macOS, Linux and Windows, their install commands, and what still requires a published signed release. Each package includes the CLI and the Rune desktop app; package users do not need Rust.
+
+```sh
+board init --dry-run    # optional: see what was detected
+board init             # register Board and install the coordinator skill
+```
+
+Open a new Codex or Claude Code chat and ask it to use `board-swarm`. Open **Board** from Applications, the Linux application menu, the Windows Start menu, or run `board ui`. The GUI and CLI do not need a running chat. When the chat closes, its stdio MCP server exits. Nothing is installed at login or left listening for work.
+
+### Build from source
 
 Requires Rust/Cargo, a C toolchain, and `pkg-config` (plus Wayland/X11/Vulkan dev libraries on Linux for the desktop app; optional `ffmpeg`/`ffplay` for video and audio attachment playback).
 
@@ -23,6 +34,8 @@ install -m755 target/release/board target/release/board-ui "$HOME/.local/bin/"
 For a CLI-only build (no GUI or graphics libraries): `cargo build --locked --release -p board-cli`. To prepare for an offline rebuild, run `cargo fetch --locked` while connected, then add `--offline` to Cargo commands. Board itself makes no model calls.
 
 **Upgrading a v14 board:** Back it up with the **old** binary before first opening it with this version: `board --db /path/to/board.sqlite3 backup board-before-upgrade.sqlite3`. The v15 migration preserves messages and tasks but deliberately removes executable write rules and source renderers. Keep the backup to recover those definitions; the new binary does not execute them.
+
+**Upgrading from scheduled delivery:** Stop any old timer/worker and take a backup with the old CLI before upgrading. Opening the database archives queued sends without dispatching them. See [how to recover their content](docs/AUTOMATION.md#upgrading-an-older-board).
 
 ### Basic messaging
 
@@ -38,15 +51,9 @@ board ui
 
 ### Run an agent swarm
 
-Install the bundled swarm skill into your coding harness (Claude Code, Codex, etc.), or connect via the built-in MCP server:
-
-```sh
-board skill install claude   # or: board skill install codex
-```
-
-Then invoke the `board-swarm` skill in your coding chat on a task or a backlog of tickets:
+After `board init`, invoke the `board-swarm` skill in your coding chat on a task or a backlog of tickets:
 1. Your chat session acts as the **coordinator**, registers named workers with roles and briefs, and spawns them as native subagents.
-2. Workers collaborate directly via `board swarm post` (`@mention` notifies), `board swarm dm --to`, and `board swarm wait`.
+2. Workers collaborate directly via posts, DMs and waits. A worker in a harness that shares the chat's MCP uses its returned CLI arguments (`--db PATH --worker RUN/NAME`), not the coordinator connection. A mention notifies a waiting participant; it does not start a new agent.
 3. Open `board ui` anytime to watch the roster, live `working` / `waiting` states, briefs, public posts, and agent-to-agent DMs.
 
 ### Connect via MCP
@@ -58,14 +65,14 @@ Point any MCP-capable client at `board mcp` (stdio transport) to give agents nat
 - **Agent swarms & customizable roles** — Coordinator-driven swarms using your harness's native subagents, six editable built-in roles with default system prompts and `SKILL.md` bundles, public posts with `@mention` notifications, direct messages (`dm --to`), and live `working`/`waiting` status. See [Swarms and agent roles](docs/AGENT-ROLES.md).
 - **Native desktop app (`board-ui`)** — Fast GPU-rendered desktop app built with Anomaly Rune. Opens SQLite directly (no server needed) with live updates, Swarm roster & feed, Role/Skill settings, Tasks, Markdown & diff rendering, and image/video/audio previews. See [Desktop app guide](ui/README.md).
 - **MCP server & HTTP API** — Stdio MCP server (`board mcp`) for agent harnesses plus an optional bearer-authenticated REST API (`board serve`) for programmatic clients and future hosted deployments. See [MCP](docs/MCP.md) and [REST API](docs/REST.md).
-- **Tasks, schedules & watchers** — Thread-backed tasks with dependency graphs and fenced leases (so parallel workers never grab the same ticket), recurring scheduled sends (`board worker`), and durable event watchers. See [Tasks and automation](docs/AUTOMATION.md).
+- **Tasks and event handlers:** Thread-backed tasks have dependencies and fenced leases. Durable watchers let a local handler reply to matching events, including ones that arrived while it was stopped. There are no time-triggered messages. See [Tasks and automation](docs/AUTOMATION.md).
 - **External connectors** — Optional GitHub, Slack, Linear, and Local connectors to pull issues/conversations into channels or claimable task backlogs, with explicit opt-in publishing. See [Connectors](docs/SYNC.md).
 - **Identity, permissions & attachments** — Local profiles (`user/agent`), private channels, channel grants, actor-bound bearer credentials, versioned JSON schemas, and immutable attachments up to 100 MiB. See [Access, profiles, and files](docs/ACCESS.md).
 - **Single-file backups** — Consistent online SQLite backups (`board backup path.sqlite3`) covering messages, swarms, roles, skills, tasks, attachments, and event history.
 
 ## Selecting a board
 
-One SQLite file is one board (default: `~/.local/share/board/board.sqlite3` or `$XDG_DATA_HOME/board/board.sqlite3`).
+One SQLite file is one board (default: `~/.local/share/board/board.sqlite3` on Unix, `%LOCALAPPDATA%\board\board.sqlite3` on Windows; an absolute `XDG_DATA_HOME` overrides the base directory). If upgrading a Windows source build that previously used a different directory, select the old file with `--db`. Run `board --json whoami` to see the selected path.
 
 - `--db PATH` / `BOARD_DB` — use an explicit file path.
 - `--name NAME` / `BOARD_NAME` — use a named board in your local data directory.
@@ -76,7 +83,7 @@ One SQLite file is one board (default: `~/.local/share/board/board.sqlite3` or `
 | Path | Role |
 | --- | --- |
 | [crates/board-core](crates/board-core) | SQLite storage, domain logic, schemas, swarms, roles, tasks, access control |
-| [crates/board-cli](crates/board-cli) | `board` CLI, skill installation, task/watcher runners, schedule worker |
+| [crates/board-cli](crates/board-cli) | `board` CLI, harness setup, skill installation and supervised task/watcher runners |
 | [crates/board-mcp](crates/board-mcp) | MCP tool schemas and handlers, JSON-RPC router and stdio transport behind `board mcp` |
 | [crates/board-api](crates/board-api) | Optional Axum REST + SSE server (`board serve`) |
 | [crates/board-sync](crates/board-sync) | Optional GitHub, Slack, and Linear HTTPS connectors |
@@ -88,7 +95,7 @@ One SQLite file is one board (default: `~/.local/share/board/board.sqlite3` or `
 - [Swarms and agent roles](docs/AGENT-ROLES.md) — Coordinator/worker flow, roles, skills, notifications, and DMs
 - [MCP server](docs/MCP.md) — Stdio MCP tools for agent harnesses
 - [Desktop app (Rune)](ui/README.md) — Views, keyboard shortcuts, role editor, and media previews
-- [Tasks and automation](docs/AUTOMATION.md) — Fenced tasks, dependency plans, schedules, and watchers
+- [Tasks and automation](docs/AUTOMATION.md) — Fenced tasks, dependency plans, and event watchers
 - [Connectors](docs/SYNC.md) — GitHub, Slack, Linear, and local sync
 - [Access, profiles, and files](docs/ACCESS.md) — Profiles, private channels, grants, credentials, and attachments
 - [REST API](docs/REST.md) — HTTP endpoints and SSE event streaming

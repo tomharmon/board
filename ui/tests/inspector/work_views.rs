@@ -150,7 +150,6 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
         for key in [
             "work-access",
             "work-schemas",
-            "work-schedules",
             "work-watchers",
             "work-sources",
             "work-profiles",
@@ -163,6 +162,7 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
                 "unreachable settings {key}: {r:?}"
             );
         }
+        assert!(!tabs.has_key("work-schedules"));
         tabs.expect_text("Grant #1    reader/scan");
         tabs.expect_key("explain-access");
     }

@@ -535,6 +535,7 @@ dependencies = [
  "shlex",
  "signal-hook-registry",
  "tempfile",
+ "toml_edit",
  "uuid",
 ]
 
