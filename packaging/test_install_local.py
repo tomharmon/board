@@ -1,17 +1,19 @@
 import configparser
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import install_local as local
 
 
-class LocalInstallTests(unittest.TestCase):
+class InstallFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="board-install-test-")
         self.addCleanup(self.tmp.cleanup)
@@ -25,6 +27,9 @@ class LocalInstallTests(unittest.TestCase):
             path.write_text('#!/bin/sh\nprintf launched > "$BOARD_LAUNCH_MARKER"\n')
             path.chmod(0o755)
 
+
+@unittest.skipUnless(sys.platform == "linux", "Linux local installer")
+class LocalInstallTests(InstallFixture):
     def test_installs_binaries_icon_and_matching_terminal_free_launcher(self):
         desktop = local.install(self.binaries, self.home, self.data)
         entry = configparser.ConfigParser(interpolation=None)
@@ -132,6 +137,131 @@ class LocalInstallTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("Board installation failed", result.stderr)
         self.assertFalse(self.home.exists())
+
+
+class MacLocalInstallTests(InstallFixture):
+    def setUp(self):
+        super().setUp()
+        self.commands = []
+        self.version = mock.patch.object(local, "project_version", return_value="0.1.0")
+        self.version.start()
+        self.addCleanup(self.version.stop)
+        self.run = mock.patch.object(local.subprocess, "run", side_effect=self.fake_run)
+        self.run.start()
+        self.addCleanup(self.run.stop)
+
+    def fake_run(self, command, **options):
+        self.commands.append(command)
+        if command[0] == "iconutil":
+            Path(command[-1]).write_bytes(b"icns-test")
+        return subprocess.CompletedProcess(command, 0)
+
+    def test_installs_native_bundle_icon_signatures_and_cli_links(self):
+        app = local.install_macos(self.binaries, self.home)
+        self.assertEqual(app, self.home / "Applications/Board.app")
+        with (app / "Contents/Info.plist").open("rb") as file:
+            info = plistlib.load(file)
+        self.assertEqual(info["CFBundleIdentifier"], local.APP_ID)
+        self.assertEqual(info["CFBundleExecutable"], "board-ui")
+        self.assertEqual(info["CFBundleIconFile"], "Board.icns")
+        self.assertEqual(info["CFBundleVersion"], "0.1.0")
+        self.assertEqual((app / "Contents/Resources/Board.icns").read_bytes(), b"icns-test")
+        for name in ("board", "board-ui"):
+            binary = app / "Contents/MacOS" / name
+            link = self.home / ".local/bin" / name
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(link.resolve(), binary)
+            self.assertEqual(binary.read_bytes(), (self.binaries / name).read_bytes())
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(sum(cmd[0] == "sips" for cmd in self.commands), 10)
+        signatures = [cmd for cmd in self.commands if cmd[0] == "codesign"]
+        self.assertEqual(len(signatures), 4)
+        self.assertEqual(signatures[-1][1:4], ["--verify", "--deep", "--strict"])
+        self.assertEqual([Path(cmd[-1]).name for cmd in signatures],
+                         ["board", "board-ui", "Board.app", "Board.app"])
+        self.assertFalse(list(app.parent.glob(".board-install-*")))
+
+    def test_upgrade_replaces_bundle_and_preserves_user_data(self):
+        app = local.install_macos(self.binaries, self.home)
+        (app / "obsolete-resource").touch()
+        data = self.home / ".local/share/board/board.sqlite3"
+        data.parent.mkdir(parents=True)
+        data.write_bytes(b"user database")
+        (self.binaries / "board-ui").write_text("#!/bin/sh\nexit 0\n")
+        local.install_macos(self.binaries, self.home)
+        self.assertFalse((app / "obsolete-resource").exists())
+        self.assertEqual((app / "Contents/MacOS/board-ui").read_text(), "#!/bin/sh\nexit 0\n")
+        self.assertEqual(data.read_bytes(), b"user database")
+
+    def test_signing_failure_leaves_existing_app_and_links_intact(self):
+        app = local.install_macos(self.binaries, self.home)
+        old = (app / "Contents/MacOS/board-ui").read_bytes()
+        (self.binaries / "board-ui").write_text("#!/bin/sh\nexit 0\n")
+
+        def fail_signing(command, **options):
+            if command[0] == "codesign":
+                raise subprocess.CalledProcessError(1, command)
+            return self.fake_run(command, **options)
+
+        with mock.patch.object(local.subprocess, "run", side_effect=fail_signing):
+            with self.assertRaises(subprocess.CalledProcessError):
+                local.install_macos(self.binaries, self.home)
+        self.assertEqual((app / "Contents/MacOS/board-ui").read_bytes(), old)
+        self.assertEqual((self.home / ".local/bin/board-ui").read_bytes(), old)
+        self.assertFalse(list(app.parent.glob(".board-install-*")))
+
+    def test_failed_bundle_replacement_restores_previous_app(self):
+        app = local.install_macos(self.binaries, self.home)
+        old = (app / "Contents/MacOS/board-ui").read_bytes()
+        (self.binaries / "board-ui").write_text("#!/bin/sh\nexit 0\n")
+        rename = Path.rename
+
+        def fail_replacement(source, destination):
+            if source.name == "Board.app" and source.parent.name.startswith(".board-install-"):
+                raise OSError("simulated replacement failure")
+            return rename(source, destination)
+
+        with mock.patch.object(Path, "rename", new=fail_replacement):
+            with self.assertRaisesRegex(OSError, "replacement failure"):
+                local.install_macos(self.binaries, self.home)
+        self.assertEqual((app / "Contents/MacOS/board-ui").read_bytes(), old)
+        self.assertEqual((self.home / ".local/bin/board-ui").read_bytes(), old)
+        self.assertFalse(list(app.parent.glob(".board-install-*")))
+
+    def test_rejects_unrelated_app_and_app_symlinks(self):
+        app = self.home / "Applications/Board.app"
+        (app / "Contents").mkdir(parents=True)
+        with (app / "Contents/Info.plist").open("wb") as file:
+            plistlib.dump({"CFBundleIdentifier": "unrelated.app"}, file)
+        with self.assertRaisesRegex(ValueError, "unrelated app"):
+            local.install_macos(self.binaries, self.home)
+        other = app.with_name("Other.app")
+        app.rename(other)
+        app.symlink_to(other, target_is_directory=True)
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            local.install_macos(self.binaries, self.home)
+        self.assertTrue((other / "Contents/Info.plist").exists())
+
+    def test_missing_binary_does_not_create_app(self):
+        (self.binaries / "board-ui").unlink()
+        with self.assertRaisesRegex(ValueError, "missing executable"):
+            local.install_macos(self.binaries, self.home)
+        self.assertFalse(self.home.exists())
+
+    def test_main_selects_mac_install_and_sets_deployment_target(self):
+        with mock.patch.object(local.sys, "platform", "darwin"), \
+             mock.patch.object(local.sys, "argv", ["install_local.py", "--target-dir", str(self.binaries.parent)]), \
+             mock.patch.object(local.Path, "home", return_value=self.home), \
+             mock.patch.object(local.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch("builtins.print") as output:
+            local.main()
+        build = next(cmd for cmd in self.commands if cmd[0] == "cargo")
+        self.assertIn("board-ui", build)
+        call = next(call for call in local.subprocess.run.call_args_list if call.args[0][0] == "cargo")
+        self.assertEqual(call.kwargs["env"]["MACOSX_DEPLOYMENT_TARGET"], "14.0")
+        self.assertTrue((self.home / "Applications/Board.app/Contents/Info.plist").is_file())
+        self.assertFalse(any(cmd[0] == "update-desktop-database" for cmd in self.commands))
+        self.assertTrue(any("Keep in Dock" in str(call) for call in output.call_args_list))
 
 
 if __name__ == "__main__":

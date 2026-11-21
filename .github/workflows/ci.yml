@@ -48,3 +48,30 @@ jobs:
 
       - name: Test
         run: cargo test --locked --workspace
+
+  mac-local-install:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Test installer logic
+        run: python3 -m unittest discover -s packaging -p 'test_*.py'
+
+      - name: Build and install local app
+        run: python3 packaging/install_local.py
+
+      - name: Verify installed app and upgrade
+        run: |
+          python3 packaging/install_local.py --no-build
+          plutil -lint "$HOME/Applications/Board.app/Contents/Info.plist"
+          codesign --verify --deep --strict "$HOME/Applications/Board.app"
+          test -L "$HOME/.local/bin/board"
+          test -L "$HOME/.local/bin/board-ui"
+          "$HOME/.local/bin/board" --version
+          "$HOME/.local/bin/board-ui" --ui-notices
+          iconutil -c iconset "$HOME/Applications/Board.app/Contents/Resources/Board.icns" -o target/installed-Board.iconset

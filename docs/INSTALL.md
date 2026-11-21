@@ -16,6 +16,23 @@ The release helper downloads and hashes the release's exact `board.rb`, puts it 
 
 You can inspect the helper and `board.rb` on the release page before running either. To use a tap you already maintain, put the downloaded `board.rb` in its `Casks/` directory and install by its fully qualified name. The release job does not push to any tap. Modern Homebrew [installs casks by name, not from a loose Ruby path](https://docs.brew.sh/Homebrew-Package-Policies); see also its [tap guide](https://docs.brew.sh/How-to-Create-and-Maintain-a-Tap). Do not disable Gatekeeper or remove quarantine. Uninstall with `brew uninstall --cask tomharmon/board-release-local/board` and optionally `brew untap tomharmon/board-release-local`.
 
+## macOS source install
+
+For a local-only install on macOS 14+, use a source checkout with Rust/Cargo, Python 3, and Xcode Command Line Tools installed. Run `xcode-select --install` first if the Command Line Tools are missing. From the checkout:
+
+```sh
+python3 packaging/install_local.py
+open "$HOME/Applications/Board.app"
+```
+
+Choose **Options > Keep in Dock** on Board's Dock icon. This builds only for your Mac's native architecture, installs `~/Applications/Board.app` with its icon, and links `board` and `board-ui` into `~/.local/bin`. No Homebrew, universal build, published release, Apple Developer account or background service is needed. The first Cargo build may download source dependencies; this does not download a prebuilt release. Add `~/.local/bin` to your shell's PATH for CLI commands.
+
+The installer applies and verifies an [ad hoc signature for local use](https://developer.apple.com/documentation/xcode/embedding-a-helper-tool-in-a-sandboxed-app). This is not a notarized distribution build and does not change Gatekeeper settings or remove quarantine attributes. Keep using signed release packages when sharing Board with other people.
+
+Rerun the install command to upgrade, then reopen Board. Use `--no-build` to install existing release binaries, or `--target-dir /path/to/target` to select another Cargo target directory (`CARGO_TARGET_DIR` is also honored). The app is staged and signed before replacing an existing Board bundle; a build or signing failure leaves the installed app unchanged. Agent settings, databases and login items are not modified.
+
+To uninstall this source build, remove `~/Applications/Board.app` in Finder and delete the two CLI symlinks at `~/.local/bin/board` and `~/.local/bin/board-ui`. Leave your board database directories in place to keep your data.
+
 ## Linux: apt or pacman
 
 Supported release targets: **x86-64 Ubuntu 24.04+** (also compatible Debian-family systems meeting the package's declared glibc/library dependencies) and **x86-64 Arch Linux**. The GUI needs a working Wayland or X11 session and a Vulkan driver; `ffmpeg` is optional. There is no claim of an ARM, RPM or musl build. In a terminal, as a normal user with `sudo`:
