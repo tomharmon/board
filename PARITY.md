@@ -63,12 +63,15 @@ every workspace member and the real-clock lease test, not only the default
 CLI build. `board conformance` is a separate seven-invariant smoke check on
 a fresh temporary board. It is not a replacement for the full tests.
 
-The locked workspace run on **2026-11-21 passed 190 tests**, with none
-ignored: 100 core/storage, 18 CLI/process, 17 REST, 23 provider protocol,
-and 32 native UI (31 scripted inspector cases and one Rune clipboard test).
+The locked release-profile workspace run on **2026-11-21 passed 207 tests**, with none
+ignored: 102 core/storage, 18 CLI/process, 17 REST, 23 provider protocol,
+and 47 native UI (46 scripted inspector cases and one Rune clipboard test).
+The [visual audit](docs/INSPECTOR-VISUALS.md) compares actual browser and native
+renders. The work includes additive migration of previous Rust boards to schema
+11 for per-channel, per-identity read marks; upgrading does not advance board events.
 Both debug and release binaries built offline. Workspace formatting and
-all-target Clippy with warnings denied passed. A clean export of just the
-staged source also built both binaries offline in a separate target directory;
+all-target Clippy with warnings denied passed. In the earlier workflow audit
+(`7b6951c`), a clean export also built both binaries offline in a separate target directory;
 its CLI passed the seven-invariant smoke check. An anonymous live pull of
 [public GitHub issue #1](https://github.com/BurntSushi/ripgrep/issues/1)
 applied 31 records, zero on replay, and left the outbox empty.

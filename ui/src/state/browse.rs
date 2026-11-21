@@ -13,6 +13,9 @@ pub enum Position {
 }
 
 pub struct Browse {
+    pub search_open: bool,
+    pub adding_channel: bool,
+    pub channel_name: TextEdit,
     pub filter: Filter,
     pub filter_open: bool,
     pub author: TextEdit,
@@ -33,6 +36,9 @@ pub struct Browse {
 impl Default for Browse {
     fn default() -> Self {
         Self {
+            search_open: false,
+            adding_channel: false,
+            channel_name: TextEdit::new(""),
             filter: Filter::default(),
             filter_open: false,
             author: TextEdit::new(""),
@@ -117,6 +123,25 @@ impl Browse {
     }
 }
 impl State {
+    pub fn add_channel(&mut self) {
+        let name = self
+            .browse
+            .channel_name
+            .text
+            .trim()
+            .trim_start_matches('#')
+            .to_owned();
+        match self
+            .db()
+            .and_then(|db| db.create_channel_as(&name, &self.actor))
+        {
+            Ok(_) => {
+                self.browse.adding_channel = false;
+                self.select(Some(name));
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+    }
     pub fn cancel_pending(&mut self, id: i64) {
         if self.browse.cancel != Some(id) || !self.browse.schedules.iter().any(|s| s.id == id) {
             return;

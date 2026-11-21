@@ -14,16 +14,16 @@ fn field(
         .gap(5.0)
         .child(label(name, 13.0, 600.0, INK))
         .child(
-            text_input(input, TextStyle::new(14.0, 450.0))
+            text_input(input, font(14.0, 450.0))
                 .single_line()
                 .key(id)
                 .label(name)
                 .w_full()
                 .h(35.0)
                 .px(9.0)
-                .radius(5.0)
+                .radius(2.0)
                 .border(1.0, c(EDGE))
-                .fill(c("#fafbf9"))
+                .fill(c(TINT))
                 .on_edit(move |s: &mut State| bind(s.properties.as_mut().expect("active editor"))),
         )
 }
@@ -46,7 +46,7 @@ fn labels(p: &Properties, m: &Message) -> El {
                     .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE)),
                 &format!("Edit label {key}"),
             )
-            .child(mono(key, "#376345").w(100.0).wrap_anywhere())
+            .child(mono(key, DIM).w(100.0).wrap_anywhere())
             .child(
                 label(value, 14.0, 500.0, INK)
                     .grow(1.0)
@@ -193,14 +193,14 @@ fn editor(p: &Properties) -> El {
         .w_full()
         .gap(13.0)
         .child(
-            text_input(&p.edit, TextStyle::new(15.0, 450.0).lh(21.0))
+            text_input(&p.edit, font(15.0, 450.0).lh(21.0))
                 .key("edit-body")
                 .w_full()
                 .h(160.0)
                 .padding(10.0)
-                .radius(5.0)
+                .radius(2.0)
                 .border(1.0, c(EDGE))
-                .fill(c("#fafbf9"))
+                .fill(c(TINT))
                 .label("Message source")
                 .on_edit(|s: &mut State| &mut s.properties.as_mut().expect("active editor").edit)
                 .on_input_key(|s: &mut State, k, tx| {
@@ -244,7 +244,7 @@ pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
                 .center_y()
                 .gap(8.0)
                 .child(
-                    label(format!("Message #{}", m.id), 22.0, 630.0, INK)
+                    label(format!("Message #{}", m.id), 15.0, 600.0, INK)
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate(),
@@ -332,7 +332,7 @@ pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
                         tx.focus_when_shown(key, true);
                     }
                 })
-                .build(&Kit::neutral(false)),
+                .build(&Kit::neutral(dark())),
         )
         .child(rule());
     if s.error.is_some() || p.revision != m.revision {

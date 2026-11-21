@@ -2,6 +2,9 @@ use super::*;
 use crate::state::SchemaPart;
 
 fn open_form(s: &mut State) {
+    if s.page == Page::Workspace && s.desk.access.registry() {
+        s.go(Page::Access);
+    }
     s.desk.enter(s.page);
     s.desk.editing = true;
     match s.page {
@@ -21,6 +24,33 @@ fn open_form(s: &mut State) {
         _ => (),
     }
     s.refresh();
+}
+pub(super) fn add_resource(s: &State) -> Option<El> {
+    if s.desk.editing {
+        return None;
+    }
+    let kind = match s.page {
+        Page::Workspace | Page::Access if s.desk.access.registry() => "grant",
+        Page::Schemas => "schema",
+        Page::Schedules => "schedule",
+        Page::Watchers => "watcher",
+        _ => return None,
+    };
+    Some(
+        click(
+            row()
+                .key("add-resource")
+                .h(25.0)
+                .center_y()
+                .px(8.0)
+                .gap(5.0)
+                .fill(c(TINT)),
+            &format!("Add {kind}"),
+        )
+        .child(icon(&icons::PLUS, 12.0).color(c(DIM)))
+        .child(label(kind, 12.0, 400.0, DIM))
+        .on_press(open_form),
+    )
 }
 fn form(s: &State) -> El {
     let d = &s.desk;
@@ -172,26 +202,169 @@ fn remove(s: &State, key: String, verb: &str) -> El {
     }
 }
 fn section(name: &str, detail: &str) -> El {
-    col().w_full().gap(5.0).child(mono(name, MUTED)).child(
-        label(detail, 14.0, 510.0, INK)
-            .w_full()
-            .wrap_anywhere()
-            .selectable(true),
-    )
+    row()
+        .w_full()
+        .center_y()
+        .gap(12.0)
+        .py(3.0)
+        .child(
+            label(name, 12.0, 400.0, DIM)
+                .grow(1.0)
+                .min_w(0.0)
+                .wrap_anywhere(),
+        )
+        .child(
+            label(detail, 12.0, 400.0, MUTED)
+                .grow(1.5)
+                .min_w(0.0)
+                .wrap_anywhere()
+                .selectable(true),
+        )
+}
+
+fn actions<'a>(values: impl IntoIterator<Item = &'a board_local::access::Action>) -> String {
+    use board_local::access::Action::*;
+    let values = values
+        .into_iter()
+        .map(|v| match v {
+            Read => "read",
+            Post => "post",
+            React => "react",
+            Label => "label",
+            Sync => "sync",
+            Manage => "manage",
+        })
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        "none".to_owned()
+    } else {
+        values.join(" ")
+    }
+}
+fn scope(rules: &board_local::access::Rules) -> String {
+    rules
+        .0
+        .iter()
+        .map(|(channel, rights)| format!("{channel}  {}", actions(rights)))
+        .collect::<Vec<_>>()
+        .join("    ")
+}
+fn explainer(s: &State) -> El {
+    let a = &s.desk.access;
+    let check = action("explain-access", "explain", true)
+        .disabled(
+            a.fields.channel.text.trim().is_empty()
+                || (a.other && a.fields.name.text.trim().is_empty()),
+        )
+        .on_press(State::explain_access);
+    let input = |edit: &TextEdit,
+                 key: &str,
+                 title: &str,
+                 prompt: &str,
+                 write: fn(&mut State) -> &mut TextEdit| {
+        text_input(edit, font(12.0, 400.0))
+            .key(key)
+            .label(title)
+            .single_line()
+            .w(158.0)
+            .max_w(200.0)
+            .h(28.0)
+            .placeholder(prompt, c(FAINT))
+            .color(c(INK))
+            .fill(c(TINT))
+            .px(7.0)
+            .on_edit(write)
+            .on_input_key(|s: &mut State, k, _| {
+                if k.key == Key::Enter {
+                    s.explain_access();
+                    true
+                } else {
+                    false
+                }
+            })
+    };
+    let mut out = col()
+        .w_full()
+        .gap(5.0)
+        .pt(6.0)
+        .child(mono("explain", FAINT));
+    let mut controls = row()
+        .w_full()
+        .gap(4.0)
+        .flex_wrap()
+        .center_y()
+        .child(input(
+            &a.fields.channel,
+            "explain-channel",
+            "Channel to explain",
+            "#channel",
+            |s| &mut s.desk.access.fields.channel,
+        ))
+        .child(mono("for", MUTED))
+        .child(
+            action("explain-self", "you", !a.other).on_press(|s: &mut State| {
+                s.desk.access.other = false;
+                s.desk.access.query = None;
+                s.desk.access.decision = None;
+            }),
+        );
+    if a.registry() {
+        controls = controls.child(action("explain-subject", "actor", a.other).on_press_tx(
+            |s: &mut State, tx| {
+                s.desk.access.other = true;
+                s.desk.access.query = None;
+                s.desk.access.decision = None;
+                tx.focus_when_shown("explain-actor", true);
+            },
+        ));
+    }
+    if a.other && a.registry() {
+        controls = controls.child(input(
+            &a.fields.name,
+            "explain-actor",
+            "Person or profile to explain",
+            "name or profile",
+            |s| &mut s.desk.access.fields.name,
+        ));
+    }
+    out = out.child(controls.child(check));
+    if let (Some((who, ch, _)), Some(d)) = (&a.query, &a.decision) {
+        let mut result = format!("@{who}  #{ch}  {}", actions(&d.actions));
+        if let Some(level) = &d.level {
+            result.push_str(&format!("  ·  {level}"));
+        }
+        if let Some(pattern) = &d.pattern {
+            result.push_str(&format!("  {pattern}"));
+        }
+        if !d.grants.is_empty() {
+            result.push_str(&format!(
+                "  grants {}",
+                d.grants
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        out = out.child(
+            mono(result, DIM)
+                .key("access-explanation")
+                .w_full()
+                .wrap_anywhere()
+                .selectable(true),
+        );
+    }
+    out
 }
 fn overview(s: &State) -> El {
     let d = &s.desk;
     let mut list = col()
-        .key("work-sections")
+        .key("local-board")
         .w_full()
-        .gap(10.0)
-        .child(heading("Workspace", None))
+        .gap(3.0)
+        .child(mono("local board", FAINT))
         .child(section(
-            "DATABASE",
-            &local::database_path().display().to_string(),
-        ))
-        .child(section(
-            "CONNECTION",
+            "connection",
             if s.connected() {
                 "Local SQLite"
             } else {
@@ -199,50 +372,13 @@ fn overview(s: &State) -> El {
             },
         ))
         .child(section(
-            "SNAPSHOT",
+            "snapshot",
             &format!("Event {}   /   {} channels", d.head, s.channels.len()),
-        ))
-        .child(rule());
-    for (name, meta, key, page) in [
-        (
-            "Schedules",
-            "Pending and previous sends",
-            "work-schedules",
-            Page::Schedules,
-        ),
-        (
-            "Watchers",
-            "Subscriptions and acknowledgement cursors",
-            "work-watchers",
-            Page::Watchers,
-        ),
-        (
-            "Schemas",
-            "Versioned local definitions",
-            "work-schemas",
-            Page::Schemas,
-        ),
-        (
-            "Profiles",
-            "Local person and agent identities",
-            "work-profiles",
-            Page::Profiles,
-        ),
-    ] {
-        list = list.child(listrow(key, name, meta, move |s| s.go(page)));
-    }
-    list = list.child(listrow(
-        "work-sources",
-        "Sources",
-        "Local mappings and delivery queues",
-        |s| s.go(Page::Sources),
-    ));
+        ));
     if !s.delegated {
-        list = list.child(listrow(
-            "work-access",
-            "Access",
-            "Grants and local credentials",
-            |s| s.go(Page::Access),
+        list = list.child(section(
+            "database",
+            &local::database_path().display().to_string(),
         ));
     }
     list
@@ -258,7 +394,7 @@ fn profiles(s: &State) -> El {
                     .on_press(|s: &mut State| s.go(Page::People)),
             ),
         ))
-        .child(section("CURRENT", &s.actor));
+        .child(section("current", &s.actor));
     for (i, who) in s.desk.profiles.iter().enumerate() {
         let actor = who.clone();
         panel = panel.child(
@@ -300,28 +436,11 @@ fn profiles(s: &State) -> El {
 }
 
 pub(super) fn view(s: &State) -> El {
-    if s.page == Page::Workspace {
-        return overview(s);
-    }
     if s.page == Page::Profiles {
         return profiles(s);
     }
     let d = &s.desk;
-    let title = name(s.page, s);
-    let button = (!d.editing).then(|| {
-        action(
-            "add-resource",
-            match s.page {
-                Page::Schedules => "Schedule",
-                Page::Watchers => "Add watcher",
-                Page::Access => "Add grant",
-                _ => "Register",
-            },
-            true,
-        )
-        .on_press(open_form)
-    });
-    let mut out = col().w_full().gap(13.0).child(heading(&title, button));
+    let mut out = col().w_full().gap(8.0);
     if d.editing {
         return out.child(form(s));
     }
@@ -334,27 +453,38 @@ pub(super) fn view(s: &State) -> El {
                 let mut item = col()
                     .key(format!("schedule-{}", sched.id))
                     .w_full()
-                    .gap(6.0)
+                    .gap(3.0)
                     .child(
-                        mono(
-                            format!("#{}    {}    #{}", sched.id, sched.state, sched.channel),
-                            ACCENT,
-                        )
-                        .w_full()
-                        .wrap_anywhere(),
-                    )
-                    .child(
-                        label(&sched.text, 15.0, 550.0, INK)
+                        row()
                             .w_full()
-                            .wrap_anywhere(),
+                            .gap(8.0)
+                            .center_y()
+                            .child(
+                                mono(
+                                    format!(
+                                        "#{}    {}    #{}",
+                                        sched.id, sched.state, sched.channel
+                                    ),
+                                    MUTED,
+                                )
+                                .max_w(190.0)
+                                .wrap_anywhere(),
+                            )
+                            .child(
+                                label(&sched.text, 12.5, 450.0, INK)
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .wrap_anywhere(),
+                            ),
                     )
                     .child(
                         mono(
                             format!(
-                                "{}    {}    Sent {}",
+                                "{}    {}    sent {}{}",
                                 sched.actor,
                                 utc(sched.due),
-                                sched.sent
+                                sched.sent,
+                                if sched.no_sync { "    board only" } else { "" }
                             ),
                             MUTED,
                         )
@@ -368,6 +498,13 @@ pub(super) fn view(s: &State) -> El {
                         .or_else(|| sched.until.map(|n| format!("until {}", utc(n))))
                         .unwrap_or_else(|| "until canceled".into());
                     item = item.child(mono(format!("Every {n}s, {stop}"), MUTED));
+                }
+                if let Some(end) = &sched.canceled {
+                    item = item.child(
+                        mono(format!("{}: {}", end.by, end.reason), MUTED)
+                            .w_full()
+                            .wrap_anywhere(),
+                    );
                 }
                 if let Some(reply) = sched.re {
                     item = item.child(
@@ -393,48 +530,62 @@ pub(super) fn view(s: &State) -> El {
                 out = out.child(empty("No watchers"));
             }
             for w in &d.watchers {
+                let mut criteria =
+                    serde_json::to_value(&w.filter).expect("serializable stored filter");
+                if let Some(obj) = criteria.as_object_mut() {
+                    obj.retain(|_, v| {
+                        !v.is_null()
+                            && !v.as_object().is_some_and(|o| o.is_empty())
+                            && !v.as_array().is_some_and(|a| a.is_empty())
+                    });
+                }
                 out = out
                     .child(
                         col()
                             .key(format!("watcher-{}", w.name))
                             .w_full()
-                            .gap(6.0)
-                            .child(label(&w.name, 16.0, 600.0, INK))
+                            .gap(3.0)
                             .child(
-                                mono(
-                                    format!(
-                                        "Cursor {}    {}",
-                                        w.cursor,
-                                        w.run_as.as_deref().unwrap_or("Local")
-                                    ),
-                                    MUTED,
-                                )
-                                .w_full()
-                                .wrap_anywhere(),
+                                row()
+                                    .w_full()
+                                    .gap(8.0)
+                                    .center_y()
+                                    .child(
+                                        label(&w.name, 13.0, 500.0, INK)
+                                            .grow(1.0)
+                                            .min_w(0.0)
+                                            .wrap_anywhere(),
+                                    )
+                                    .child(
+                                        mono(
+                                            format!(
+                                                "Cursor {}    {}",
+                                                w.cursor,
+                                                w.run_as.as_deref().unwrap_or("Local")
+                                            ),
+                                            MUTED,
+                                        )
+                                        .wrap_anywhere(),
+                                    )
+                                    .child(remove(s, w.name.clone(), "Remove")),
                             )
                             .child(
                                 mono(
                                     format!(
                                         "{}    {}",
                                         w.kind.as_deref().unwrap_or("All event types"),
-                                        w.filter.channel.as_deref().unwrap_or("All channels")
+                                        if criteria.as_object().is_some_and(|o| o.is_empty()) {
+                                            "All channels".into()
+                                        } else {
+                                            criteria.to_string()
+                                        }
                                     ),
-                                    MUTED,
-                                )
-                                .w_full()
-                                .wrap_anywhere(),
-                            )
-                            .child(
-                                mono(
-                                    serde_json::to_string(&w.filter)
-                                        .expect("serializable stored filter"),
                                     MUTED,
                                 )
                                 .w_full()
                                 .wrap_anywhere()
                                 .selectable(true),
-                            )
-                            .child(remove(s, w.name.clone(), "Remove")),
+                            ),
                     )
                     .child(rule());
             }
@@ -529,21 +680,40 @@ pub(super) fn view(s: &State) -> El {
                 out = out.child(empty("No schemas"));
             }
         }
-        Page::Access => {
-            out = out.child(mono("GRANTS", MUTED));
+        Page::Access | Page::Workspace => {
+            out = out.child(mono("you", FAINT));
+            if let Some(v) = &d.access.viewer {
+                out = out.child(section(&v.actor, &scope(&v.can)));
+            }
+            out = out.child(explainer(s));
+            if !d.access.registry() {
+                return out.child(overview(s).pt(12.0));
+            }
+            out = out.child(mono("grants", FAINT).pt(8.0));
             if d.grants.is_empty() {
                 out = out.child(empty("No grants"));
             }
             for g in &d.grants {
-                out = out
-                    .child(section(
-                        &format!("Grant #{}    {}", g.id, g.subject),
-                        &serde_json::to_string(&g.can).expect("valid policy"),
-                    ))
-                    .child(remove(s, format!("grant-{}", g.id), "Revoke"))
-                    .child(rule());
+                out = out.child(
+                    row()
+                        .w_full()
+                        .center_y()
+                        .gap(6.0)
+                        .child(
+                            section(
+                                &format!("Grant #{}    {}", g.id, g.subjects.join(", ")),
+                                &scope(&g.can),
+                            )
+                            .min_w(0.0)
+                            .grow(1.0),
+                        )
+                        .child(remove(s, format!("grant-{}", g.id), "Revoke")),
+                );
             }
-            out = out.child(mono("CREDENTIALS", MUTED));
+            if s.delegated {
+                return out.child(overview(s).pt(12.0));
+            }
+            out = out.child(mono("credentials", FAINT).pt(8.0));
             if d.credentials.is_empty() {
                 out = out.child(empty("No credentials"));
             }
@@ -561,11 +731,7 @@ pub(super) fn view(s: &State) -> El {
                 };
                 out = out.child(section(&format!("{state}    {}", c.actor), &c.id));
                 if let Some(rules) = &c.scope {
-                    out = out.child(
-                        mono(serde_json::to_string(rules).expect("valid scope"), MUTED)
-                            .w_full()
-                            .wrap_anywhere(),
-                    );
+                    out = out.child(mono(scope(rules), MUTED).w_full().wrap_anywhere());
                 }
                 if let Some(expires) = c.expires {
                     out = out.child(mono(format!("Expires {}", utc(expires)), MUTED));
@@ -574,6 +740,9 @@ pub(super) fn view(s: &State) -> El {
                     out = out.child(remove(s, format!("credential-{}", c.id), "Revoke"));
                 }
                 out = out.child(rule());
+            }
+            if s.page == Page::Workspace {
+                out = out.child(overview(s).pt(12.0));
             }
         }
         _ => (),

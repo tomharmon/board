@@ -590,6 +590,7 @@ dependencies = [
  "pulldown-cmark",
  "rune",
  "rune-kit",
+ "serde",
  "serde_json",
  "tempfile",
 ]

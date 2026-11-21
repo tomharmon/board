@@ -26,7 +26,9 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
        CREATE TABLE IF NOT EXISTS access_credentials(
        id TEXT PRIMARY KEY,digest BLOB UNIQUE NOT NULL,actor TEXT NOT NULL,scope TEXT,expires INTEGER,revoked INTEGER NOT NULL DEFAULT 0);
        CREATE TABLE IF NOT EXISTS blind_posts(id INTEGER PRIMARY KEY REFERENCES messages(id));
-       CREATE TABLE IF NOT EXISTS activity_seen(actor TEXT PRIMARY KEY,cursor INTEGER NOT NULL);")?;
+       CREATE TABLE IF NOT EXISTS activity_seen(actor TEXT PRIMARY KEY,cursor INTEGER NOT NULL);
+       CREATE TABLE IF NOT EXISTS channel_seen(actor TEXT NOT NULL,channel TEXT NOT NULL REFERENCES channels(name),
+           message INTEGER NOT NULL,PRIMARY KEY(actor,channel));")?;
     Ok(())
 }
 

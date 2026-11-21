@@ -31,8 +31,7 @@ fn key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
         }
         s.show_filters(tx);
     } else if k.is_command('f') {
-        s.go(Page::Feed);
-        tx.focus_when_shown("search", true);
+        s.open_search(tx);
     } else if k.key == Key::Escape && s.browse.jump_open {
         s.browse.jump_open = false;
         tx.focus_when_shown("jump-message", true);
@@ -52,9 +51,20 @@ fn key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
         s.close_properties(tx);
     } else if k.key == Key::Escape && s.preview.is_some() {
         s.close_preview(tx);
+    } else if k.key == Key::Escape && matches!(s.page, Page::Task(_)) && s.desk.task_options {
+        s.set_task_options(false);
+        tx.focus_when_shown("task-options", true);
+    } else if k.key == Key::Escape && matches!(s.page, Page::Thread(_)) {
+        s.close_thread(tx);
+    } else if k.key == Key::Escape && s.browse.search_open {
+        s.close_search();
+        tx.focus_when_shown("search-toggle", true);
     } else if k.key == Key::Escape && s.page != Page::Feed {
         let old = s.page;
         s.back();
+        if s.page == old {
+            return true;
+        }
         let target = match (s.page, old) {
             (Page::Feed, Page::Thread(id)) => format!("thread-{id}"),
             (Page::Tasks, Page::Task(id)) => format!("task-row-{id}"),
@@ -73,10 +83,11 @@ fn key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
 fn main() {
     if std::env::args_os().skip(1).eq(["--ui-notices"]) {
         print!(
-            "Rune, rune-kit and rune-highlights\n{}\nEmbedded Inter fonts\n{}\nPierre Highlights (translated by Rune)\n{}",
+            "Rune, rune-kit and rune-highlights\n{}\nEmbedded Inter fonts\n{}\nPierre Highlights (translated by Rune)\n{}\nLucide glyphs\n{}",
             include_str!("../licenses/Rune-MIT.txt"),
             include_str!("../licenses/Inter-OFL.txt"),
-            include_str!("../licenses/Highlights-Apache.txt")
+            include_str!("../licenses/Highlights-Apache.txt"),
+            include_str!("../licenses/Lucide.txt")
         );
         return;
     }

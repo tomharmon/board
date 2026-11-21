@@ -35,6 +35,66 @@ pub struct Form {
     pub value: TextEdit,
     pub extra: TextEdit,
 }
+pub struct TaskEntry {
+    instance: std::sync::Arc<()>,
+    pub form: Form,
+    pub labels: TextEdit,
+    pub files: Vec<(String, Vec<u8>)>,
+    pub no_sync: bool,
+    pub show_labels: bool,
+}
+impl Default for TaskEntry {
+    fn default() -> Self {
+        Self {
+            instance: Default::default(),
+            form: Form::default(),
+            labels: TextEdit::new(""),
+            files: Vec::new(),
+            no_sync: false,
+            show_labels: false,
+        }
+    }
+}
+
+#[derive(Default)]
+pub struct AccessReview {
+    pub viewer: Option<board_local::access::Viewer>,
+    pub fields: Form,
+    pub other: bool,
+    pub query: Option<(String, String, bool)>,
+    pub decision: Option<board_local::access::Decision>,
+}
+impl AccessReview {
+    pub fn registry(&self) -> bool {
+        self.viewer.as_ref().is_some_and(|v| {
+            v.owner
+                || v.can
+                    .0
+                    .get("*")
+                    .is_some_and(|a| a.contains(&board_local::access::Action::Manage))
+        })
+    }
+    fn decision(
+        db: &Board,
+        v: &board_local::access::Viewer,
+        subject: &str,
+        channel: &str,
+        other: bool,
+    ) -> Result<board_local::access::Decision> {
+        if v.owner && !other {
+            // A local owner is not constrained by grants a token for the same name would receive.
+            board_local::validate_channel(channel)?;
+            return Ok(board_local::access::Decision {
+                actions: v.can.0.get("*").into_iter().flatten().copied().collect(),
+                pattern: Some("*".into()),
+                level: Some("local owner".into()),
+                over: vec![],
+                grants: vec![],
+            });
+        }
+        db.explain_decision(subject, channel)
+    }
+}
 impl Default for Form {
     fn default() -> Self {
         Self {
@@ -57,7 +117,14 @@ pub struct Desk {
     pub head: i64,
     pub through: i64,
     pub tasks: Vec<Task>,
+    pub selected_task: Option<Task>,
+    pub task_options: bool,
+    pub task_rows: HashMap<i64, TaskRow>,
     pub task_filter: usize,
+    pub filter_form: Form,
+    pub filtering: bool,
+    pub task_entry: TaskEntry,
+    pub access: AccessReview,
     pub criteria: automation::TaskFilter,
     pub schedules: Vec<Schedule>,
     pub watchers: Vec<Watcher>,
@@ -77,11 +144,32 @@ pub struct Desk {
     claims: HashMap<(String, i64), (i64, String)>,
 }
 
+pub struct TaskRow {
+    pub created: String,
+    pub labels: BTreeMap<String, String>,
+    pub files: String,
+}
 impl Desk {
+    pub const TASK_STATES: [&'static str; 9] = [
+        "open",
+        "waiting",
+        "ready",
+        "claimed",
+        "blocked",
+        "completed",
+        "failed",
+        "canceled",
+        "all",
+    ];
     pub fn clear_data(&mut self) {
+        self.task_entry.instance = Default::default();
         self.messages.clear();
         self.events.clear();
         self.tasks.clear();
+        self.selected_task = None;
+        self.task_rows.clear();
+        self.access.viewer = None;
+        self.access.decision = None;
         self.schedules.clear();
         self.watchers.clear();
         self.schemas.clear();
@@ -101,15 +189,32 @@ impl Desk {
         self.pages.clear();
         self.watcher_pages.clear();
     }
+    pub fn enter_from(&mut self, old: Page, page: Page) {
+        let keep = matches!(old, Page::Tasks | Page::Task(_))
+            && matches!(page, Page::Tasks | Page::Task(_));
+        let pages = if keep {
+            std::mem::take(&mut self.pages)
+        } else {
+            Vec::new()
+        };
+        self.enter(page);
+        self.pages = pages;
+    }
     pub fn enter(&mut self, page: Page) {
         self.first_page();
         self.clear_data();
         self.form = Form::default();
+        self.access = AccessReview::default();
         self.editing = false;
+        self.task_options = false;
+        self.filtering = false;
+        self.filter_form = Form::default();
         self.confirm = None;
         self.schema_open = None;
         self.source.expanded = None;
-        if page == Page::NewTask || page == Page::Schedules {
+        if page == Page::NewTask && self.task_entry.form.channel.text.is_empty() {
+            self.task_entry.form.channel = TextEdit::new("general");
+        } else if page == Page::Schedules {
             self.form.channel = TextEdit::new("general");
         }
     }
@@ -188,8 +293,8 @@ impl Desk {
                     self.events = events;
                 }
             },
-            Page::Tasks => {
-                let state = ["open", "ready", "claimed", "all"][self.task_filter];
+            Page::Tasks | Page::Task(_) => {
+                let state = Self::TASK_STATES[self.task_filter];
                 self.criteria.state = Some(state.into());
                 let (_, mut tasks) =
                     automation::filtered_tasks_page(db, &self.criteria, after, PAGE + 1)?;
@@ -197,21 +302,42 @@ impl Desk {
                     tasks.truncate(PAGE);
                     self.next = tasks.last().map(|t| t.id);
                 }
+                self.task_rows = tasks
+                    .iter()
+                    .map(|t| {
+                        let m = db.get(t.id)?;
+                        Ok((
+                            t.id,
+                            TaskRow {
+                                created: m.created_at,
+                                labels: m.labels,
+                                files: m
+                                    .attachments
+                                    .into_iter()
+                                    .map(|f| f.name)
+                                    .collect::<Vec<_>>()
+                                    .join(", "),
+                            },
+                        ))
+                    })
+                    .collect::<Result<_>>()?;
                 self.tasks = tasks;
-            }
-            Page::Task(id) => {
-                let t = automation::get_task(db, id)?;
-                if self.tasks.first().is_none_or(|old| old.id != id) {
-                    self.form.name = TextEdit::new(t.assignee.as_deref().unwrap_or(""));
-                    self.form.extra = TextEdit::new(
-                        t.needs
-                            .iter()
-                            .map(i64::to_string)
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                    );
+                if let Page::Task(id) = page {
+                    let t = automation::get_task(db, id)?;
+                    if self.selected_task.as_ref().is_none_or(|old| old.id != id) {
+                        self.form.name = TextEdit::new(t.assignee.as_deref().unwrap_or(""));
+                        self.form.extra = TextEdit::new(
+                            t.needs
+                                .iter()
+                                .map(i64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                        );
+                    }
+                    self.selected_task = Some(t);
+                } else {
+                    self.selected_task = None;
                 }
-                self.tasks = vec![t];
             }
             Page::Schedules => {
                 let (_, mut rows) = automation::schedules_page(db, true, after, PAGE + 1)?;
@@ -234,9 +360,35 @@ impl Desk {
                 self.watchers = rows;
             }
             Page::Schemas => self.schemas = db.schemas()?,
-            Page::Access => {
-                self.grants = db.grants()?;
-                self.credentials = db.credentials()?;
+            Page::Access | Page::Workspace => {
+                self.access.viewer = Some(db.viewer(actor)?);
+                let registry = self.access.registry();
+                self.grants = if registry { db.grants()? } else { vec![] };
+                self.credentials = if delegated { vec![] } else { db.credentials()? };
+                if self
+                    .access
+                    .query
+                    .as_ref()
+                    .is_some_and(|(_, _, other)| *other && !registry)
+                {
+                    self.access.query = None;
+                    self.access.other = false;
+                    self.access.fields.name.clear();
+                }
+                self.access.decision = self
+                    .access
+                    .query
+                    .as_ref()
+                    .map(|(who, ch, other)| {
+                        AccessReview::decision(
+                            db,
+                            self.access.viewer.as_ref().unwrap(),
+                            who,
+                            ch,
+                            *other,
+                        )
+                    })
+                    .transpose()?;
             }
             Page::Sources => self.source.list = db.sources(actor)?,
             Page::Inbox => self.next = self.source.load(db, actor, after, PAGE)?,
@@ -281,10 +433,50 @@ fn ids(text: &str) -> Result<Vec<i64>> {
 }
 
 impl State {
+    pub fn explain_access(&mut self) {
+        let review = &self.desk.access;
+        let other = review.other && review.registry();
+        let who = if other {
+            review.fields.name.text.trim()
+        } else {
+            &self.actor
+        }
+        .to_owned();
+        let ch = review
+            .fields
+            .channel
+            .text
+            .trim()
+            .trim_start_matches('#')
+            .to_owned();
+        let result = self.db().and_then(|db| {
+            AccessReview::decision(
+                db,
+                review.viewer.as_ref().context("No current permissions")?,
+                &who,
+                &ch,
+                other,
+            )
+        });
+        if let Some(decision) = self.result(result) {
+            self.desk.access.query = Some((who, ch, other));
+            self.desk.access.decision = Some(decision);
+        }
+    }
     pub fn open_message_thread(&mut self, id: i64) {
         let result = self.db().and_then(|b| b.get(id));
         if let Some(m) = self.result(result) {
-            self.go(Page::Thread(m.re.unwrap_or(id)));
+            let root = m.re.unwrap_or(id);
+            let page = if self.page == Page::Task(root) {
+                Page::Task(root)
+            } else {
+                Page::Thread(root)
+            };
+            self.go(page);
+            if self.page != page {
+                return;
+            }
+            self.set_task_options(false);
             self.browse.position = if m.re.is_some() {
                 Position::Before(id.saturating_add(1))
             } else {
@@ -339,6 +531,7 @@ impl State {
         self.desk.source.outgoing = false;
         self.desk.criteria = Default::default();
         self.desk.task_filter = 0;
+        self.desk.task_entry = TaskEntry::default();
         self.history.clear();
         self.query.clear();
         self.browse = Browse::default();
@@ -349,14 +542,28 @@ impl State {
     }
 
     pub fn create_task(&mut self, existing: Option<i64>) {
-        let form = &self.desk.form;
-        let options = PostOptions::default();
+        let entry = &self.desk.task_entry;
+        let form = &entry.form;
         let result = self.db().and_then(|db| {
+            let options = if existing.is_none() {
+                PostOptions {
+                    no_sync: entry.no_sync,
+                    files: entry.files.clone(),
+                    labels: board_local::ComposerSettings {
+                        labels: entry.labels.text.clone(),
+                        ..Default::default()
+                    }
+                    .parsed_labels()?,
+                    ..Default::default()
+                }
+            } else {
+                PostOptions::default()
+            };
             let target = if let Some(id) = existing {
                 automation::TaskTarget::Existing(id)
             } else {
                 automation::TaskTarget::New {
-                    channel: form.channel.text.trim(),
+                    channel: form.channel.text.trim().trim_start_matches('#'),
                     text: &form.body.text,
                     options: &options,
                 }
@@ -376,13 +583,86 @@ impl State {
             )
         });
         if let Some(t) = self.result(result) {
-            self.go(Page::Task(t.id));
+            if existing.is_none() {
+                self.desk.task_entry = TaskEntry::default();
+            }
+            if existing.is_none() && matches!(self.page, Page::Tasks | Page::Task(_)) {
+                self.desk.first_page();
+                self.refresh();
+            } else {
+                self.go(Page::Task(t.id));
+            }
         }
+    }
+
+    pub fn pick_task_file(&mut self, tx: &mut Tx) {
+        let actor = self.actor.clone();
+        let page = self.page;
+        let entry = &self.desk.task_entry;
+        let generation = std::sync::Arc::downgrade(&entry.instance);
+        let channel = entry.form.channel.text.clone();
+        let private = entry.no_sync;
+        let labels = entry.labels.text.clone();
+        let assignee = entry.form.name.text.clone();
+        let needs = entry.form.extra.text.clone();
+        tx.open_file(
+            rune::FileDialogOptions {
+                title: "Attach task file".into(),
+                ..Default::default()
+            },
+            move |s: &mut State, result, _| match result {
+                Ok(Some(path))
+                    if generation.upgrade().is_some()
+                        && s.actor == actor
+                        && s.page == page
+                        && !s.access_blocked
+                        && !s.desk.filtering
+                        && s.desk.task_entry.form.channel.text == channel
+                        && s.desk.task_entry.no_sync == private
+                        && s.desk.task_entry.labels.text == labels
+                        && s.desk.task_entry.form.name.text == assignee
+                        && s.desk.task_entry.form.extra.text == needs =>
+                {
+                    let read = || -> Result<_> {
+                        ensure!(
+                            s.desk.task_entry.files.len() < board_local::MAX_ATTACHMENTS,
+                            "At most {} attachments",
+                            board_local::MAX_ATTACHMENTS
+                        );
+                        if s.delegated {
+                            let channel = channel.trim().trim_start_matches('#');
+                            ensure!(
+                                !channel.is_empty(),
+                                "Choose a task channel before attaching a file"
+                            );
+                            let rights = s.db()?.explain(&actor, channel)?;
+                            ensure!(
+                                rights.contains(&board_local::access::Action::Post),
+                                "Posting to this channel is no longer permitted"
+                            );
+                            ensure!(
+                                labels.trim().is_empty()
+                                    || rights.contains(&board_local::access::Action::Label),
+                                "Labeling in this channel is no longer permitted"
+                            );
+                        }
+                        super::files::read_attachment(&path)
+                    };
+                    let outcome = read();
+                    if let Some(file) = s.result(outcome) {
+                        s.desk.task_entry.files.push(file);
+                    }
+                }
+                Ok(Some(_)) => s.error = Some("Task entry changed; file was not attached".into()),
+                Err(e) => s.error = Some(e.to_string()),
+                Ok(None) => (),
+            },
+        );
     }
 
     pub fn edit_task_filters(&mut self) {
         let c = &self.desk.criteria;
-        let f = &mut self.desk.form;
+        let f = &mut self.desk.filter_form;
         f.channel = TextEdit::new(c.channel.as_deref().unwrap_or(""));
         f.name = TextEdit::new(c.owner.as_deref().unwrap_or(""));
         f.value = TextEdit::new(c.assignee.as_deref().unwrap_or(""));
@@ -398,12 +678,12 @@ impl State {
                 .collect::<Vec<_>>()
                 .join("\n"),
         );
-        self.desk.editing = true;
+        self.desk.filtering = true;
     }
 
     pub fn save_task_filters(&mut self) {
         let build = || -> Result<automation::TaskFilter> {
-            let f = &self.desk.form;
+            let f = &self.desk.filter_form;
             let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
             let terms: Vec<_> = f.body.text.lines().filter_map(opt).collect();
             let c = automation::TaskFilter {
@@ -423,7 +703,7 @@ impl State {
         let result = build();
         if let Some(criteria) = self.result(result) {
             self.desk.criteria = criteria;
-            self.desk.editing = false;
+            self.desk.filtering = false;
             self.desk.first_page();
             self.refresh();
         }
@@ -472,8 +752,8 @@ impl State {
             ) || matches!(cmd, TaskCommand::Block)
                 && self
                     .desk
-                    .tasks
-                    .first()
+                    .selected_task
+                    .as_ref()
                     .is_some_and(|t| t.state == "claimed");
             automation::change_task(
                 db,
@@ -586,7 +866,7 @@ impl State {
                     automation::cancel_schedule(db, key.parse()?, &self.actor).map(|_| ())
                 }
                 Page::Watchers => automation::remove_watcher_as(db, &self.actor, key),
-                Page::Access => {
+                Page::Access | Page::Workspace if self.desk.access.registry() => {
                     if let Some(id) = key.strip_prefix("grant-") {
                         db.revoke_grant(&self.actor, id.parse()?)
                     } else {

@@ -5,36 +5,89 @@ mod tasks;
 use super::*;
 use crate::state::{ActivityMode, TaskCommand};
 use rune::TextEdit;
-use rune_kit::SegmentedControl;
-
-pub(super) fn name(page: Page, s: &State) -> String {
-    match page {
-        Page::Feed => title_for(s),
-        Page::Thread(id) => format!("#{id}"),
-        Page::Compose => "New thread".into(),
-        Page::Activity => "Activity".into(),
-        Page::Tasks => "Tasks".into(),
-        Page::Task(id) => format!("Task #{id}"),
-        Page::NewTask => "New task".into(),
-        Page::Workspace => "Workspace".into(),
-        Page::Schedules => "Schedules".into(),
-        Page::Watchers => "Watchers".into(),
-        Page::Schemas => "Schemas".into(),
-        Page::Access => "Access".into(),
-        Page::Sources => "Sources".into(),
-        Page::Inbox => "Inbox".into(),
-        Page::Profiles => "Profiles".into(),
-        Page::People => "People".into(),
-    }
-}
 
 fn seg(labels: &[&str], selected: usize, name: &str, key: &str, pick: fn(&mut State, usize)) -> El {
-    SegmentedControl::new(labels, Some(selected))
-        .label(name)
-        .fit()
-        .on_pick(move |s: &mut State, i, _| pick(s, i))
-        .build(&Kit::neutral(false))
+    let mut strip = row()
         .key(key)
+        .label(name)
+        .w_full()
+        .center_y()
+        .gap(17.0)
+        .flex_wrap()
+        .focus_group();
+    for (i, title) in labels.iter().enumerate() {
+        // Keep the original four task selectors stable for keyboard and scripted clients.
+        let child_key = match (key, *title) {
+            ("task-filter", "open") => "segment0".into(),
+            ("task-filter", "ready") => "segment1".into(),
+            ("task-filter", "claimed") => "segment2".into(),
+            ("task-filter", "all") => "segment3".into(),
+            ("task-filter", state) => format!("task-state-{state}"),
+            _ => format!("segment{i}"),
+        };
+        strip = strip
+            .child(tab(&child_key, title, i == selected).on_press(move |s: &mut State| pick(s, i)));
+    }
+    strip
+}
+fn tab(key: &str, title: &str, active: bool) -> El {
+    click(
+        row().key(key).h(34.0).center_y().min_w(0.0).border_sides(
+            [0.0, 0.0, 1.0, 0.0],
+            if active { c(INK) } else { Color::TRANSPARENT },
+        ),
+        title,
+    )
+    .child(label(
+        title.to_lowercase(),
+        13.0,
+        400.0,
+        if active { INK } else { MUTED },
+    ))
+}
+fn settings(page: Page) -> bool {
+    matches!(
+        page,
+        Page::Workspace
+            | Page::Access
+            | Page::Schemas
+            | Page::Schedules
+            | Page::Watchers
+            | Page::Sources
+            | Page::Inbox
+            | Page::Profiles
+            | Page::Activity
+    )
+}
+fn settings_tabs(s: &State, inset: f32) -> El {
+    let mut strip = row()
+        .key("work-sections")
+        .label("Settings sections")
+        .w_full()
+        .flex_wrap()
+        .center_y()
+        .gap(14.0)
+        .px(inset)
+        .focus_group()
+        .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE));
+    for (key, title, page) in [
+        ("work-access", "access", Page::Access),
+        ("work-schemas", "schemas", Page::Schemas),
+        ("work-schedules", "schedules", Page::Schedules),
+        ("work-watchers", "watchers", Page::Watchers),
+        ("work-sources", "sync", Page::Sources),
+        ("work-profiles", "profiles", Page::Profiles),
+        ("work-history", "history", Page::Activity),
+    ] {
+        let active = s.page == page
+            || (page == Page::Access && s.page == Page::Workspace)
+            || (page == Page::Sources && s.page == Page::Inbox);
+        strip = strip.child(tab(key, title, active).on_press(move |s: &mut State| s.go(page)));
+    }
+    if let Some(add) = admin::add_resource(s) {
+        strip = strip.child(el().grow(1.0)).child(add);
+    }
+    strip
 }
 
 pub(super) fn field(
@@ -44,30 +97,29 @@ pub(super) fn field(
     write: fn(&mut State) -> &mut TextEdit,
     multi: bool,
 ) -> El {
-    let mut input = text_input(value, TextStyle::new(14.0, 450.0))
+    let mut input = text_input(value, font(13.0, 400.0))
         .key(key)
         .label(name)
         .on_edit(write)
         .w_full()
-        .padding(9.0)
-        .radius(5.0)
-        .border(1.0, c(EDGE))
-        .fill(c("#fafbf9"));
+        .color(c(INK))
+        .padding(7.0)
+        .fill(c(TINT));
     if multi {
-        input = input.h(84.0);
+        input = input.h(72.0);
     } else {
-        input = input.single_line().h(36.0);
+        input = input.single_line().h(30.0);
     }
     col()
         .w_full()
-        .gap(5.0)
-        .child(label(name, 13.0, 580.0, INK))
+        .gap(3.0)
+        .child(label(name, 11.0, 400.0, MUTED))
         .child(input)
 }
 
 fn heading(name: &str, extra: Option<El>) -> El {
     let bar = row().w_full().gap(8.0).center_y().child(
-        label(name, 22.0, 630.0, INK)
+        label(name, 12.0, 500.0, DIM)
             .grow(1.0)
             .min_w(0.0)
             .wrap_anywhere(),
@@ -78,37 +130,31 @@ fn heading(name: &str, extra: Option<El>) -> El {
     }
 }
 fn empty(name: &str) -> El {
-    label(name, 15.0, 500.0, MUTED)
+    label(name, 12.0, 400.0, FAINT)
         .w_full()
         .py(12.0)
         .wrap_anywhere()
 }
 fn listrow(key: &str, title: &str, detail: &str, open: impl Fn(&mut State) + 'static) -> El {
     click(
-        row()
-            .key(key)
-            .w_full()
-            .py(11.0)
-            .px(3.0)
-            .center_y()
-            .gap(8.0)
-            .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE)),
+        row().key(key).w_full().py(5.0).px(3.0).center_y().gap(10.0),
         title,
     )
     .child(
-        col()
+        row()
             .grow(1.0)
             .min_w(0.0)
-            .gap(5.0)
+            .center_y()
+            .gap(14.0)
             .child(
-                label(title, 15.0, 580.0, INK)
-                    .w_full()
+                label(title, 13.0, 450.0, INK)
+                    .grow(1.0)
+                    .min_w(0.0)
                     .wrap_anywhere()
                     .max_lines(3),
             )
-            .child(mono(detail, MUTED).w_full().wrap_anywhere()),
+            .child(mono(detail, MUTED).grow(1.0).min_w(0.0).wrap_anywhere()),
     )
-    .child(icon(&glyphs::CARET_RIGHT, 14.0).color(c(MUTED)))
     .on_press(open)
 }
 fn pager(s: &State) -> El {
@@ -354,20 +400,58 @@ fn activity(s: &State) -> El {
     panel
 }
 
+pub(super) fn task_list_for(s: &State, inset: f32, compact: bool) -> El {
+    let mut panel = col().w_full().grow(1.0).min_h(0.0).child(scroll(
+        "work-scroll",
+        col()
+            .w_full()
+            .px(inset)
+            .py(4.0)
+            .child(tasks::list(s, compact)),
+    ));
+    if !s.desk.filtering {
+        panel = panel
+            .child(pager(s).px(inset))
+            .child(tasks::composer(s, inset));
+    }
+    panel
+}
+pub(super) fn task_detail(s: &State, inset: f32) -> El {
+    scroll(
+        "task-detail-scroll",
+        col().w_full().px(inset).py(12.0).child(tasks::detail(s)),
+    )
+}
+pub(super) fn task_banner(s: &State, inset: f32) -> El {
+    col()
+        .key("task-detail-scroll")
+        .w_full()
+        .px(inset)
+        .pt(15.0)
+        .pb(13.0)
+        .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE))
+        .child(tasks::banner(s))
+}
 pub(super) fn view(s: &State, inset: f32) -> El {
     let inner = match s.page {
         Page::Activity => activity(s),
         Page::Sources | Page::Inbox => sources::view(s),
-        Page::Tasks | Page::Task(_) | Page::NewTask => tasks::view(s),
+        Page::Tasks => return task_list_for(s, inset, false),
+        Page::Task(_) => return task_detail(s, inset),
+        Page::NewTask => tasks::new_task(s),
         _ => admin::view(s),
     };
     let paged = matches!(
         s.page,
-        Page::Activity | Page::Tasks | Page::Schedules | Page::Watchers | Page::Inbox
+        Page::Activity | Page::Schedules | Page::Watchers | Page::Inbox
     );
-    let mut panel = col().w_full().grow(1.0).min_h(0.0).child(scroll(
+    let mut panel = col().w_full().grow(1.0).min_h(0.0);
+    if settings(s.page) {
+        panel = panel.child(settings_tabs(s, inset))
+    }
+    panel = panel.child(scroll(
         "work-scroll",
-        col().w_full().px(inset).py(17.0).child(inner),
+        col().w_full().px(inset).py(12.0).child(inner),
     ));
     if paged {
         panel = panel.child(pager(s).px(inset));

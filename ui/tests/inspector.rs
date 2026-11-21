@@ -14,10 +14,18 @@ use board_local::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "inspector/picker.rs"]
+mod picker;
+#[path = "inspector/task_conversation.rs"]
+mod task_conversation;
+#[path = "inspector/work_views.rs"]
+mod work_views;
+
 // Each shipped binary creates a whole graphics device, including a software
 // renderer's thread pool on CPU-only builders. Bound those devices independently
 // of libtest's CPU-based thread count.
 static RENDERERS: (Mutex<u8>, Condvar) = (Mutex::new(3), Condvar::new());
+const DESKTOP: &str = "1200x800";
 struct RendererSlot;
 impl RendererSlot {
     fn take() -> Self {
@@ -73,6 +81,7 @@ impl Fixture {
         }
         cmd.env("BOARD_DB", &self.db)
             .env("BOARD_USER", "reader")
+            .env("BOARD_UI_THEME", "light")
             .env_remove("BOARD_PROFILE")
             .env_remove("BOARD_TOKEN")
             .env("RUNE_DIRS_ROOT", self.dir.path().join("rune"))
@@ -92,6 +101,42 @@ impl Fixture {
             String::from_utf8_lossy(&output.stderr)
         );
         self.tree()
+    }
+
+    fn snapshot(
+        &self,
+        steps: Value,
+        size: (u32, u32),
+        theme: &str,
+        name: &str,
+    ) -> (Tree, image::RgbaImage) {
+        let path = self.dir.path().join(format!("{name}.png"));
+        let output = self
+            .command(steps, &format!("{}x{}", size.0, size.1), "1.2")
+            .env("BOARD_UI_THEME", theme)
+            .arg("--snap")
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let tree = self.tree();
+        let frame = read_frame(&path, size);
+        // Only the synthetic layout fixtures are eligible for optional capture.
+        if let Some(dir) = std::env::var_os("BOARD_UI_TEST_ARTIFACTS") {
+            let dir = PathBuf::from(dir);
+            fs::create_dir_all(&dir).unwrap();
+            fs::copy(&path, dir.join(format!("{name}.png"))).unwrap();
+            fs::copy(
+                self.dir.path().join("tree.json"),
+                dir.join(format!("{name}.tree.json")),
+            )
+            .unwrap();
+        }
+        (tree, frame)
     }
 
     fn at_mark(&self, cmd: &mut Command, mark: &str, write: impl FnOnce()) -> Tree {
@@ -130,7 +175,38 @@ impl Fixture {
 
 struct Tree(Vec<Value>);
 
+#[derive(Copy, Clone, Debug)]
+struct Rect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+impl Rect {
+    fn edge(self) -> f64 {
+        self.x + self.w
+    }
+    fn bottom(self) -> f64 {
+        self.y + self.h
+    }
+}
+
 impl Tree {
+    fn has_key(&self, key: &str) -> bool {
+        self.0.iter().any(|e| e["key"] == key)
+    }
+    fn bounds(&self, key: &str) -> Rect {
+        self.expect_key(key);
+        let el = self.0.iter().find(|e| e["key"] == key).unwrap();
+        let rect: &[Value; 4] = el["rect"]
+            .as_array()
+            .unwrap()
+            .as_slice()
+            .try_into()
+            .unwrap();
+        let [x, y, w, h] = rect.each_ref().map(|v| v.as_f64().unwrap());
+        Rect { x, y, w, h }
+    }
     fn expect_key(&self, key: &str) {
         assert!(
             self.0.iter().any(|e| e["key"] == key),
@@ -148,7 +224,7 @@ impl Tree {
     }
 }
 
-fn check_pixels(path: &Path, size: (u32, u32)) {
+fn read_frame(path: &Path, size: (u32, u32)) -> image::RgbaImage {
     let mut reader = png::Decoder::new(BufReader::new(File::open(path).unwrap()))
         .read_info()
         .unwrap();
@@ -156,19 +232,256 @@ fn check_pixels(path: &Path, size: (u32, u32)) {
     let frame = reader.next_frame(&mut rgba).unwrap();
     assert_eq!((frame.width, frame.height), size);
     assert_eq!(frame.color_type, png::ColorType::Rgba);
-    let (pixels, remainder) = rgba[..frame.buffer_size()].as_chunks::<4>();
-    assert!(remainder.is_empty());
-    let ink = pixels
-        .iter()
-        .filter(|p| p[0] < 100 && p[1] < 100 && p[2] < 100 && p[3] == 255)
-        .count();
-    let accent = pixels
-        .iter()
-        .filter(|p| p[0] > 135 && p[1] < 100 && p[2] < 105 && p[3] == 255)
-        .count();
+    rgba.truncate(frame.buffer_size());
+    image::RgbaImage::from_raw(frame.width, frame.height, rgba).unwrap()
+}
+
+fn check_surface(pixels: &image::RgbaImage, rect: Rect, dark: bool) {
+    let (mut area, mut neutral, mut ink, mut paper) = (0u64, 0u64, 0u64, 0u64);
+    for y in
+        rect.y.max(0.0).ceil() as u32..rect.bottom().min(f64::from(pixels.height())).floor() as u32
+    {
+        for x in
+            rect.x.max(0.0).ceil() as u32..rect.edge().min(f64::from(pixels.width())).floor() as u32
+        {
+            let [r, g, b, a] = pixels[(x, y)].0;
+            let lo = r.min(g).min(b);
+            let hi = r.max(g).max(b);
+            area += 1;
+            neutral += u64::from(a == 255 && hi - lo <= 16);
+            paper += u64::from(a == 255 && if dark { hi <= 55 } else { lo >= 225 });
+            ink += u64::from(a == 255 && if dark { lo >= 175 } else { hi <= 110 });
+        }
+    }
     assert!(
-        ink > 180 && accent > 100,
-        "blank or missing content: {ink} ink pixels, {accent} accent pixels"
+        area > 0 && paper > area / 2 && neutral * 100 > area * 98 && ink > 180,
+        "unpainted or wrong theme in {rect:?} (dark={dark}): {ink} foreground, {paper} background, {neutral}/{area} neutral"
+    );
+}
+
+fn check_pixels(path: &Path, size: (u32, u32)) {
+    check_surface(
+        &read_frame(path, size),
+        Rect {
+            x: 0.0,
+            y: 0.0,
+            w: f64::from(size.0),
+            h: f64::from(size.1),
+        },
+        false,
+    );
+}
+
+fn layout_fixture(f: &Fixture) -> (i64, i64, i64) {
+    let b = Board::open(&f.db).unwrap();
+    let first = b
+        .post(
+            "desk",
+            "reader",
+            "Compare lock outcomes",
+            &PostOptions::default(),
+        )
+        .unwrap();
+    let second = b
+        .post(
+            "desk",
+            "writer",
+            "Review backup record",
+            &PostOptions::default(),
+        )
+        .unwrap();
+    let reply = b
+        .reply(
+            first.id,
+            "writer",
+            "Pinned reader saw the same snapshot",
+            &Default::default(),
+        )
+        .unwrap();
+    (first.id, second.id, reply.id)
+}
+
+fn close_to(actual: f64, expected: f64, tolerance: f64, detail: &str) {
+    assert!(
+        (actual - expected).abs() <= tolerance,
+        "{detail}: {actual}, expected {expected} +/- {tolerance}"
+    );
+}
+fn panel_header(tree: &Tree, key: &str, pane: Rect) {
+    let bar = tree.bounds(key);
+    close_to(bar.x, pane.x, 2.0, key);
+    close_to(bar.y, pane.y, 2.0, key);
+    close_to(bar.w, pane.w, 7.0, key);
+    close_to(bar.h, 46.0, 1.0, key);
+}
+
+#[test]
+fn desktop_shell_keeps_the_activity_feed_beside_an_independently_switchable_thread() {
+    let f = Fixture::new();
+    let (first, second, reply) = layout_fixture(&f);
+    let pick = |t: f64, id: i64| json!({"t":t,"type":"tap","key":format!("thread-{id}")});
+    let (t, frame) = f.snapshot(
+        json!([pick(0.2, first)]),
+        (1200, 800),
+        "light",
+        "desktop-thread-light",
+    );
+    let rail = t.bounds("channels");
+    let feed = t.bounds("feed-pane");
+    let thread = t.bounds("thread-pane");
+    assert!(
+        (200.0..=240.0).contains(&rail.w),
+        "unexpected sidebar: {rail:?}"
+    );
+    assert!(
+        feed.w >= 225.0 && thread.w >= 250.0,
+        "unusable panes: {feed:?}, {thread:?}"
+    );
+    close_to(rail.w, 224.0, 2.0, "default desktop sidebar width");
+    close_to(thread.w, 440.0, 2.0, "default desktop thread width");
+    close_to(rail.x, 0.0, 1.0, "sidebar origin");
+    close_to(rail.edge(), feed.x, 8.0, "sidebar/feed boundary");
+    close_to(feed.edge(), thread.x, 8.0, "feed/thread boundary");
+    close_to(thread.edge(), 1200.0, 2.0, "right edge");
+    for (header, pane) in [
+        ("sidebar-header", rail),
+        ("feed-header", feed),
+        ("thread-header", thread),
+    ] {
+        close_to(pane.y, 0.0, 2.0, header);
+        close_to(pane.bottom(), 800.0, 2.0, header);
+        panel_header(&t, header, pane);
+        check_surface(&frame, pane, false);
+    }
+    t.expect_key("sidebar-resize");
+    t.expect_key("thread-resize");
+    t.expect_key("feed-compose");
+    assert_eq!(
+        t.0.iter().filter(|e| e["key"] == "message-body").count(),
+        1,
+        "two panes must not compete for the active message editor"
+    );
+    t.expect_key(&format!("activity-reply-{reply}"));
+    t.expect_key(&format!("message-{reply}"));
+    let oldest = t.bounds(&format!("thread-{first}"));
+    let feed_item = t.bounds(&format!("thread-{second}"));
+    let newest = t.bounds(&format!("activity-reply-{reply}"));
+    assert!(
+        oldest.bottom() <= feed_item.y + 1.0 && feed_item.bottom() <= newest.y + 1.0,
+        "all activity must show distinct non-overlapping roots and replies in chronological order: {oldest:?}, {feed_item:?}, {newest:?}"
+    );
+    let message = t.bounds(&format!("message-{first}"));
+    assert!(feed_item.x >= feed.x - 1.0 && feed_item.edge() <= feed.edge() + 1.0);
+    assert!(message.x >= thread.x - 1.0 && message.edge() <= thread.edge() + 1.0);
+
+    let (next, dark) = f.snapshot(
+        json!([pick(0.2, first), pick(0.6, second)]),
+        (1200, 800),
+        "dark",
+        "desktop-thread-dark",
+    );
+    next.expect_key(&format!("thread-{first}"));
+    next.expect_key(&format!("message-{second}"));
+    assert!(
+        !next.has_key(&format!("message-{reply}")),
+        "switched pane still shows old conversation"
+    );
+    for key in ["channels", "feed-pane", "thread-pane"] {
+        check_surface(&dark, next.bounds(key), true);
+    }
+    let back = f.render(
+        json!([pick(0.2,first),pick(0.5,second),{"t":0.8,"type":"tap","key":"back-to-feed"}]),
+        "1200x800",
+        "1.8",
+    );
+    assert!(!back.has_key("thread-pane"));
+    close_to(
+        back.bounds("feed-pane").edge(),
+        1200.0,
+        2.0,
+        "fully expanded feed",
+    );
+    back.expect_key(&format!("activity-reply-{reply}"));
+    let resized = f.render(
+        json!([pick(0.2,first),
+        {"t":0.4,"type":"tap","key":"sidebar-resize"},{"t":0.6,"type":"key","name":"ArrowRight"},
+        {"t":0.85,"type":"drag","key":"thread-resize","dx":-36,"dur":0.25}]),
+        "1200x800",
+        "1.35",
+    );
+    assert!(
+        resized.bounds("channels").w > rail.w + 1.0,
+        "focused divider did not resize with the keyboard"
+    );
+    assert!(
+        resized.bounds("thread-pane").w > thread.w + 15.0,
+        "drag did not expand the thread pane"
+    );
+    resized.expect_key(&format!("message-{first}"));
+}
+
+#[test]
+fn compact_shell_opens_navigation_on_demand_and_returns_from_a_full_width_thread() {
+    let f = Fixture::new();
+    let (first, _, reply) = layout_fixture(&f);
+    let (initial, frame) = f.snapshot(json!([]), (680, 720), "light", "compact-activity");
+    initial.expect_key("open-nav");
+    initial.expect_key(&format!("activity-reply-{reply}"));
+    let feed = initial.bounds("feed-pane");
+    close_to(feed.x, 0.0, 2.0, "compact feed origin");
+    close_to(feed.w, 680.0, 2.0, "compact feed width");
+    assert!(!initial.has_key("channels") && !initial.has_key("thread-pane"));
+    panel_header(&initial, "feed-header", feed);
+    check_surface(&frame, feed, false);
+
+    let menu = json!({"t":0.18,"type":"tap","key":"open-nav"});
+    let channel = json!({"t":0.45,"type":"tap","key":"nav-desk"});
+    let open = json!({"t":0.65,"type":"tap","key":format!("thread-{first}")});
+    let nav = f.render(json!([menu]), "680x720", "0.5");
+    nav.expect_key("channels");
+    nav.expect_key("close-nav");
+    nav.expect_key("nav-scrim");
+    close_to(nav.bounds("channels").w, 280.0, 2.0, "compact drawer width");
+    nav.expect_key("nav-desk");
+    let dismissed = f.render(
+        json!([menu,{"t":0.4,"type":"key","name":"Escape"}]),
+        "680x720",
+        "0.75",
+    );
+    dismissed.expect_key("feed-pane");
+    dismissed.expect_key("open-nav");
+    assert!(
+        !dismissed.has_key("channels"),
+        "Escape didn't close the navigation drawer"
+    );
+    let (thread, frame) = f.snapshot(
+        json!([menu, channel, open]),
+        (680, 720),
+        "light",
+        "compact-thread",
+    );
+    let pane = thread.bounds("thread-pane");
+    close_to(pane.x, 0.0, 2.0, "compact thread origin");
+    close_to(pane.w, 680.0, 2.0, "compact thread width");
+    panel_header(&thread, "thread-header", pane);
+    thread.expect_key(&format!("message-{reply}"));
+    assert!(
+        !thread.has_key("channels")
+            && !thread.has_key("feed-pane")
+            && !thread.has_key("thread-resize")
+    );
+    check_surface(&frame, pane, false);
+    let closed = f.render(
+        json!([menu,channel,open,{"t":0.85,"type":"tap","key":"back-to-feed"}]),
+        "680x720",
+        "1.85",
+    );
+    closed.expect_key(&format!("thread-{first}"));
+    closed.expect_key("open-nav");
+    closed.expect_key("feed-pane");
+    assert!(
+        !closed.has_key("thread-pane") && !closed.has_key(&format!("activity-reply-{reply}")),
+        "closing a channel thread should return to that channel's roots, not All activity"
     );
 }
 
@@ -227,13 +540,135 @@ fn composer_search_individual_reply_and_reaction() {
     );
     t.expect_text("Confirmed from the inspector");
     t.expect_text("stage=tested");
-    t.expect_text("star 1 (reader)");
+    t.expect_key(&format!("reaction-{}-0", parent.id));
+    assert_eq!(
+        db.get(parent.id).unwrap().reactions.get("star").unwrap(),
+        &["reader"]
+    );
     let messages = db.thread(root.id).unwrap();
     assert_eq!(messages.len(), 3);
     assert_eq!(
         (messages[2].re, messages[2].reply_to),
         (Some(root.id), Some(parent.id))
     );
+}
+
+#[test]
+fn inline_channel_composer_sends_with_enter_preserves_shift_newline_and_waits_for_ime_commit() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    b.create_channel("work").unwrap();
+    let mut cmd=f.command(json!([
+        {"t":0.12,"type":"tap","key":"nav-work"},{"t":0.35,"type":"tap","key":"message-body"},
+        {"t":0.55,"paste":"First line"},{"t":0.75,"type":"key","shift":true,"name":"Enter"},
+        {"t":0.95,"paste":"Second line"},{"t":1.15,"type":"key","name":"Enter"},
+        {"t":1.45,"type":"tap","key":"nav-work"},{"t":1.65,"type":"tap","key":"message-body"},
+        {"t":1.85,"paste":"Greeting: "},{"t":2.05,"type":"ime","preedit":"こんにちは","cursor":[15,15]},
+        {"t":2.25,"type":"key","name":"Enter"},{"t":2.45,"type":"mark","name":"ime-held"},
+        {"t":2.95,"type":"ime","commit":"こんにちは"},{"t":3.15,"type":"key","cmd":true,"name":"Enter"}
+    ]),DESKTOP,"3.65");
+    let mut interim = Vec::new();
+    let t = f.at_mark(&mut cmd, "ime-held", || {
+        interim = b.messages(&Filter::default(), 10).unwrap();
+    });
+    assert_eq!(
+        interim.len(),
+        1,
+        "Enter during preedit published an unfinished message"
+    );
+    assert_eq!(interim[0].text, "First line\nSecond line");
+    assert_eq!(interim[0].channel, "work");
+    t.expect_text("Greeting: こんにちは");
+    let msgs = b.messages(&Filter::default(), 10).unwrap();
+    assert_eq!(
+        msgs.iter()
+            .map(|m| (&*m.channel, &*m.text, m.reply_to))
+            .collect::<Vec<_>>(),
+        [
+            ("work", "First line\nSecond line", None),
+            ("work", "Greeting: こんにちは", None)
+        ]
+    );
+}
+
+#[test]
+fn split_composers_keep_root_and_reply_drafts_separate_across_focus_send_and_restart() {
+    let f = Fixture::new();
+    let db = Board::open(&f.db).unwrap();
+    let root = db
+        .post("desk", "writer", "Handoff", &Default::default())
+        .unwrap()
+        .id;
+    let main = "Independent top-level note";
+    let reply = "Reply from the thread";
+    let mut cmd = f.command(json!([
+        {"t":0.12,"type":"tap","key":"nav-desk"},
+        {"t":0.32,"type":"tap","key":format!("thread-{root}")},
+        {"t":0.55,"type":"tap","key":"message-body"},{"t":0.75,"paste":reply},
+        {"t":0.98,"type":"tap","key":"feed-compose"},{"t":1.2,"type":"tap","key":"message-body"},
+        {"t":1.42,"paste":main},{"t":1.65,"type":"tap","key":"thread-compose"},
+        {"t":1.9,"type":"mark","name":"drafts-separated"},
+        {"t":2.45,"type":"tap","key":"message-body"},{"t":2.62,"type":"key","name":"End"},
+        {"t":2.85,"type":"key","shift":true,"name":"Enter"},{"t":3.05,"paste":"Second line"},
+        {"t":3.3,"type":"key","name":"Enter"},{"t":3.7,"type":"tap","key":"feed-compose"}
+    ]), DESKTOP, "4.15");
+    let scope = format!("thread:{root}");
+    let mut pending = None;
+    let sent = f.at_mark(&mut cmd, "drafts-separated", || {
+        pending = Some((
+            db.load_draft("reader", &scope),
+            db.load_draft("reader", "new"),
+            db.thread(root).unwrap().len(),
+        ));
+    });
+    let (thread_draft, root_draft, count) = pending.unwrap();
+    let thread_draft = thread_draft
+        .unwrap()
+        .expect("reply persisted on pane switch");
+    let root_draft = root_draft.unwrap().expect("root persisted on pane switch");
+    assert_eq!(count, 1, "switching pane published a draft");
+    assert_eq!(thread_draft.body, reply);
+    assert_eq!(
+        (
+            root_draft.body.as_str(),
+            root_draft.channel.as_str(),
+            root_draft.reply_to
+        ),
+        (main, "desk", None)
+    );
+    sent.expect_key("thread-pane");
+    sent.expect_key("thread-compose");
+    sent.expect_text(main);
+    let msgs = db.thread(root).unwrap();
+    assert_eq!(msgs.len(), 2);
+    assert_eq!(
+        (msgs[1].text.as_str(), msgs[1].re, msgs[1].reply_to),
+        ("Reply from the thread\nSecond line", Some(root), None)
+    );
+    assert!(db.load_draft("reader", &scope).unwrap().is_none());
+    assert_eq!(db.load_draft("reader", "new").unwrap().unwrap().body, main);
+    let restored = f.render(json!([]), DESKTOP, "0.5");
+    restored.expect_key("message-body");
+    restored.expect_text(main);
+    f.render(
+        json!([
+            {"t":0.15,"type":"tap","key":"message-body"},{"t":0.4,"type":"key","name":"Enter"}
+        ]),
+        DESKTOP,
+        "0.85",
+    );
+    let msgs = db.messages(&Filter::default(), 10).unwrap();
+    assert_eq!(msgs.len(), 3);
+    assert_eq!(
+        (
+            msgs[2].text.as_str(),
+            msgs[2].channel.as_str(),
+            msgs[2].re,
+            msgs[2].reply_to
+        ),
+        (main, "desk", None, None)
+    );
+    assert!(db.load_draft("reader", "new").unwrap().is_none());
 }
 
 #[test]
@@ -267,13 +702,14 @@ fn live_inspector_renders_task_and_observes_an_independent_writer() {
     let png = f.dir.path().join("live.png");
     let mut cmd = f.command(
         json!([
-            {"t":0.1,"type":"tap","key":"tasks-only"},
-            {"t":0.4,"type":"key","cmd":true,"name":"f"},
-            {"t":0.7,"type":"key","name":"Enter"},
-            {"t":0.9,"type":"mark","name":"opened"}
+            {"t":0.1,"type":"tap","key":"filter-messages"},
+            {"t":0.55,"type":"tap","key":"tasks-only"},
+            {"t":0.9,"type":"key","cmd":true,"name":"f"},
+            {"t":1.2,"type":"key","name":"Enter"},
+            {"t":1.45,"type":"mark","name":"opened"}
         ]),
         "900x660",
-        "3.2",
+        "4.1",
     );
     let t = f.at_mark(cmd.arg("--snap").arg(&png), "opened", || {
         change_task(
@@ -298,12 +734,16 @@ fn live_inspector_renders_task_and_observes_an_independent_writer() {
     for text in [
         "Verify the release",
         "ready",
-        "jules/lead",
+        task.owner.as_str(),
         "jules/review",
         "External writer checked in",
     ] {
         t.expect_text(text);
     }
+    assert!(
+        t.0.iter()
+            .any(|e| e["text"] == "lead" && e["help"] == "jules/lead")
+    );
     check_pixels(&png, (900, 660));
 }
 
@@ -366,7 +806,7 @@ fn older_pages_remain_browsable() {
         json!([
             {"t":0.1, "type":"key", "cmd":true, "name":"f"},
             {"t":0.4, "type":"key", "name":"ArrowDown"},
-            {"t":0.7, "type":"key", "name":"ArrowDown"},
+            {"t":0.7, "type":"key", "name":"ArrowUp"},
             {"t":1.0, "type":"key", "name":"Enter"}
         ]),
         "780x540",
@@ -445,8 +885,10 @@ fn metadata_revision_checked_edit_and_confirmed_tombstone() {
     );
     t.expect_key("conversation");
     t.expect_text("stage=verified");
-    t.expect_text("eyes 1 (reader)");
+    t.expect_key(&format!("reaction-{}-0", m.id));
+    t.expect_text("👀 1");
     let after = board.get(m.id).unwrap();
+    assert_eq!(after.reactions.get("eyes").unwrap(), &["reader"]);
     assert_eq!(after.text, "Edited **by owner**");
     assert!(after.revision > m.revision);
     let t = f.render(
@@ -630,21 +1072,21 @@ fn chronological_activity_and_profile_read_position_survive_restart() {
         )
         .unwrap();
     let t = f.render(
-        json!([{"t":0.1,"type":"tap","key":"activity"}]),
-        "850x680",
-        "0.4",
+        json!([{"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.55,"type":"tap","key":"activity"}]),
+        DESKTOP,
+        "1.0",
     );
     t.expect_key(&format!("activity-message-{}", root.id));
     t.expect_key(&format!("activity-message-{}", reply.id));
     t.expect_text("Reply in the stream");
     let t = f.render(
         json!([
-            {"t":0.1,"type":"tap","key":"activity"},
-            {"t":0.4,"type":"tap","key":"segment2"},
-            {"t":0.7,"type":"tap","key":"mark-read"}
+            {"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.55,"type":"tap","key":"activity"},
+            {"t":0.9,"type":"tap","key":"segment2"},
+            {"t":1.25,"type":"tap","key":"mark-read"}
         ]),
-        "850x680",
-        "1",
+        DESKTOP,
+        "1.65",
     );
     t.expect_text("0 unread");
     assert_eq!(b.activity_seen("reader").unwrap(), b.cursor().unwrap());
@@ -668,11 +1110,11 @@ fn chronological_activity_and_profile_read_position_survive_restart() {
         .unwrap();
     let t = f.render(
         json!([
-            {"t":0.1,"type":"tap","key":"activity"},
-            {"t":0.3,"type":"tap","key":"segment2"}
+            {"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.55,"type":"tap","key":"activity"},
+            {"t":0.9,"type":"tap","key":"segment2"}
         ]),
-        "850x680",
-        "0.7",
+        DESKTOP,
+        "1.3",
     );
     t.expect_text("1 unread");
     t.expect_text("Arrived after the mark");
@@ -681,11 +1123,11 @@ fn chronological_activity_and_profile_read_position_survive_restart() {
         .unwrap();
     let t = f.render(
         json!([
-            {"t":0.1,"type":"tap","key":"activity"},
-            {"t":0.3,"type":"tap","key":"segment2"}
+            {"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.55,"type":"tap","key":"activity"},
+            {"t":0.9,"type":"tap","key":"segment2"}
         ]),
-        "850x680",
-        "0.7",
+        DESKTOP,
+        "1.3",
     );
     t.expect_text("Message deleted");
     assert!(!t.0.iter().any(|e| e["text"] == "Arrived after the mark"));
@@ -710,7 +1152,7 @@ fn switching_profiles_keeps_composer_drafts_and_authorship_separate() {
             {"t":2.5,"type":"key","cmd":true,"name":"n"},
             {"t":2.8,"type":"key","cmd":true,"name":"Enter"}
         ]),
-        "880x690",
+        DESKTOP,
         "3.1",
     );
     t.expect_text("Personal notes");
@@ -740,12 +1182,13 @@ fn task_board_claims_and_completes_using_a_fenced_lease() {
             {"t":1.5,"type":"tap","key":"renew-task"},
             {"t":1.8,"type":"tap","key":"release-task"},
             {"t":2.1,"type":"tap","key":"claim-task"},
-            {"t":2.4,"type":"tap","key":"task-result"},
-            {"t":2.7,"paste":"Checks passed"},
-            {"t":3.0,"type":"tap","key":"complete-task"}
+            {"t":2.75,"type":"tap","key":"task-options"},
+            {"t":3.10,"type":"tap","key":"task-result"},
+            {"t":3.40,"paste":"Checks passed"},
+            {"t":3.70,"type":"tap","key":"complete-task"}
         ]),
-        "900x900",
-        "3.3",
+        DESKTOP,
+        "4.1",
     );
     t.expect_text("completed");
     t.expect_text("Checks passed");
@@ -762,14 +1205,14 @@ fn task_board_claims_and_completes_using_a_fenced_lease() {
         json!([
             {"t":0.1,"type":"tap","key":"tasks"},
             {"t":0.3,"type":"tap","key":"segment3"},
-            {"t":0.6,"type":"tap","key":format!("task-row-{}",task.id)},
-            {"t":0.9,"type":"tap","key":"task-thread"}
+            {"t":0.6,"type":"tap","key":format!("task-row-{}",task.id)}
         ]),
-        "850x680",
+        DESKTOP,
         "1.2",
     );
     t.expect_key("conversation");
-    t.expect_key("task-details");
+    t.expect_key("task-detail-scroll");
+    t.expect_text("Checks passed");
 }
 
 #[test]
@@ -858,11 +1301,11 @@ fn delegated_inspector_filters_reads_and_removes_contents_on_revocation() {
     let delegation = b
         .issue_credential("owner", "guest/view", None, None)
         .unwrap();
-    let mut cmd = f.command(json!([]), "870x690", "0.5");
+    let mut cmd = f.command(json!([]), DESKTOP, "0.5");
     let result = cmd.env("BOARD_TOKEN", &delegation.token).output().unwrap();
     assert!(result.status.success());
     let t = f.tree();
-    t.expect_text("guest/view");
+    t.expect_text("as guest/view");
     t.expect_text("Public thread");
     assert!(
         !t.0.iter()
@@ -872,7 +1315,7 @@ fn delegated_inspector_filters_reads_and_removes_contents_on_revocation() {
         json!([
             {"t":0.1,"type":"tap","key":"choose-profile"}
         ]),
-        "870x690",
+        DESKTOP,
         "0.5",
     );
     assert!(
@@ -890,7 +1333,7 @@ fn delegated_inspector_filters_reads_and_removes_contents_on_revocation() {
             {"t":0.1,"type":"tap","key":format!("thread-{}",allowed.id)},
             {"t":0.7,"type":"mark","name":"bound"}
         ]),
-        "870x690",
+        DESKTOP,
         "3.0",
     );
     let t = f.at_mark(cmd.env("BOARD_TOKEN", &delegation.token), "bound", || {
@@ -922,7 +1365,7 @@ fn owner_creates_grants_and_revokes_credentials_without_displaying_secrets() {
             {"t":1.3,"paste":"dev/=read,post"},
             {"t":1.5,"type":"tap","key":"save-resource"}
         ]),
-        "890x760",
+        DESKTOP,
         "1.8",
     );
     t.expect_text("Grant #1    reader/scan");
@@ -939,7 +1382,7 @@ fn owner_creates_grants_and_revokes_credentials_without_displaying_secrets() {
             {"t":0.9,"type":"tap","key":format!("remove-credential-{id}")},
             {"t":1.1,"type":"tap","key":format!("confirm-credential-{id}")}
         ]),
-        "890x760",
+        DESKTOP,
         "1.4",
     );
     t.expect_text("Revoked    reader/scan");
@@ -1089,7 +1532,7 @@ fn scoped_source_inbox_is_read_only_and_hides_raw_payloads_and_tokens() {
         {"t":0.1,"type":"tap","key":"workspace"},{"t":0.3,"type":"tap","key":"work-sources"}
     ]);
     let render = |steps: Value, end: &str| {
-        let mut cmd = f.command(steps, "880x770", end);
+        let mut cmd = f.command(steps, DESKTOP, end);
         let result = cmd.env("BOARD_TOKEN", &issued.token).output().unwrap();
         assert!(
             result.status.success(),
@@ -1314,7 +1757,7 @@ fn schema_examples_append_to_real_drafts_and_unsolved_shapes_offer_only_the_defi
         {"t":0.6,"type":"tap","key":"schema-approval-3"},{"t":0.9,"type":"tap","key":"copy-schema-example"},
         {"t":1.2,"type":"tap","key":"compose-schema-example"},{"t":1.5,"type":"tap","key":"send"}
     ]);
-    let t = f.render(steps, "900x820", "1.9");
+    let t = f.render(steps, DESKTOP, "1.9");
     let msgs = b.messages(&Filter::default(), 10).unwrap();
     assert_eq!(msgs.len(), 1);
     let m = &msgs[0];
@@ -1329,7 +1772,7 @@ fn schema_examples_append_to_real_drafts_and_unsolved_shapes_offer_only_the_defi
     let t = f.render(json!([
         {"t":0.2,"type":"tap","key":"workspace"},{"t":0.4,"type":"tap","key":"work-schemas"},
         {"t":0.6,"type":"tap","key":"schema-impossible-1"},{"t":0.9,"type":"tap","key":"copy-schema-definition"}
-    ]),"870x790","1.2");
+    ]),DESKTOP,"1.2");
     t.expect_key("copy-schema-definition");
     t.expect_text("No validated example available");
     assert!(
@@ -1662,7 +2105,7 @@ fn query_filters_replies_before_paging_and_separates_imported_origins() {
         {"t":1.5,"type":"tap","key":"filter-labels"},{"t":1.7,"paste":"stage=ready|review\nempty="},
         {"t":1.9,"type":"tap","key":"apply-filters"}
     ]);
-    let t = f.render(steps.clone(), "860x740", "2.2");
+    let t = f.render(steps.clone(), DESKTOP, "2.2");
     t.expect_text("Target thread");
     assert!(!t.0.iter().any(|e| {
         e["text"]
@@ -1670,8 +2113,9 @@ fn query_filters_replies_before_paging_and_separates_imported_origins() {
             .is_some_and(|s| s.starts_with("Distractor"))
     }));
     let mut activity = steps.as_array().unwrap().clone();
-    activity.push(json!({"t":2.3,"type":"tap","key":"activity"}));
-    let t = f.render(Value::Array(activity), "860x740", "2.6");
+    activity.push(json!({"t":2.3,"type":"tap","key":"filter-messages"}));
+    activity.push(json!({"t":2.5,"type":"tap","key":"activity"}));
+    let t = f.render(Value::Array(activity), DESKTOP, "2.8");
     t.expect_key(&format!("activity-message-{}", reply.id));
     assert!(
         !t.0.iter()
@@ -1684,7 +2128,7 @@ fn query_filters_replies_before_paging_and_separates_imported_origins() {
     let t=f.render(json!([
         {"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.3,"type":"tap","key":"filter-from"},
         {"t":0.5,"paste":"mirror"},{"t":0.7,"type":"tap","key":"apply-filters"}
-    ]),"860x740","1.0");
+    ]),DESKTOP,"1.0");
     t.expect_text("Imported activity");
     t.expect_key(&format!("thread-{}", imp.id));
     assert!(!t.0.iter().any(|e| e["text"] == "Target thread"));
@@ -1710,7 +2154,7 @@ fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
         {"t":0.5,"type":"tap","key":"edit-person"},{"t":0.7,"type":"key","cmd":true,"name":"a"},{"t":0.9,"paste":"Studio Reader"},
         {"t":1.1,"type":"tap","key":"person-handle"},{"t":1.3,"type":"key","cmd":true,"name":"a"},{"t":1.5,"paste":"studio-reader"},
         {"t":1.7,"type":"tap","key":"save-person"}
-    ]),"860x740","2.1");
+    ]),DESKTOP,"2.1");
     t.expect_text("Studio Reader");
     t.expect_text("Render worker");
     assert_eq!(
@@ -1723,7 +2167,7 @@ fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
             {"t":0.5,"type":"tap","key":"mention-person"},{"t":0.7,"paste":"shade"},
             {"t":0.9,"type":"key","name":"Enter"},{"t":1.1,"type":"key","cmd":true,"name":"Enter"}
         ]),
-        "860x740",
+        DESKTOP,
         "1.6",
     );
     t.expect_key("conversation");
@@ -1751,7 +2195,7 @@ fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
     let credential = b.issue_credential("reader", "guest", None, None).unwrap();
     let mut cmd=f.command(json!([
         {"t":0.1,"type":"tap","key":"choose-profile"},{"t":0.3,"type":"tap","key":"open-directory"}
-    ]),"860x740","0.6");
+    ]),DESKTOP,"0.6");
     assert!(
         cmd.env("BOARD_TOKEN", &credential.token)
             .output()
@@ -1811,7 +2255,7 @@ fn task_routing_filters_query_all_pages_and_pending_schedules_are_in_thread() {
         {"t":1.7,"type":"tap","key":"criteria-needs"},{"t":1.9,"paste":format!("#{}",prereq.id)},
         {"t":2.1,"type":"tap","key":"criteria-labels"},{"t":2.3,"paste":"batch=weekly|nightly"},
         {"t":2.5,"type":"tap","key":"apply-task-filters"}
-    ]),"900x820","2.8");
+    ]),DESKTOP,"2.8");
     t.expect_text("Filtered job");
     t.expect_key(&format!("task-row-{}", target.id));
     assert!(
@@ -1963,9 +2407,9 @@ fn recurring_composer_persists_stop_date_and_rejects_two_competing_stops() {
         {"t":1.1,"type":"key","name":"Backspace"},{"t":1.3,"type":"tap","key":"done-delivery"},
         {"t":1.6,"type":"tap","key":"send"}
     ]),"940x830","2.0");
-    t.expect_text("Schedules");
     let rows = board_local::automation::schedules(&b, true).unwrap();
     assert_eq!(rows.len(), 1);
+    t.expect_key(&format!("schedule-{}", rows[0].id));
     assert_eq!(rows[0].max_sends, None);
     assert_eq!(
         rows[0].until,
@@ -2267,3 +2711,6 @@ fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
         "the last decoded magenta frame must actually reach the Rune framebuffer"
     );
 }
+
+#[path = "inspector/sidebar.rs"]
+mod sidebar;

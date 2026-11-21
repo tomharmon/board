@@ -16,6 +16,53 @@ fn channel(row: &Row<'_>) -> rusqlite::Result<Channel> {
 }
 
 impl Board {
+    /// Private last-read message IDs; like the activity checkpoint, these are not board events.
+    pub fn channel_read_marks(
+        &self,
+        actor: &str,
+    ) -> Result<std::collections::BTreeMap<String, i64>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let access = self.access_on(&tx)?;
+        let key = access.private_key(actor)?;
+        let mut marks = std::collections::BTreeMap::new();
+        for row in tx
+            .prepare("SELECT channel,message FROM channel_seen WHERE actor=?")?
+            .query_map([key], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))?
+        {
+            let (name, id) = row?;
+            if access.allows(crate::access::Action::Read, &name) {
+                marks.insert(name, id);
+            }
+        }
+        tx.commit()?;
+        Ok(marks)
+    }
+
+    /// Record only positions the reader actually observed, not the head at click time.
+    pub fn mark_channels_read(&self, actor: &str, positions: &[(&str, i64)]) -> Result<()> {
+        if positions.is_empty() {
+            return Ok(());
+        }
+        self.write(|tx| {
+            let access = self.access_on(tx)?;
+            let key = access.private_key(actor)?;
+            let mut save = tx.prepare(
+                "INSERT INTO channel_seen(actor,channel,message)
+                SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM channels WHERE name=?2)
+                AND (?3=0 OR EXISTS(SELECT 1 FROM messages WHERE id=?3 AND channel=?2))
+                ON CONFLICT(actor,channel) DO UPDATE SET message=max(message,excluded.message)",
+            )?;
+            for &(channel, id) in positions {
+                access.require(crate::access::Action::Read, channel)?;
+                ensure!(
+                    save.execute(params![key, channel, id])? != 0,
+                    "invalid channel read position"
+                );
+            }
+            Ok(())
+        })
+    }
+
     pub fn channel(&self, name: &str) -> Result<Channel> {
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;

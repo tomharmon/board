@@ -109,7 +109,7 @@ fn preview(file: &Attachment, bytes: &[u8]) -> Preview {
     Preview::Other("No inline preview for this file type".into())
 }
 
-fn read_attachment(path: &Path) -> Result<(String, Vec<u8>)> {
+pub(super) fn read_attachment(path: &Path) -> Result<(String, Vec<u8>)> {
     let info = path
         .metadata()
         .with_context(|| format!("Open {}", path.display()))?;
@@ -218,14 +218,52 @@ impl State {
 
     pub fn pick_file(&mut self, tx: &mut Tx) {
         let page = self.page;
+        let actor = self.actor.clone();
+        let generation = std::sync::Arc::downgrade(&self.delivery.instance);
+        let (root, target, no_sync) = (self.edits_root(), self.reply_to, self.delivery.no_sync);
+        let channel = self.destination.text.clone();
         tx.open_file(
             FileDialogOptions {
                 title: "Attach file".into(),
                 ..Default::default()
             },
             move |s: &mut State, result, _| match result {
-                Ok(Some(path)) if s.page == page && s.properties.is_none() => {
-                    s.error = s.stage_files(&[path]).err().map(|e| format!("{e:#}"));
+                Ok(Some(path))
+                    if generation.upgrade().is_some()
+                        && s.page == page
+                        && !s.access_blocked
+                        && s.actor == actor
+                        && s.edits_root() == root
+                        && s.reply_to == target
+                        && (!root || s.destination.text == channel)
+                        && s.delivery.no_sync == no_sync
+                        && s.properties.is_none() =>
+                {
+                    let allowed = || -> Result<()> {
+                        if s.delegated {
+                            let db = s.db()?;
+                            db.activity_seen(&s.actor)?;
+                            let destination = if root {
+                                channel.trim().to_owned()
+                            } else if let Some(id) = page.thread_id() {
+                                db.get(target.unwrap_or(id))?.channel
+                            } else {
+                                anyhow::bail!("No active composer")
+                            };
+                            if !destination.is_empty() {
+                                ensure!(
+                                    db.explain(&actor, &destination)?
+                                        .contains(&board_local::access::Action::Post),
+                                    "Posting to this channel is no longer permitted"
+                                );
+                            }
+                        }
+                        Ok(())
+                    };
+                    s.error = allowed()
+                        .and_then(|()| s.stage_files(&[path]))
+                        .err()
+                        .map(|e| format!("{e:#}"));
                 }
                 Ok(Some(_)) => s.error = Some("Composer changed; file was not attached".into()),
                 Ok(None) => {}

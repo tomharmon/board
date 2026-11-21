@@ -58,7 +58,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
         return scroll("people-scroll", list);
     }
     list = list.child(
-        text_input(&d.query, TextStyle::new(14.0, 450.0))
+        text_input(&d.query, font(14.0, 450.0))
             .single_line()
             .key("person-query")
             .label("Find a person or agent")
@@ -67,7 +67,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
             .h(36.0)
             .padding(8.0)
             .border(1.0, c(EDGE))
-            .radius(5.0)
+            .radius(2.0)
             .on_edit(|s: &mut State| &mut s.people.query)
             .on_input_change(|s: &mut State, _| {
                 s.people.offset = 0;

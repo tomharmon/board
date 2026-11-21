@@ -2,12 +2,15 @@ use super::*;
 use workspace::field;
 
 pub(super) fn button() -> El {
-    action("filter-messages", "Filters", false).on_press_tx(State::show_filters)
+    tool("filter-messages", "Filter messages", &icons::LIST_FILTER).on_press_tx(State::show_filters)
 }
 
 pub(super) fn summary(s: &State) -> El {
     let f = &s.browse.filter;
     let mut terms = Vec::new();
+    if s.tasks_only {
+        terms.push("tasks only".into());
+    }
     if let Some(origin) = &f.from {
         terms.push(format!("From {origin}"));
     }
@@ -44,10 +47,44 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                 .w_full()
                 .center_y()
                 .gap(6.0)
-                .child(label("Message filters", 22.0, 630.0, INK).grow(1.0))
+                .child(label("Message filters", 14.0, 600.0, INK).grow(1.0))
                 .child(
                     tool("close-filters", "Close filters", &glyphs::CLOSE)
                         .on_press(|s: &mut State| s.browse.filter_open = false),
+                ),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(5.0)
+                .center_y()
+                .child(action("tasks-only", "tasks only", s.tasks_only).on_press(
+                    |s: &mut State| {
+                        s.tasks_only = !s.tasks_only;
+                        s.browse.filter_open = false;
+                        s.starts.clear();
+                        s.refresh();
+                    },
+                ))
+                .child(
+                    tool("search-toggle", "Search threads", &glyphs::SEARCH).on_press_tx(
+                        |s: &mut State, tx| {
+                            s.browse.filter_open = false;
+                            s.open_search(tx);
+                        },
+                    ),
+                )
+                .child(
+                    tool("jump-message", "Go to message ID", &glyphs::CURSOR_TEXT).on_press_tx(
+                        |s: &mut State, tx| {
+                            s.browse.filter_open = false;
+                            s.jump_field(tx);
+                        },
+                    ),
+                )
+                .child(
+                    action("activity", "activity history", false)
+                        .on_press(|s: &mut State| s.go(Page::Activity)),
                 ),
         )
         .child(field(

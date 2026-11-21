@@ -1,19 +1,12 @@
 use super::*;
 use rune::TextEdit;
+use rune_kit::Checkbox;
 
 pub(super) fn options(s: &State) -> El {
     let active = s.delivery.later || s.delivery.no_sync || !s.delivery.labels.text.is_empty();
-    tool(
-        "delivery-options",
-        "Delivery options",
-        if s.delivery.no_sync {
-            &glyphs::LOCK
-        } else {
-            &glyphs::FILE_TEXT
-        },
-    )
-    .fill(if active { c(TINT) } else { Color::TRANSPARENT })
-    .on_press(State::open_delivery)
+    tool("delivery-options", "Delivery options", &icons::TAG)
+        .fill(if active { c(TINT) } else { Color::TRANSPARENT })
+        .on_press(State::open_delivery)
 }
 fn input(
     key: &str,
@@ -22,7 +15,7 @@ fn input(
     multi: bool,
     bind: fn(&mut State) -> &mut TextEdit,
 ) -> El {
-    let mut field = text_input(value, TextStyle::new(14.0, 450.0))
+    let mut field = text_input(value, font(14.0, 450.0))
         .key(key)
         .label(label_)
         .w_full()
@@ -54,7 +47,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                 .w_full()
                 .center_y()
                 .gap(6.0)
-                .child(label("Delivery options", 22.0, 630.0, INK).grow(1.0))
+                .child(label("Delivery options", 15.0, 600.0, INK).grow(1.0))
                 .child(
                     tool("close-delivery", "Back to composer", &glyphs::CLOSE).on_press_tx(
                         |s: &mut State, tx| {
@@ -71,7 +64,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                     s.delivery.no_sync = !s.delivery.no_sync;
                     s.draft_changed();
                 })
-                .build(&Kit::neutral(false))
+                .build(&Kit::neutral(dark()))
                 .key("compose-no-sync"),
         )
         .child(input(
@@ -88,7 +81,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                     s.delivery.later = !s.delivery.later;
                     s.draft_changed();
                 })
-                .build(&Kit::neutral(false))
+                .build(&Kit::neutral(dark()))
                 .disabled(d.after.is_some())
                 .key("compose-later"),
         );

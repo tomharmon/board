@@ -59,29 +59,31 @@ fn mark_fences(m: &Message) -> (String, HashMap<String, usize>) {
     (display, tags)
 }
 
-fn structured(id: i64, index: usize, b: &Block, raw: bool) -> El {
+fn structured(prefix: &str, id: i64, index: usize, b: &Block, raw: bool) -> El {
     let mut panel = col()
-        .key(format!("block-{id}-{index}"))
+        .key(format!("{prefix}block-{id}-{index}"))
         .w_full()
-        .gap(6.0)
-        .py(6.0)
-        .pl(12.0)
-        .border_sides([0.0, 0.0, 0.0, 2.0], c("#729481"))
+        .max_w(640.0)
+        .gap(3.0)
+        .pb(6.0)
+        .border(1.0, c(EDGE))
         .child(
             row()
                 .w_full()
+                .h(26.0)
+                .pl(10.0)
                 .center_y()
                 .gap(8.0)
-                .child(icon(&glyphs::FILE_CODE, 16.0).color(c("#376345")))
+                .fill(c(PANEL))
                 .child(
-                    mono(format!("{}@{}", b.schema, b.version), "#376345")
+                    label(format!("{}@{}", b.schema, b.version), 12., 600., INK)
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate(),
                 )
                 .child(
                     tool(
-                        &format!("raw-{id}-{index}"),
+                        &format!("{prefix}raw-{id}-{index}"),
                         if raw { "Show fields" } else { "Show JSON" },
                         &glyphs::FILE_TEXT,
                     )
@@ -99,12 +101,13 @@ fn structured(id: i64, index: usize, b: &Block, raw: bool) -> El {
                 INK,
             )
             .w_full()
+            .px(10.0)
             .wrap_anywhere()
             .selectable(true),
         );
     } else if let Some(fields) = b.data.as_object() {
         if fields.is_empty() {
-            panel = panel.child(mono("{}", MUTED));
+            panel = panel.child(mono("{}", MUTED).px(10.));
         }
         for (name, value) in fields {
             let display = value
@@ -114,10 +117,11 @@ fn structured(id: i64, index: usize, b: &Block, raw: bool) -> El {
             panel = panel.child(
                 row()
                     .w_full()
+                    .px(10.0)
                     .gap(10.0)
                     .child(mono(name, MUTED).w(82.0).wrap_anywhere())
                     .child(
-                        label(display, 14.0, 460.0, INK)
+                        label(display, 12.0, 400.0, INK)
                             .grow(1.0)
                             .min_w(0.0)
                             .wrap_anywhere()
@@ -130,19 +134,29 @@ fn structured(id: i64, index: usize, b: &Block, raw: bool) -> El {
 }
 
 pub(super) fn body(s: &State, m: &Message) -> El {
+    scoped_body(s, m, "")
+}
+pub(super) fn scoped_body(s: &State, m: &Message, prefix: &'static str) -> El {
     if m.deleted || m.text.is_empty() {
-        return label(message_text(m), 15.0, 420.0, MUTED)
+        return label(message_text(m), 14.0, 400.0, MUTED)
             .w_full()
             .wrap_anywhere();
     }
-    let style = MarkdownStyle::neutral(false)
-        .text(c(INK))
+    let style = MarkdownStyle::neutral(dark())
+        .text(c(DIM))
         .muted(c(MUTED))
         .link(c(ACCENT))
         .rule(c(EDGE))
-        .body_font(TextStyle::new(15.0, 420.0).lh(21.0))
-        .heading_font(1, TextStyle::new(21.0, 650.0))
-        .heading_font(2, TextStyle::new(19.0, 620.0))
+        .body_font(font(13.6, 400.0).lh(21.0))
+        .heading_font(1, font(14.0, 600.0).lh(21.0))
+        .heading_font(2, font(14.0, 600.0).lh(21.0))
+        .heading_font(3, font(14.0, 600.0).lh(21.0))
+        .code_block_font(font(13., 400.).lh(19.5))
+        .code_block_padding(10., 10.)
+        .quote(c(EDGE), 2., 10., c(MUTED))
+        .list(20., 1.)
+        .inline_code_bg(c(PANEL))
+        .strong_weight(600.)
         .code_block(c(PANEL), c(EDGE));
     let md = if m.blocks.is_empty() {
         Markdown::new(&m.text)
@@ -159,7 +173,7 @@ pub(super) fn body(s: &State, m: &Message) -> El {
             let Some(i) = frame.language.and_then(|tag| tags.get(tag)).copied() else {
                 return code;
             };
-            structured(id, i, &blocks[i].0, blocks[i].1)
+            structured(prefix, id, i, &blocks[i].0, blocks[i].1)
         })
     };
     // No URL opener or image resolver: message content cannot make network or file requests.

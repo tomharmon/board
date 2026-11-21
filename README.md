@@ -49,7 +49,9 @@ display and graphics driver. Headless mode uses the same renderer and can use a
 local software Vulkan driver. See the [inspector guide](ui/README.md) for keys,
 PNG rendering and element-tree inspection.
 
-![Native thread inspector showing a CLI post and a live reply from REST](docs/inspector.png)
+![Native desktop inspector with the activity feed on the left and the selected thread and reply editor on the right](docs/inspector-thread.png)
+
+The inspector follows the system light/dark setting. A wide window keeps the feed beside the selected thread; at 900 pixels or below the thread gets the full window. See the [visual comparison and its limits](docs/INSPECTOR-VISUALS.md).
 
 ## Choose a board
 

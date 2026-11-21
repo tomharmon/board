@@ -1,6 +1,7 @@
 mod browse;
 mod drafts;
 mod files;
+mod layout;
 mod people;
 mod sources;
 mod templates;
@@ -9,6 +10,7 @@ mod workspace;
 pub use browse::{Browse, Position};
 pub use drafts::Delivery;
 pub use files::{AttachmentPreview, Preview};
+pub use layout::Layout;
 pub use people::People;
 pub use templates::SchemaPart;
 pub use video::Clip;
@@ -39,6 +41,19 @@ pub enum Page {
     Inbox,
     Profiles,
     People,
+}
+
+impl Page {
+    pub fn is_feed(self) -> bool {
+        matches!(self, Self::Feed | Self::Compose)
+    }
+
+    pub fn thread_id(self) -> Option<i64> {
+        match self {
+            Self::Thread(id) | Self::Task(id) => Some(id),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -96,7 +111,10 @@ pub struct State {
     pub page: Page,
     pub channel: Option<String>,
     pub channels: Vec<Channel>,
+    pub open_tasks: i64,
+    pub unread_channels: HashSet<String>,
     pub threads: Vec<ThreadSummary>,
+    pub activity_messages: Vec<Message>,
     pub thread: Vec<Message>,
     pub browse: Browse,
     pub people: People,
@@ -106,6 +124,8 @@ pub struct State {
     pub tasks_only: bool,
     pub destination: TextEdit,
     pub body: TextEdit,
+    root_editor_in_thread: bool,
+    pub inactive_draft: String,
     pub files: Files,
     pub reply_to: Option<i64>,
     pub properties: Option<Properties>,
@@ -117,6 +137,7 @@ pub struct State {
     pub starts: Vec<i64>,
     pub older: Option<i64>,
     pub nav: bool,
+    pub layout: Layout,
     version: i64,
     next_poll: f64,
 }
@@ -148,7 +169,10 @@ impl State {
             page: Page::Feed,
             channel: None,
             channels: Vec::new(),
+            open_tasks: 0,
+            unread_channels: HashSet::new(),
             threads: Vec::new(),
+            activity_messages: Vec::new(),
             thread: Vec::new(),
             browse: Browse::default(),
             people: People::default(),
@@ -158,6 +182,8 @@ impl State {
             tasks_only: false,
             destination: TextEdit::new("general"),
             body: TextEdit::new(""),
+            root_editor_in_thread: false,
+            inactive_draft: String::new(),
             files: Vec::new(),
             reply_to: None,
             properties: None,
@@ -168,11 +194,17 @@ impl State {
             starts: Vec::new(),
             older: None,
             nav: false,
+            layout: Layout::load(),
             version: -1,
             next_poll: 0.0,
         };
         if s.board.is_some() {
             s.refresh();
+            if !s.access_blocked
+                && let Err(e) = s.restore_draft()
+            {
+                s.error = Some(format!("Draft not available: {e:#}"));
+            }
         }
         s
     }
@@ -203,40 +235,78 @@ impl State {
         self.refresh();
     }
 
+    pub fn is_timeline(&self) -> bool {
+        self.channel.is_none()
+            && self.query.text.trim().is_empty()
+            && !self.browse.has_filters()
+            && !self.tasks_only
+            && !self.browse.search_open
+    }
+
     fn load(&mut self) -> Result<()> {
         let db = self.board.as_ref().context("Database is not open")?;
         // Sample before reading: a concurrent writer during the load forces another refresh.
         let version = db.data_version()?;
+        let mut hide_draft = false;
+        if self.delegated
+            && self.delivery.stamp.is_some()
+            && let Some(scope) = self.draft_scope()
+            && let Err(e) = db.load_draft(&self.actor, &scope)
+        {
+            use board_local::errors::{Kind, classify};
+            match classify(&e).0 {
+                Kind::Missing | Kind::Forbidden | Kind::Gone => hide_draft = true,
+                _ => return Err(e),
+            }
+        }
         let channels = db.channels()?;
+        let open_tasks = automation::open_task_count(db)?;
         let mut filter = self.browse.filter.clone();
-        filter.channel = if self.page == Page::Feed {
-            self.channel.clone()
-        } else {
-            None
-        };
+        let has_feed = self.page.is_feed() || matches!(self.page, Page::Thread(_));
+        let marks = db.channel_read_marks(&self.actor)?;
+        let mut opened = Vec::new();
+        let mut unread = HashSet::new();
+        for ch in &channels {
+            let last = ch.last.unwrap_or(0);
+            let viewing = has_feed
+                && self.channel.as_deref().is_some_and(|scope| {
+                    ch.name == scope || (scope.ends_with('/') && ch.name.starts_with(scope))
+                });
+            match marks.get(&ch.name) {
+                None => opened.push((ch.name.as_str(), last)),
+                Some(&seen) if seen < last && viewing => opened.push((ch.name.as_str(), last)),
+                Some(&seen) if seen < last => {
+                    unread.insert(ch.name.clone());
+                }
+                Some(_) => (),
+            }
+        }
+        db.mark_channels_read(&self.actor, &opened)?;
+        filter.channel = if has_feed { self.channel.clone() } else { None };
         filter.text =
             (!self.query.text.trim().is_empty()).then(|| self.query.text.trim().to_owned());
-        if self.tasks_only && self.page == Page::Feed {
+        if self.tasks_only && has_feed {
             filter.labels.insert("board.task".into(), String::new());
         }
-        let (threads, older) = if self.page == Page::Feed {
-            let mut window = db.threads_window(&filter, self.starts.last().copied(), 50)?;
-            window.rows.reverse();
-            (window.rows, window.older)
+        let before = self.starts.last().copied();
+        let (threads, activity_messages, older) = if has_feed && self.is_timeline() {
+            let window = db.messages_window(&filter, before, 50)?;
+            (Vec::new(), window.rows, window.older)
+        } else if has_feed {
+            let window = db.threads_window(&filter, before, 50)?;
+            (window.rows, Vec::new(), window.older)
         } else {
-            (Vec::new(), None)
+            (Vec::new(), Vec::new(), None)
         };
-        let thread = match self.page {
-            Page::Thread(id) => self.browse.read_thread(db, id)?,
-            _ => Vec::new(),
-        };
-        let typing = match self.page {
-            Page::Thread(id) => db
-                .typing(id)?
-                .into_iter()
-                .filter(|t| t.actor != self.actor)
-                .collect(),
-            _ => Vec::new(),
+        let (thread, typing) = match self.page.thread_id() {
+            Some(id) => (
+                self.browse.read_thread(db, id)?,
+                db.typing(id)?
+                    .into_iter()
+                    .filter(|t| t.actor != self.actor)
+                    .collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
         };
         self.desk
             .load(db, &self.actor, self.page, self.delegated, &filter)?;
@@ -249,9 +319,25 @@ impl State {
         }
         self.version = version;
         self.channels = channels;
+        self.open_tasks = open_tasks;
+        self.unread_channels = unread;
         self.threads = threads;
+        self.activity_messages = activity_messages;
         self.older = older;
         self.thread = thread;
+        self.inactive_draft = if let Page::Thread(root) = self.page {
+            let other = if self.root_editor_in_thread {
+                format!("thread:{root}")
+            } else {
+                "new".into()
+            };
+            db.load_draft(&self.actor, &other)
+                .ok()
+                .flatten()
+                .map_or_else(String::new, |d| d.body)
+        } else {
+            String::new()
+        };
         if let Some(p) = &mut self.properties {
             p.deliveries = db.message_deliveries(&self.actor, p.id)?;
         }
@@ -263,6 +349,9 @@ impl State {
             self.preview = None;
         }
         self.typing = typing;
+        if hide_draft {
+            self.hide_unavailable_draft();
+        }
         Ok(())
     }
 
@@ -270,7 +359,11 @@ impl State {
         if let Err(e) = self.load() {
             self.access_blocked = self.delegated;
             self.channels.clear();
+            self.open_tasks = 0;
+            self.unread_channels.clear();
             self.threads.clear();
+            self.activity_messages.clear();
+            self.inactive_draft.clear();
             self.thread.clear();
             self.browse.schedules.clear();
             self.preview = None;
@@ -285,26 +378,76 @@ impl State {
     }
 
     pub fn select(&mut self, channel: Option<String>) {
+        // A populated draft keeps its explicit destination when the user browses away.
+        if self.page.is_feed()
+            && self.body.text.is_empty()
+            && self.files.is_empty()
+            && self.delivery.stamp.is_none()
+        {
+            self.destination = TextEdit::new(
+                channel
+                    .as_deref()
+                    .unwrap_or("general")
+                    .trim_end_matches('/'),
+            );
+        }
         self.channel = channel;
         self.query.clear();
+        self.browse.search_open = false;
         self.starts.clear();
         self.go(Page::Feed);
     }
 
+    pub fn open_search(&mut self, tx: &mut Tx) {
+        if !self.page.is_feed() {
+            self.go(Page::Feed);
+        }
+        if self.page.is_feed() {
+            self.browse.search_open = true;
+            self.starts.clear();
+            self.refresh();
+            tx.focus_when_shown("search", true);
+        }
+    }
+
+    pub fn close_search(&mut self) {
+        self.query.clear();
+        self.browse.search_open = false;
+        self.starts.clear();
+        self.refresh();
+    }
+
+    pub fn close_thread(&mut self, tx: &mut Tx) {
+        let Page::Thread(id) = self.page else {
+            return;
+        };
+        // Selecting another row in the same feed replaces the detail; close dismisses all of it.
+        let previous = self
+            .history
+            .iter()
+            .rposition(|p| !matches!(p, Page::Thread(_)));
+        if self.return_to(previous) {
+            tx.focus_when_shown(format!("thread-{id}"), true);
+        }
+    }
+
     pub fn go(&mut self, page: Page) {
         let mut draft_warning = None;
+        if self.page != page
+            && let Err(e) = self.flush_draft()
+        {
+            self.error = Some(format!("Draft not saved: {e:#}"));
+            self.delivery.open = true;
+            return;
+        }
         self.properties = None;
         self.preview = None;
         self.browse.jump_open = false;
         self.browse.filter_open = false;
         self.people = People::default();
         if self.page != page {
-            if let Err(e) = self.flush_draft() {
-                self.error = Some(format!("Draft not saved: {e:#}"));
-                self.delivery.open = true;
-                return;
-            }
             self.clear_typing();
+            self.root_editor_in_thread = false;
             self.history.push(self.page);
             if self.history.len() > 64 {
                 self.history.remove(0);
@@ -320,7 +463,7 @@ impl State {
                     .unwrap_or("general")
                     .trim_end_matches('/'),
             );
-            self.desk.enter(page);
+            self.desk.enter_from(self.page, page);
             self.browse.reset_thread();
             self.page = page;
             if let Err(e) = self.restore_draft() {
@@ -336,16 +479,29 @@ impl State {
     }
 
     pub fn back(&mut self) {
-        let page = self.history.pop().unwrap_or(Page::Feed);
-        let history = std::mem::take(&mut self.history);
+        self.return_to(self.history.len().checked_sub(1));
+    }
+
+    fn return_to(&mut self, previous: Option<usize>) -> bool {
+        let mut history = std::mem::take(&mut self.history);
+        let page = previous.map_or(Page::Feed, |i| history[i]);
         self.go(page);
+        let arrived = self.page == page;
+        if arrived {
+            history.truncate(previous.unwrap_or(0));
+        }
         self.history = history;
+        arrived
     }
 
     pub fn star(&mut self, id: i64, remove: bool) {
+        self.toggle_named_reaction(id, "star", remove);
+    }
+
+    pub fn toggle_named_reaction(&mut self, id: i64, name: &str, remove: bool) {
         match self
             .db()
-            .and_then(|db| db.react(id, &self.actor, "star", remove))
+            .and_then(|db| db.react(id, &self.actor, name, remove))
         {
             Ok(_) => {
                 self.error = None;
@@ -356,7 +512,12 @@ impl State {
     }
 
     pub fn note_typing(&mut self) {
-        let Page::Thread(id) = self.page else { return };
+        if self.edits_root() {
+            return;
+        }
+        let Some(id) = self.page.thread_id() else {
+            return;
+        };
         if self.body.text.trim().is_empty() {
             self.clear_typing();
             return;
@@ -533,13 +694,9 @@ impl State {
             .thread
             .first()
             .and_then(|m| m.task.as_ref())
-            .or_else(|| {
-                self.desk
-                    .tasks
-                    .iter()
-                    .find(|t| t.lease_until.is_some_and(|until| until <= wall))
-            })
-            && task.lease_until.is_some_and(|until| until <= wall)
+            .into_iter()
+            .chain(&self.desk.tasks)
+            .find(|t| t.lease_until.is_some_and(|until| until <= wall))
         {
             match automation::get_task(db, task.id) {
                 Ok(_) => self.refresh(),

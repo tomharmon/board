@@ -749,6 +749,21 @@ pub fn list_tasks(board: &Board, channel: Option<&str>, state: Option<&str>) -> 
     Ok(tasks_page(board, channel, state, 0, usize::MAX)?.1)
 }
 
+const OPEN_STATES: &str = "t.state NOT IN ('completed','failed','canceled')";
+
+/// The sidebar count does not load rows or claim tokens; an expiring lease is still open.
+pub fn open_task_count(board: &Board) -> Result<i64> {
+    let tx = board.conn.unchecked_transaction()?;
+    let access = board.access_on(&tx)?;
+    let (visible, bind) = crate::read::visible_predicate(&tx, &access, &crate::Filter::default())?;
+    let sql = format!(
+        "SELECT count(*) FROM tasks t JOIN messages m ON m.id=t.id WHERE {visible} AND {OPEN_STATES}"
+    );
+    let n = tx.query_row(&sql, rusqlite::params_from_iter(bind), |r| r.get(0))?;
+    tx.commit()?;
+    Ok(n)
+}
+
 /// Oldest task roots first. `after` is exclusive; the first return value is the snapshot's event head.
 pub fn tasks_page(
     board: &Board,
@@ -856,7 +871,8 @@ pub fn filtered_tasks_page_as(
         format!("SELECT t.id FROM tasks t JOIN messages m ON m.id=t.id WHERE {predicate}");
     match state {
         None | Some("open") => {
-            sql.push_str(" AND t.state NOT IN ('completed','failed','canceled')")
+            sql.push_str(" AND ");
+            sql.push_str(OPEN_STATES);
         }
         Some("all") => (),
         Some(state) => {

@@ -13,7 +13,7 @@ fn provider(p: &Provider) -> &'static str {
 pub(super) fn view(s: &State) -> El {
     let source = &s.desk.source;
     if s.page == Page::Sources {
-        let mut rows = col().w_full().gap(10.0).child(heading("Sources", None));
+        let mut rows = col().w_full().gap(2.0).child(mono("sources", FAINT));
         if source.list.is_empty() {
             rows = rows.child(empty("No visible sources"));
         }
@@ -42,8 +42,14 @@ pub(super) fn view(s: &State) -> El {
     };
     let mut panel = col()
         .w_full()
-        .gap(12.0)
-        .child(heading(&config.name, None))
+        .gap(5.0)
+        .child(heading(
+            &config.name,
+            Some(
+                action("source-list", "all sources", false)
+                    .on_press(|s: &mut State| s.go(Page::Sources)),
+            ),
+        ))
         .child(
             mono(
                 format!(
@@ -93,9 +99,9 @@ pub(super) fn view(s: &State) -> El {
         ));
         if Some(id) == source.expanded {
             if job.state == "uncertain" {
-                panel = panel.child(label("External outcome unknown", 14.0, 600.0, ACCENT));
+                panel = panel.child(label("External outcome unknown", 12.0, 500.0, ACCENT));
             } else if job.error_recorded {
-                panel = panel.child(label("Delivery error recorded", 14.0, 600.0, ACCENT));
+                panel = panel.child(label("Delivery error recorded", 12.0, 500.0, ACCENT));
             }
             if let Some(local) = job.local {
                 panel = panel.child(
