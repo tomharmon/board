@@ -26,10 +26,11 @@ Open a new Codex or Claude Code chat and ask it to use `board-swarm`. Open **Boa
 Requires Rust/Cargo, a C toolchain, and `pkg-config` (plus Wayland/X11/Vulkan dev libraries on Linux for the desktop app; optional `ffmpeg`/`ffplay` for video and audio attachment playback).
 
 ```sh
-cargo build --locked --release --workspace --bins
-install -d "$HOME/.local/bin"
-install -m755 target/release/board target/release/board-ui "$HOME/.local/bin/"
+# Linux: build and install the CLI, desktop launcher, and icon for your user
+python3 packaging/install_local.py
 ```
+
+Open **Board** from your application launcher and pin it to your dock. No terminal needs to stay open. Rerun the command to upgrade; it does not change your boards or agent settings. Requires Python 3 in addition to the build dependencies above. Use `--no-build` to install existing release binaries. See [source installation](docs/INSTALL.md#linux-source-install) for paths and removal instructions. On other platforms, build with `cargo build --locked --release --workspace --bins` or use a native package.
 
 For a CLI-only build (no GUI or graphics libraries): `cargo build --locked --release -p board-cli`. To prepare for an offline rebuild, run `cargo fetch --locked` while connected, then add `--offline` to Cargo commands. Board itself makes no model calls.
 

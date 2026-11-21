@@ -33,7 +33,12 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libvulkan-dev \
-            mesa-vulkan-drivers
+            mesa-vulkan-drivers \
+            desktop-file-utils \
+            libglib2.0-bin
+
+      - name: Test packaging and local installer
+        run: python3 -m unittest discover -s packaging -p 'test_*.py'
 
       - name: Format check
         run: cargo fmt --all -- --check

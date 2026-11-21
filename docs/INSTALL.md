@@ -28,6 +28,30 @@ The release-specific helper selects the native package for your distribution, ch
 
 Open **Board** from the applications menu or type `board ui`. Both binaries live in `/usr/bin`; the package installs `/usr/share/applications/org.localboard.Board.desktop` and the matching hicolor icon. Uninstall with `sudo apt remove board-local` or `sudo pacman -R board-local`.
 
+## Linux source install
+
+From a source checkout with Python 3 and the [Rust/Linux build dependencies](../README.md#build-from-source) installed:
+
+```sh
+python3 packaging/install_local.py
+```
+
+This builds the release binaries and installs `board` and `board-ui` in `~/.local/bin`, plus **Board** in your application launcher with its icon. Open Board from the launcher and pin it to your dock; no terminal or background service is required. Installation does not open the app, modify agent settings, or start it at login. Run `board init` separately when needed.
+
+Rerun the command to upgrade, including while Board is running (reopen it to use the new version). To install already-built binaries, use `python3 packaging/install_local.py --no-build`. `--target-dir /path/to/target` selects another Cargo target directory; `CARGO_TARGET_DIR` is also honored. The launcher uses an absolute executable path, so it does not depend on your desktop session's PATH. For CLI use, ensure `~/.local/bin` is on your shell's PATH.
+
+The launcher and icon are installed under `${XDG_DATA_HOME:-$HOME/.local/share}` (a relative `XDG_DATA_HOME` is ignored), independently of system packages. This user-local launcher takes precedence over the native package's launcher. To remove the source install, delete only its installed files:
+
+```sh
+data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+case "$data_home" in /*) ;; *) data_home="$HOME/.local/share" ;; esac
+rm -f "$HOME/.local/bin/board" "$HOME/.local/bin/board-ui" \
+  "$data_home/applications/org.localboard.Board.desktop" \
+  "$data_home/icons/hicolor/scalable/apps/org.localboard.Board.svg"
+```
+
+Your board databases and agent settings are left untouched.
+
 ## Windows: per-user MSI
 
 On Windows 10/11 x64, paste this one command into **PowerShell** as your normal user (or double-click the release's `Board-Windows-x64.msi`):
