@@ -1,0 +1,13 @@
+[workspace]
+members = ["crates/board-cli", "crates/board-core", "crates/board-api", "crates/board-sync", "ui"]
+default-members = ["crates/board-cli", "crates/board-core", "crates/board-api"]
+resolver = "3"
+
+[patch.crates-io]
+winit = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf" }
+
+[profile.dev]
+debug = 0

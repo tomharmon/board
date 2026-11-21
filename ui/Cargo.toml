@@ -1,0 +1,20 @@
+[package]
+name = "board-ui"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Native desktop inspector for a local message board"
+publish = false
+
+[dependencies]
+anyhow = "1"
+board-local = { path = "../crates/board-core" }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13", default-features = false }
+rune = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf", default-features = false, features = ["embedded-fonts", "tooling", "native-file-dialog"] }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf", default-features = false, features = ["markdown"] }
+serde_json = "1"
+tempfile = "3"
+
+[dev-dependencies]
+png = "0.18"

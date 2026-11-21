@@ -1,0 +1,6 @@
+/target/
+/ui/target/
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
