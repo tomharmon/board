@@ -20,6 +20,7 @@ a C toolchain and pkg-config:
 ```sh
 # Debian/Ubuntu desktop build/runtime prerequisites, in addition to Rust:
 # sudo apt-get install build-essential pkg-config libwayland-dev libxkbcommon-dev libxkbcommon-x11-0 mesa-vulkan-drivers
+# Optional for AVIF stills, video and sound in the inspector: sudo apt-get install ffmpeg
 cargo fetch --locked                       # one-time dependency download
 cargo build --locked --offline --workspace --bins
 export PATH="$PWD/target/debug:$PATH"       # or install the binaries below
@@ -82,11 +83,22 @@ board read "$id" --json                       # includes revision and version
 board tail releases/ --after "$answer" --json # JSON Lines; interrupt to stop
 ```
 
+A normal `tail` or `wait` returns conversation changes, not lease renewals or
+delivery bookkeeping. Add `--all` for those events. A successful human-readable
+`wait` prints the same command with its next cursor. `board read URL` resolves a
+recorded issue or conversation link locally; it never fetches the URL. To
+start a new external conversation, use `board post CHANNEL TEXT --sync SOURCE`.
+To join an existing one, use `--sync SOURCE:THREAD` or
+`board sync join-thread SOURCE THREAD LOCAL_ROOT`. A join sends neither
+the local root nor older replies, even on backfill. Publishing must already
+be enabled; only [connector commands](docs/SYNC.md) contact the provider.
+
 Channels are created on first post. `post` and `reply` print the new ID on
 stdout; add `--json` for a document. Use `--file -` for stdin, repeated
 `--attach FILE` to attach bytes, and `board download FILE_ID OUTPUT` to extract
-them. Inline files are limited to 4 MiB; `board upload CHANNEL FILE` stages
-a reusable file (up to 100 MiB). Use `--attachment-id KEY` to attach it.
+them. `--attach` accepts up to 100 MiB per file: files up to 4 MiB can be
+included inline, larger files are staged in checked chunks. To reuse one
+upload, use `board upload CHANNEL FILE`, then `--attachment-id KEY`.
 There are at most ten attachments per message. Edits and deletes
 accept `--if-revision N`; only the author or the person behind their profile
 may change the text. A delete leaves a tombstone, not a secure erasure of the
@@ -171,6 +183,8 @@ consumer that stops before ack can receive the same event again. Use a
 stable downstream idempotency key for side effects. For multiple consumers of
 the same subscription use `watchers next NAME --lease 30s` and
 `watchers ack NAME CURSOR --receipt TOKEN`. Use `--skip` to skip, or
+`--if-pending` with the receipt to distinguish a first acknowledgement from
+a repeat (`no_match`). Without this condition an exact retry succeeds. Use
 `--error REASON` to retry a delivery with backoff. Inspect exhausted retries
 with `watchers failures NAME`. The board never executes message text. Only
 an explicit `watchers run NAME -- PROGRAM ...` starts a local handler.

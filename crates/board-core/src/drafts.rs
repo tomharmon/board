@@ -22,6 +22,30 @@ pub struct ComposerSettings {
     #[serde(skip_serializing_if = "String::is_empty")]
     pub until: String,
     pub labels: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskDraftSettings>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TaskDraftSettings {
+    pub needs: String,
+    pub assignee: String,
+}
+impl TaskDraftSettings {
+    pub fn parsed_needs(&self) -> Result<Vec<i64>> {
+        self.needs
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.trim_start_matches('#')
+                    .parse::<i64>()
+                    .ok()
+                    .filter(|id| *id > 0)
+                    .context("Prerequisites must be positive task IDs")
+            })
+            .collect()
+    }
 }
 impl ComposerSettings {
     pub fn parsed_labels(&self) -> Result<BTreeMap<String, String>> {
@@ -63,6 +87,9 @@ pub struct SavedComposer {
     pub settings: ComposerSettings,
     pub files: Vec<(String, Vec<u8>)>,
     pub stamp: String,
+}
+pub(crate) fn root_scope(scope: &str, channel: &str) -> bool {
+    scope == "new" || scope.strip_prefix("channel:") == Some(channel)
 }
 pub(crate) fn init(c: &Connection) -> Result<()> {
     c.execute_batch("CREATE TABLE IF NOT EXISTS composer_settings(actor TEXT NOT NULL,scope TEXT NOT NULL,
@@ -141,6 +168,23 @@ impl Board {
         tx.commit()?;
         Ok(saved)
     }
+    pub(crate) fn composer_settings_on(
+        &self,
+        c: &Connection,
+        actor: &str,
+        scope: &str,
+    ) -> Result<ComposerSettings> {
+        let key = self.composer_key(c, actor, scope)?;
+        let saved: String = c
+            .query_row(
+                "SELECT settings FROM composer_settings WHERE actor=? AND scope=?",
+                [&key, scope],
+                |r| r.get(0),
+            )
+            .optional()?
+            .context(conflict())?;
+        Ok(serde_json::from_str(&saved)?)
+    }
     /// Only supply files after the attachment queue changes; editing one character does not rewrite BLOBs.
     pub fn save_composer(
         &self,
@@ -163,11 +207,15 @@ impl Board {
             };
             ensure!(d.body.encode_utf16().count() <= 10_000 && !d.body.contains('\0'), "draft exceeds message limits");
             let access = self.access_on(tx)?;
+            ensure!(scope.strip_prefix("channel:").is_none_or(|channel| channel == d.channel),
+                Kind::Invalid.error("invalid_draft", "draft destination differs from its channel"));
             if !d.channel.is_empty() {
                 validate_channel(&d.channel)?;
                 access.require(Action::Post, &d.channel)?;
             }
             ensure!(!settings.later || settings.after.is_none(), "A guarded reply cannot be scheduled");
+            ensure!(settings.task.is_some() == (scope == "tasks"), "Task routing belongs to a task draft");
+            ensure!(settings.task.is_none() || (!settings.later && settings.after.is_none() && settings.due.is_empty() && settings.every.is_empty() && settings.times.is_empty() && settings.until.is_empty()), "Task drafts cannot be scheduled or reply-guarded");
             for id in [d.reply_to.or(self.draft_scope(tx, actor, scope)?), settings.after].into_iter().flatten() {
                 let channel = access.message(tx, id, Action::Read)?;
                 let root: i64 = tx.query_row(

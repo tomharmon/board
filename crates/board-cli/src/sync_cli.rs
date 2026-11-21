@@ -144,6 +144,13 @@ pub enum Sync {
         #[arg(value_parser=crate::parse_id)]
         root: i64,
     },
+    /// Join an existing provider thread locally. Only replies posted after the join may be delivered.
+    JoinThread {
+        name: String,
+        thread: String,
+        #[arg(value_parser=crate::parse_id)]
+        root: i64,
+    },
     /// Queue previously unshared local replies in an already linked thread.
     Backfill { name: String, thread: String },
     /// Fetch selected conversations from the provider. Omit THREAD for the configured repo/channel/team.
@@ -173,7 +180,7 @@ pub enum Sync {
         #[arg(long, default_value_t = 500)]
         limit: usize,
     },
-    /// Record a verified external copy or explicitly join a local root to an external thread.
+    /// Record an operator-verified external message copy, not just a conversation link.
     Link {
         name: String,
         thread: String,
@@ -191,6 +198,13 @@ pub enum Sync {
     },
     /// Find a local message by a previously recorded provider permalink.
     Linked { name: String, url: String },
+    /// Find a readable local message and its thread from a permalink, without going online.
+    Locate { url: String },
+    /// Show public copy addresses and delivery states for one readable message.
+    Targets {
+        #[arg(value_parser=crate::parse_id)]
+        message: i64,
+    },
     Copies {
         name: String,
         #[arg(value_parser=crate::parse_id)]
@@ -504,6 +518,12 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
             let j = b.start_source_thread(a, &name, root)?;
             print(&j, js, || format!("delivery {}: {}", j.id, j.state))
         }
+        Sync::JoinThread { name, thread, root } => {
+            let (link, _) = b.join_source_thread(a, &name, &thread, root)?;
+            print(&link, js, || {
+                format!("thread #{root} linked to {name}:{}", link.thread)
+            })
+        }
         Sync::Backfill { name, thread } => {
             let n = b.backfill_source(a, &name, &thread)?;
             print(&json!({"queued":n}), js, || {
@@ -615,6 +635,32 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
                     .error("source_not_found", "no recorded permalink")
             })?;
             print(&m, js, || m.id.to_string())
+        }
+        Sync::Locate { url } => {
+            let found = b.locate_link(&url)?;
+            print(&found, js, || found.message.to_string())
+        }
+        Sync::Targets { message } => {
+            let found = b.sync_targets(message)?;
+            print(&found, js, || {
+                if found.targets.is_empty() {
+                    return "No sync targets".into();
+                }
+                found
+                    .targets
+                    .iter()
+                    .map(|t| {
+                        format!(
+                            "{}  {}  {}  {}",
+                            t.source,
+                            t.thread.as_deref().unwrap_or(&t.target),
+                            t.state,
+                            t.url.as_deref().or(t.external.as_deref()).unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
         }
         Sync::Copies { name, message } => {
             let x = b.source_copies(a, &name, message)?;

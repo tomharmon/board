@@ -3,11 +3,13 @@ pub mod access;
 mod actors;
 pub use actors::{ActorEntry, Draft, MentionActor, MentionResolution};
 mod drafts;
-pub use drafts::{ComposerSettings, SavedComposer};
+pub use drafts::{ComposerSettings, SavedComposer, TaskDraftSettings};
 mod files;
 mod prose;
 pub mod reactions;
-pub use files::{MAX_DIRECT_BYTES, Upload, content_type_for};
+pub use files::{
+    MAX_DIRECT_BYTES, Upload, content_type_for, valid_name as validate_attachment_name,
+};
 pub mod automation;
 mod backup;
 mod core;
@@ -25,3 +27,4 @@ pub use core::*;
 pub use read::*;
 pub use schemas::{Block, Schema};
 pub mod policy;
+mod projections;

@@ -524,6 +524,39 @@ fn delegated_watchers_use_private_names_and_recheck_both_registered_and_pulling_
     assert!(ack_delivery(&aonly, "jobs", b.id, Some(&d.receipt)).is_err());
     assert_eq!(next_event(&aonly, "jobs")?.unwrap().cursor, a.id);
     ack_event(&aonly, "jobs", a.id)?;
+    let completed = owner.post(
+        "work/b",
+        "human",
+        "settled while visible",
+        &Default::default(),
+    )?;
+    let finished = lease_event(&ada, "jobs", 60)?.unwrap();
+    assert_eq!(finished.event.cursor, completed.id);
+    let prove = |db: &Board, id| {
+        settle_delivery_if(
+            db,
+            "jobs",
+            id,
+            Some(&finished.receipt),
+            DeliveryOutcome::Ack,
+            true,
+        )
+    };
+    prove(&ada, completed.id)?;
+    assert_eq!(
+        classify(&prove(&ada, completed.id).unwrap_err()).1,
+        "no_match"
+    );
+    let masked = prove(&aonly, completed.id).unwrap_err();
+    assert_eq!(classify(&masked).1, "delivery_conflict");
+    assert_eq!(
+        masked.to_string(),
+        prove(&aonly, hidden.id).unwrap_err().to_string()
+    );
+    assert_eq!(
+        masked.to_string(),
+        prove(&bo, completed.id).unwrap_err().to_string()
+    );
     owner.set_grant(
         "owner",
         Some(grant.id),
@@ -531,6 +564,10 @@ fn delegated_watchers_use_private_names_and_recheck_both_registered_and_pulling_
         &Rules::parse("work/a=read,post")?,
     )?;
     assert!(ack_delivery(&ada, "jobs", b.id, Some(&d.receipt)).is_err());
+    assert_eq!(
+        masked.to_string(),
+        prove(&ada, completed.id).unwrap_err().to_string()
+    );
     Connection::open(&db)?.execute(
         "UPDATE watcher_queue SET lease_until=0 WHERE cursor=?",
         [b.id],

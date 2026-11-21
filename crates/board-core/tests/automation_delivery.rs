@@ -17,6 +17,86 @@ fn due() -> Timing {
 }
 
 #[test]
+fn conditional_ack_has_one_winner_and_only_its_proof_can_report_no_match_after_reopen() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("acks.db");
+    let b = Board::open(&path)?;
+    add_watcher(&b, "w", Filter::default(), Some("message.posted"))?;
+    b.post("public", "sam", "First", &Default::default())?;
+    let offered = lease_event(&b, "w", 60)?.unwrap();
+    let cursor = offered.event.cursor;
+    let proof = offered.receipt;
+    let head = b.cursor()?;
+    let gate = Arc::new(Barrier::new(2));
+    let workers = [Board::open(&path)?, Board::open(&path)?]
+        .into_iter()
+        .map(|db| {
+            let gate = gate.clone();
+            let proof = proof.clone();
+            thread::spawn(move || {
+                gate.wait();
+                settle_delivery_if(&db, "w", cursor, Some(&proof), DeliveryOutcome::Ack, true)
+                    .map(|_| "ok")
+                    .unwrap_or_else(|e| board_local::errors::classify(&e).1)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut results = workers
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .collect::<Vec<_>>();
+    results.sort();
+    assert_eq!(results, ["no_match", "ok"]);
+    drop(b);
+    let b = Board::open(&path)?;
+    let strict = |cursor, proof: Option<&str>| {
+        settle_delivery_if(&b, "w", cursor, proof, DeliveryOutcome::Ack, true)
+    };
+    assert_eq!(
+        board_local::errors::classify(&strict(cursor, Some(&proof)).unwrap_err()).1,
+        "no_match"
+    );
+    let wrong = strict(cursor, Some("another proof")).unwrap_err();
+    let absent = strict(cursor + 1000, Some(&proof)).unwrap_err();
+    assert_eq!(board_local::errors::classify(&wrong).1, "delivery_conflict");
+    assert_eq!(wrong.to_string(), absent.to_string());
+    assert_eq!(
+        board_local::errors::classify(&strict(cursor, None).unwrap_err()).1,
+        "receipt_required"
+    );
+    ack_delivery(&b, "w", cursor, Some(&proof))?;
+    assert_eq!(b.cursor()?, head);
+    assert!(lease_event(&b, "w", 60)?.is_none());
+
+    b.post("public", "sam", "Retryable", &Default::default())?;
+    let d = lease_event(&b, "w", 60)?.unwrap();
+    settle_delivery_if(
+        &b,
+        "w",
+        d.event.cursor,
+        Some(&d.receipt),
+        DeliveryOutcome::Error("retry"),
+        true,
+    )?;
+    assert_eq!(
+        board_local::errors::classify(&strict(d.event.cursor, Some(&d.receipt)).unwrap_err()).1,
+        "delivery_conflict"
+    );
+    Connection::open(&path)?.execute(
+        "UPDATE watcher_queue SET retry_at=0 WHERE cursor=?",
+        [d.event.cursor],
+    )?;
+    let next = lease_event(&b, "w", 60)?.unwrap();
+    strict(next.event.cursor, Some(&next.receipt))?;
+    assert_eq!(
+        board_local::errors::classify(&strict(d.event.cursor, Some(&d.receipt)).unwrap_err()).1,
+        "delivery_conflict"
+    );
+    Ok(())
+}
+
+#[test]
 fn new_schedule_checks_past_time_but_restart_dispatches_old_persisted_deadlines() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("deadline.db");
@@ -385,7 +465,10 @@ fn watcher_lanes_run_independently_and_survive_poison_events() -> Result<()> {
             [a.id],
         )?;
         let d = lease_event(&db, "review", 60)?.unwrap();
-        assert_eq!((d.event.cursor, d.attempt), (a.id, attempt));
+        assert_eq!(
+            (d.event.cursor, d.attempt, d.attempts),
+            (a.id, attempt - 1, attempt)
+        );
         assert_ne!(d.receipt, receipts[&a.id]);
         assert!(ack_delivery(&db, "review", a.id, Some(&receipts[&a.id])).is_err());
         settle_delivery(
@@ -451,7 +534,10 @@ fn interrupted_deliveries_resist_stale_ack_and_unblock_the_lane_at_ten() -> Resu
     let reply = db.reply(root.id, "sam", "second", &Default::default())?;
     for attempt in 1..=10 {
         let leased = lease_event(&db, "review", 60)?.unwrap();
-        assert_eq!((leased.attempt, leased.event.cursor), (attempt, root.id));
+        assert_eq!(
+            (leased.attempt, leased.attempts, leased.event.cursor),
+            (attempt - 1, attempt, root.id)
+        );
         Connection::open(&path)?.execute(
             "UPDATE watcher_queue SET lease_until=0 WHERE name='review' AND cursor=?",
             [root.id],

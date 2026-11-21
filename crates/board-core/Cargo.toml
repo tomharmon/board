@@ -12,6 +12,7 @@ rusqlite = { version = "0.37", features = ["bundled", "backup", "functions", "bl
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
+icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 url = "2"
 fluent-uri = "0.3"
 rhai = {version="1.25.1",default-features=false,features=["std","serde","no_module","no_time"]}

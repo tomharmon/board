@@ -20,8 +20,9 @@ application from a disposable local database.
   are included in both the source and `board-ui --ui-notices`.
 - [Rhai](https://github.com/rhaiscript/rhai) is the embedded, operation-limited
   rules interpreter (MIT or Apache-2.0). [FFmpeg](https://ffmpeg.org/legal.html)
-  is optional for silent local H.264 previews. Board does not bundle FFmpeg
-  or a codec library; the user's installed executable retains its own license.
+  supplies optional local AVIF, MP4/MOV and WebM decoding and a local audio
+  player. Board does not bundle those executables or their codec libraries;
+  the user's installation retains its own license.
 
 For packaging, use `cargo metadata --offline --locked --format-version 1`
 after fetching the locked dependencies. Its package entries identify source

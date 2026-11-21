@@ -7,6 +7,7 @@ mod preview;
 mod properties;
 mod rich;
 mod shell;
+mod suggestions;
 mod workspace;
 
 use crate::state::{Page, Position, State};
@@ -158,7 +159,7 @@ fn search(s: &State) -> El {
                 .min_w(0.0)
                 .on_edit(|s: &mut State| &mut s.query)
                 .on_input_change(|s: &mut State, _| {
-                    s.starts.clear();
+                    s.reset_feed();
                     s.refresh();
                 })
                 .on_input_key(|s: &mut State, k, tx| {
@@ -178,7 +179,7 @@ fn search(s: &State) -> El {
         field = field.child(
             tool("clear-search", "Clear search", &glyphs::CLOSE).on_press(|s: &mut State| {
                 s.query.clear();
-                s.starts.clear();
+                s.reset_feed();
                 s.refresh();
             }),
         );

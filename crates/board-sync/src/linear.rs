@@ -23,6 +23,42 @@ fn next(v: &Value, seen: &mut HashSet<String>) -> Result<Option<String>> {
     Ok(Some(n.into()))
 }
 impl Connector {
+    /// Recheck the issue on every send: a durable copy may predate a team move.
+    pub(super) fn linear_destination(
+        &self,
+        src: &Source,
+        thread: &str,
+        comment: Option<&str>,
+    ) -> Result<String> {
+        let data = if let Some(c) = comment {
+            self.gql("query BoardCommentDestination($id:String!,$comment:String!){issue(id:$id){id identifier team{key}} comment(id:$comment){id issue{id}}}",json!({"id":thread,"comment":c}))?
+        } else {
+            self.gql(
+                "query BoardIssueDestination($id:String!){issue(id:$id){id identifier team{key}}}",
+                json!({"id":thread}),
+            )?
+        };
+        let issue = &data["issue"];
+        ensure!(
+            issue["team"]["key"] == src.remote,
+            "Linear issue is outside the configured team or inaccessible"
+        );
+        let id = s(issue, "id")?;
+        ensure!(
+            id == thread
+                || issue["identifier"]
+                    .as_str()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(thread)),
+            "Linear returned a different issue"
+        );
+        if let Some(c) = comment {
+            ensure!(
+                data["comment"]["id"] == c && data["comment"]["issue"]["id"] == id,
+                "Linear comment is outside the verified issue or inaccessible"
+            );
+        }
+        Ok(id.to_owned())
+    }
     pub(super) fn linear_preview(
         &self,
         src: &Source,

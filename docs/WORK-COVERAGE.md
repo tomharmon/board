@@ -10,7 +10,7 @@ The test names below are unique substrings usable as Cargo test filters.
 Core tests are in `crates/board-core/tests/{tasks,automation_delivery,
 work_recovery,work_parity}.rs` and `crates/board-core/src/automation/tests.rs`.
 HTTP tests live in `crates/board-api/src/work/tests.rs`; real child-process
-and CLI tests are in `crates/board-cli/tests/{processes,task_runner}.rs`.
+and CLI tests are in `crates/board-cli/tests/{processes,task_runner,delegation}.rs`.
 Run `cargo test --offline --locked -p board-local -p board-api -p board-cli`.
 The slow wall-clock takeover is explicit:
 `cargo test --offline --locked -p board-cli --test processes -- --ignored`.
@@ -31,9 +31,9 @@ cargo build --offline --locked -p board-cli
 node scripts/compare-work.mjs /path/to/original/package-with-deps target/debug/board --expiry
 ```
 
-The short run (omit `--expiry`) measures 41 equivalent outcomes: 11 watcher,
-11 schedule, and 19 task observations. The wall-clock run adds three task
-assertions after a real 30-second lease runs out, for **44 equivalent
+The short run (omit `--expiry`) measures 44 equivalent outcomes: 13 watcher,
+11 schedule, and 20 task observations. The wall-clock run adds three task
+assertions after a real 30-second lease runs out, for **47 equivalent
 outcomes**. These are not 43 upstream conformance cases. In particular:
 
 | Family | What the two implementations actually did |
@@ -42,12 +42,14 @@ outcomes**. These are not 43 upstream conformance cases. In particular:
 | Schedules | Created and read a board-only reply schedule, scoped it to the right thread, canceled it, and reopened it. Both also dispatched a real one-shot with labels, its schedule ID, zero-based ordinal and board-only flag, then reopened without another send. The original uses its local timer; the Rust side invokes the worker. |
 | Tasks | Claimed, retried a caller-minted proof without changing its deadline, renewed, released, failed, reopened, blocked and completed a task. The probe checked `by=me` against a caller and their separate profile, dependent readiness, omission of the proof from thread reads, and rejection of stale, wrong, too-short and terminal claims. With `--expiry`, the board is reopened during the lease; only the replacement holder can finish and its result persists. |
 
-Three observed differences are asserted separately: the original first
-watcher attempt is numbered 0, the port's is 1; repeating a successful
-acknowledgement gives `no_match` upstream and succeeds idempotently here;
-and the original SDK's renew result carries the proof, while Rust CLI renew
-does not print it again. Both retain and accept the same proof and epoch
-after renewal. This probe does not compare hosted delivery, external network
+One deliberate interface difference is asserted separately: repeating an
+acknowledgement with the same winning proof gives `no_match` upstream and
+succeeds idempotently here, so a lost success response can be retried. The
+same probe checks that requesting `--if-pending` yields the original
+`no_match` outcome on a proven repeat.
+It does not rerun a delivery or acknowledge a newer lease. Both start
+delivery attempt numbering at zero and return the authenticated holder's
+proof on renewal without putting it in thread history. This probe does not compare hosted delivery, external network
 side effects, delegated policy matrices, repeated schedule cadence or native
 UI behavior; the tests below cover the corresponding local workflows.
 The comparison also caught a parser regression for otherwise valid
@@ -68,7 +70,7 @@ checks the Unix mode and refuses shared or redirected proof files.
 | Task 2: keyed create versus plain roots/replies | Shared post identity; `single_task_is_a_keyed_post_but_a_batch_is_a_separate_guarded_request`. |
 | Task 3: racing claims and result | Immediate SQLite transaction; `independent_processes_cannot_share_or_reuse_a_claim`, `concurrent_claims_have_one_winner`. |
 | Task 4: lease deadline, minimum, renewal | 30-3600 seconds; `task_resources_page_replay_and_fence_claims`, `supervisor_renews_and_settles_child_exit`. |
-| Task 5: fenced release, new epoch, fail/reopen | `dependencies_leases_and_stale_epochs`, `claim_secrets_never_leave_the_claim_response`, `expired_process_cannot_finish_after_a_real_time_takeover`. |
+| Task 5: fenced release, new epoch, fail/reopen | `dependencies_leases_and_stale_epochs`, `claim_secrets_only_reach_the_authorized_lease_holder`, `expired_process_cannot_finish_after_a_real_time_takeover`. |
 | Task 6: only successful prerequisites make work ready | `dependencies_leases_and_stale_epochs`, `task_owner_assignment_reopen_dependencies`. |
 | Task 7: refuse canceled prerequisites; allow failed ones | `task_owner_assignment_reopen_dependencies`, `imported_edits_hold_adopted_task`. |
 | Task 8: scope reverse-dependency list | `task_collection_finds_reverse_dependencies_and_filters_before_pagination`. |
@@ -85,10 +87,10 @@ checks the Unix mode and refuses shared or redirected proof files.
 | Task 19: label permission required for claims | `principal_profile_and_post_only_owner_rights`, `scoped_tasks_hide_prerequisites_and_queue_limits`. |
 | Task 20: unreadable needs are not usable | `scoped_tasks_hide_prerequisites_and_queue_limits`, `blind_task_and_plan_retries`. Internal named batch edges reveal only the writer's own new roots. |
 | Task 21: exact-label subtree ready queue, waiting | `queue_labels_are_exact_and_owner_opt_ins_name_people`, `waiting_queue_claim_releases_connection`, `canceled_wait_before_commit`, `queue_poll_only_expires_the_overdue_lease_it_can_actually_take`. |
-| Task 22: entering/leaving ready label; never expose token | `change_feed_and_watchers_include_both_sides`, `claim_secrets_never_leave_the_claim_response`. |
+| Task 22: entering/leaving ready label; no published token | `change_feed_and_watchers_include_both_sides`, `claim_secrets_only_reach_the_authorized_lease_holder`. |
 | Task 23: reserved task label and conditional updates | `task_owner_assignment_reopen_dependencies_and_reserved_labels`, `independent_writers_linearize_retry_revision_labels_and_latest_reply`. |
 | Task 24: non-owner edit of imported root stops old lease | Actual local import, adoption, claim and reimport: `imported_edits_hold_adopted_task`. |
-| Watcher 1: register, pull, acknowledge | `replacement_and_bulk_delivery_routes`, `leased_delivery_is_exclusive_expires_and_fences_stale_acknowledgements`. An exact repeat PUT is intentionally idempotent here, not a missing-match error. |
+| Watcher 1: register, pull, acknowledge | `replacement_and_bulk_delivery_routes`, `leased_delivery_is_exclusive_expires_and_fences_stale_acknowledgements`, `conditional_ack_has_one_winner`, `strict_ack_over_loopback_and_cli`. An exact repeat PUT is idempotent by default; a strict, receipt-backed acknowledgement reports `no_match`. |
 | Watcher 2: wake a deployed application by path | No deployment or network wake-up. `watchers run -- COMMAND` is the foreground local equivalent; `explicit_watcher_handler_receives_json`. |
 | Watcher 3: temporary request cap cannot register, pull or ack | `watcher_set_replacement_preserves_leases_and_checkpoints_and_temporary_caps_cannot_pull_or_ack`. |
 
@@ -111,3 +113,21 @@ atomically with a schedule. `scheduling_a_saved_draft_is_atomic` injects
 a SQLite write failure, refuses mismatched saved privacy, labels, file bytes
 and send time, then exercises an outdated window, a successful commit, a
 second submit and a database reopen.
+
+Two other composer cases are checked separately. In
+`saved_task_submission_fences_private_routing_files_and_double_submits_after_reopen`,
+the exact saved private task draft, including prerequisites, assignee, labels
+and attachment bytes, is consumed in the same transaction as the new task.
+A rejected route, stale revision or failed task insert leaves it intact.
+`scheduled_channel_draft_cannot_be_sent_to_another_destination` verifies
+that a channel-specific new-thread draft and the all-channel compose slot
+can coexist without one window retiring the other's schedule.
+
+The original schedule list accepts an exact channel. Local CLI and
+`GET /v1/schedules?channel=work` use the same convention; `work/` extends
+it to the whole subtree. Both channel visibility and the actor filter apply
+before the page limit; `--all` includes cancelled and finished schedules.
+`schedule_filters_combine_actor_handles` checks exact actor IDs versus
+person/profile-family matching, a renamed handle, channel boundaries and
+history. `read_only_sync_lookups_and_schedule_scopes` checks two actual
+HTTP pages when a hidden schedule precedes the first visible one.

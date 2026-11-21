@@ -2,9 +2,8 @@ use crate::{Board, Channel, validate_channel};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Row, params};
 
-const COUNTS: &str =
-    "SELECT c.name, count(m.id) FILTER (WHERE m.re IS NULL), count(m.id), max(m.id)
-    FROM channels c LEFT JOIN messages m ON c.name=m.channel";
+const COUNTS: &str = "SELECT c.name,coalesce(a.roots,0),coalesce(a.total,0),a.latest
+     FROM channels c LEFT JOIN channel_activity a ON c.name=a.channel";
 
 fn channel(row: &Row<'_>) -> rusqlite::Result<Channel> {
     Ok(Channel {
@@ -16,6 +15,19 @@ fn channel(row: &Row<'_>) -> rusqlite::Result<Channel> {
 }
 
 impl Board {
+    pub fn channels(&self) -> Result<Vec<Channel>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let access = self.access_on(&tx)?;
+        let rows = tx
+            .prepare(&format!("{COUNTS} ORDER BY c.name"))?
+            .query_map([], channel)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        tx.commit()?;
+        Ok(rows
+            .into_iter()
+            .filter(|c| access.allows(crate::access::Action::Read, &c.name))
+            .collect())
+    }
     /// Private last-read message IDs; like the activity checkpoint, these are not board events.
     pub fn channel_read_marks(
         &self,
@@ -72,11 +84,7 @@ impl Board {
                 .error("channel_not_found", format!("channel not found: {name}"))
         );
         let channel = tx
-            .query_row(
-                &format!("{COUNTS} WHERE c.name=? GROUP BY c.name"),
-                [name],
-                channel,
-            )
+            .query_row(&format!("{COUNTS} WHERE c.name=?"), [name], channel)
             .optional()?
             .with_context(|| {
                 crate::errors::Kind::Missing
@@ -126,7 +134,7 @@ impl Board {
         let sql = format!(
             "{COUNTS} WHERE c.name > ?1 AND (?2 IS NULL OR c.name=?2 OR instr(c.name,?2||'/')=1)
             AND (?4 IS NULL OR c.name IN (SELECT value FROM json_each(?4))) AND (?5 IS NULL OR instr(c.name,?5)=1)
-            GROUP BY c.name ORDER BY c.name LIMIT ?3"
+            ORDER BY c.name LIMIT ?3"
         );
         let mut rows: Vec<_> = tx
             .prepare(&sql)?

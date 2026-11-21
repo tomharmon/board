@@ -3,6 +3,29 @@ use board_local::{Board, PostOptions, access::Rules};
 use sha2::{Digest, Sha256};
 
 #[test]
+fn all_channel_read_does_not_make_unpublished_or_deleted_uploads_public() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("all-reads.db");
+    let owner = Board::open(&path)?;
+    owner.set_grant("admin", None, "guest", &Rules::parse("*=read,post")?)?;
+    let mut guest = Board::open(&path)?;
+    guest.bind_token(&owner.issue_credential("admin", "guest", None, None)?.token)?;
+    let file = owner.upload("writer", "reports", "draft.txt", "text/plain", b"unsent")?;
+    let opts = PostOptions {
+        attachment_ids: vec![file.id],
+        ..Default::default()
+    };
+    assert!(guest.download(file.id).is_err());
+    assert!(guest.file_id("guest", &file.key).is_err());
+    assert!(guest.post("other", "guest", "unpublished", &opts).is_err());
+    let shared = owner.post("reports", "writer", "readable", &opts)?;
+    assert_eq!(guest.download(file.id)?.1, b"unsent");
+    owner.delete(shared.id, "writer", None)?;
+    assert!(guest.download(file.id).is_err());
+    Ok(())
+}
+
+#[test]
 fn immutable_upload_permissions_follow_live_placements_and_uploader_origin() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("assets.db");

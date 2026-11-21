@@ -250,7 +250,7 @@ pub(super) fn watch(
                 .env("BOARD_WATCHER", name)
                 .env("BOARD_TRIGGER", &d.trigger)
                 .env("BOARD_CALLBACK_TOKEN", &capability)
-                .env("BOARD_ATTEMPT", d.attempt.to_string());
+                .env("BOARD_ATTEMPT", d.attempts.to_string());
         });
         let (code, err) = if let Ok(mut job) = started {
             let mut input = job.0.stdin.take().context("handler stdin not available")?;
@@ -293,7 +293,7 @@ pub(super) fn watch(
                 .map_or(DeliveryOutcome::Ack, DeliveryOutcome::Error),
         )?;
         print(
-            &serde_json::json!({"watcher":name,"cursor":cursor,"trigger":d.trigger,"attempt":d.attempt,"error":err}),
+            &serde_json::json!({"watcher":name,"cursor":cursor,"trigger":d.trigger,"attempt":d.attempts,"error":err}),
             json,
             || {
                 format!(

@@ -290,12 +290,17 @@ fn schedule_inner(
         } else {
             None
         };
-        let expected = root.map_or_else(|| "new".to_owned(), |id| format!("thread:{id}"));
         let mismatch = || {
             crate::errors::Kind::Conflict
                 .error("draft_changed", "draft was already sent, edited, or moved")
         };
-        ensure!(scope == expected, mismatch());
+        ensure!(
+            root.map_or_else(
+                || crate::drafts::root_scope(scope, &channel),
+                |id| scope == format!("thread:{id}")
+            ),
+            mismatch()
+        );
         let saved = board.check_composer_options_on(&tx, actor, scope, text, options, Some(&t))?;
         ensure!(
             saved.channel == channel && saved.reply_to.or(root) == re,
@@ -431,9 +436,31 @@ pub fn schedule_query(
     limit: i64,
     by_id: bool,
 ) -> Result<(i64, Vec<Schedule>)> {
+    schedule_query_in(board, all, thread, by, None, after, limit, by_id)
+}
+
+/// An exact channel is selected by name; a trailing slash includes its subtree.
+#[allow(clippy::too_many_arguments)]
+pub fn schedule_query_in(
+    board: &Board,
+    all: bool,
+    thread: Option<i64>,
+    by: Option<&str>,
+    channel: Option<&str>,
+    after: i64,
+    limit: i64,
+    by_id: bool,
+) -> Result<(i64, Vec<Schedule>)> {
     ensure!(after >= 0 && limit > 0, "invalid schedule range");
+    let base = channel.map(|ch| ch.strip_suffix('/').unwrap_or(ch));
+    if let Some(base) = base {
+        crate::validate_channel(base)?;
+    }
     let tx = board.conn.unchecked_transaction()?;
     let access = board.access_on(&tx)?;
+    let authors = by
+        .map(|query| crate::actors::author_filter(&tx, &access, query))
+        .transpose()?;
     let root = if let Some(id) = thread {
         access.message(&tx, id, Action::Read)?;
         let m = Board::get_on(&tx, id)?;
@@ -447,13 +474,16 @@ pub fn schedule_query(
         .prepare(
             "SELECT s.id,s.channel,s.actor,EXISTS(SELECT 1 FROM blind_schedules b WHERE b.schedule=s.id)
             FROM schedules s LEFT JOIN messages m ON m.id=s.re WHERE (?1 OR s.state='pending') AND s.id>?2
-            AND (?4 IS NULL OR coalesce(m.re,m.id)=?4) AND (?5 IS NULL OR s.actor=?5 OR instr(s.actor,?5||'/')=1)
+            AND (?4 IS NULL OR coalesce(m.re,m.id)=?4) AND (?5 IS NULL OR s.channel=?5 OR (?6!=?5 AND instr(s.channel,?6)=1))
             ORDER BY CASE WHEN ?3 THEN s.id ELSE s.due END,s.id",
         )?
-        .query_map(params![all,after,by_id,root,by],|r|Ok((r.get(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get(3)?)))?
+        .query_map(params![all,after,by_id,root,base,channel],|r|Ok((r.get(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get(3)?)))?
     {
         let (id,c,owner,blind)=row?;
-        if can_view(&access,&c,&owner,blind){rows.push(get(&tx,id)?);if rows.len() as i64>=limit{break;}}
+        if can_view(&access,&c,&owner,blind) && authors.as_ref().is_none_or(|a|a.matches(&owner)){
+            rows.push(get(&tx,id)?);
+            if rows.len() as i64>=limit{break;}
+        }
     }
     tx.commit()?;
     Ok((cursor, rows))

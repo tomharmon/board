@@ -5,6 +5,19 @@ use crate::{
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 
+fn normal(event: &Event) -> bool {
+    event.message.is_some()
+        && !matches!(
+            event.kind.as_str(),
+            "actor.updated"
+                | "actor.seen"
+                | "source.receipt"
+                | "message.synced"
+                | "message.files_synced"
+                | "task.renewed"
+        )
+}
+
 pub(crate) fn allowed(c: &Connection, a: &Access, mut event: Event) -> Result<Option<Event>> {
     let source_control = event.kind.starts_with("source.")
         || matches!(
@@ -77,11 +90,23 @@ impl Board {
         filter: &Filter,
         kind: Option<&str>,
     ) -> Result<(i64, Vec<Event>)> {
+        self.event_feed(after, limit, filter, kind, true)
+    }
+    /// The ordinary feed describes changes to messages; opt in to bookkeeping.
+    /// An explicitly selected kind is also an opt-in. Neither bypasses current grants.
+    pub fn event_feed(
+        &self,
+        after: i64,
+        limit: usize,
+        filter: &Filter,
+        kind: Option<&str>,
+        all: bool,
+    ) -> Result<(i64, Vec<Event>)> {
         ensure!(
             after >= 0 && (1..=500).contains(&limit),
             "invalid cursor or limit"
         );
-        self.visible_events(after, limit, filter, kind)
+        self.scan_events(after, limit, filter, kind, all || kind.is_some())
     }
     pub(crate) fn visible_events(
         &self,
@@ -90,10 +115,20 @@ impl Board {
         filter: &Filter,
         kind: Option<&str>,
     ) -> Result<(i64, Vec<Event>)> {
+        self.scan_events(after, limit, filter, kind, true)
+    }
+    fn scan_events(
+        &self,
+        after: i64,
+        limit: usize,
+        filter: &Filter,
+        kind: Option<&str>,
+        all: bool,
+    ) -> Result<(i64, Vec<Event>)> {
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
         let (authors, filters) = expanded(&tx, &a, filter)?;
-        let mut pos = after;
+        let mut pos = after.min(crate::read::cursor_on(&tx)?);
         let mut found = Vec::new();
         'scan: while found.len() < limit {
             let batch = Board::events_on(&tx, pos, 128)?;
@@ -102,7 +137,8 @@ impl Board {
             }
             for event in batch {
                 pos = event.cursor;
-                if kind.is_none_or(|k| k == event.kind)
+                if (all || normal(&event))
+                    && kind.is_none_or(|k| k == event.kind)
                     && authors.as_ref().is_none_or(|by| {
                         event.message.as_ref().is_some_and(|m| by.matches(&m.actor))
                     })
@@ -122,6 +158,9 @@ impl Board {
 
     /// Seed a tail with its last N *matching* events, not just matches among the last N writes.
     pub fn event_tail(&self, count: usize, filter: &Filter) -> Result<(i64, Vec<Event>)> {
+        self.tail_feed(count, filter, true)
+    }
+    pub fn tail_feed(&self, count: usize, filter: &Filter, all: bool) -> Result<(i64, Vec<Event>)> {
         ensure!(count <= 100, "tail history cannot exceed 100 events");
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
@@ -136,12 +175,15 @@ impl Board {
             let rows = Board::events_on(&tx, start, (end - start) as usize)?;
             for event in rows.into_iter().rev().filter(|e| {
                 e.cursor <= end
+                    && (all || normal(e))
                     && authors
                         .as_ref()
                         .is_none_or(|by| e.message.as_ref().is_some_and(|m| by.matches(&m.actor)))
                     && filters.iter().any(|f| e.matches(f))
             }) {
-                if let Some(e) = allowed(&tx, &a, event)? {
+                if let Some(e) = allowed(&tx, &a, event)?
+                    && let Some(e) = current_event(&tx, &a, e, filter, &filters)?
+                {
                     found.push(e);
                     if found.len() == count {
                         break;
@@ -151,76 +193,85 @@ impl Board {
             end = start;
         }
         found.reverse();
-        let mut out = Vec::new();
-        for mut event in found {
-            if event.kind == "source.delivery_failed"
-                && let (Some(source), Some(item)) = (
-                    event.payload.get("source").and_then(|v| v.as_str()),
-                    event.payload.get("item").and_then(|v| v.as_i64()),
-                )
-            {
-                let healed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_queue WHERE id=? AND source=? AND state IN ('done','skipped'))",params![item,source],|r|r.get(0))?;
-                if healed {
-                    continue;
-                }
-            }
-            if let Some(snapshot) = event.message.take() {
-                let current = a.view(&tx, Board::get_on(&tx, snapshot.id)?)?;
-                if (filter.text.is_some() || filter.mentions.is_some())
-                    && (current.deleted
-                        || current.text != snapshot.text
-                        || filter.text.as_ref().is_some_and(|q| {
-                            !current.text.to_lowercase().contains(&q.to_lowercase())
-                        })
-                        || (filter.mentions.is_some()
-                            && !crate::core::mentions(&current.text).any(|term| {
-                                filters
-                                    .iter()
-                                    .filter_map(|f| f.mentions.as_deref())
-                                    .any(|q| crate::prose::matches(&term, q))
-                            })))
-                {
-                    continue;
-                }
-                match event.kind.as_str() {
-                    "labels.changed" => {
-                        if let Some(set) =
-                            event.payload.get_mut("set").and_then(|s| s.as_object_mut())
-                        {
-                            set.retain(|k, v| {
-                                v.as_str()
-                                    .is_some_and(|s| current.labels.get(k).is_some_and(|v| v == s))
-                            });
-                        }
-                    }
-                    "reaction.added" | "reaction.removed"
-                        if !event
-                            .payload
-                            .get("emoji")
-                            .and_then(|v| v.as_str())
-                            .and_then(|k| current.reactions.get(k))
-                            .is_some_and(|actors| actors.contains(&event.actor)) =>
-                    {
-                        continue;
-                    }
-                    "task.failed" | "task.blocked"
-                        if snapshot.task.as_ref().map(|t| (&t.state, &t.result))
-                            != current.task.as_ref().map(|t| (&t.state, &t.result)) =>
-                    {
-                        continue;
-                    }
-                    _ => {}
-                }
-                if event.payload.get("task").is_some() {
-                    event.payload["task"] = serde_json::to_value(&current.task)?;
-                }
-                event.message = Some(current);
-            }
-            out.push(event);
-        }
         tx.commit()?;
-        Ok((head, out))
+        Ok((head, found))
     }
+}
+fn current_event(
+    tx: &Connection,
+    a: &Access,
+    mut event: Event,
+    filter: &Filter,
+    filters: &[Filter],
+) -> Result<Option<Event>> {
+    if event.kind == "source.delivery_failed"
+        && let (Some(source), Some(item)) = (
+            event.payload.get("source").and_then(|v| v.as_str()),
+            event.payload.get("item").and_then(|v| v.as_i64()),
+        )
+    {
+        let healed:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_queue WHERE id=? AND source=? AND state IN ('done','skipped'))",params![item,source],|r|r.get(0))?;
+        if healed {
+            return Ok(None);
+        }
+    }
+    if let Some(snapshot) = event.message.take() {
+        let current = a.view(tx, Board::get_on(tx, snapshot.id)?)?;
+        if (filter.text.is_some() || filter.mentions.is_some())
+            && (current.deleted
+                || current.text != snapshot.text
+                || filter
+                    .text
+                    .as_ref()
+                    .is_some_and(|q| !current.text.to_lowercase().contains(&q.to_lowercase()))
+                || (filter.mentions.is_some()
+                    && !crate::core::mentions(&current.text).any(|term| {
+                        filters
+                            .iter()
+                            .filter_map(|f| f.mentions.as_deref())
+                            .any(|q| crate::prose::matches(&term, q))
+                    })))
+        {
+            return Ok(None);
+        }
+        match event.kind.as_str() {
+            "source.receipt" | "message.synced" | "message.files_synced" if current.deleted => {
+                return Ok(None);
+            }
+            "labels.changed" => {
+                if let Some(set) = event.payload.get_mut("set").and_then(|s| s.as_object_mut()) {
+                    set.retain(|k, v| {
+                        v.as_str()
+                            .is_some_and(|s| current.labels.get(k).is_some_and(|v| v == s))
+                    });
+                }
+            }
+            "reaction.added" | "reaction.removed"
+                if !event
+                    .payload
+                    .get("emoji")
+                    .and_then(|v| v.as_str())
+                    .and_then(|k| current.reactions.get(k))
+                    .is_some_and(|actors| actors.contains(&event.actor)) =>
+            {
+                return Ok(None);
+            }
+            "task.failed" | "task.blocked"
+                if snapshot.task.as_ref().map(|t| (&t.state, &t.result))
+                    != current.task.as_ref().map(|t| (&t.state, &t.result)) =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
+        if event.payload.get("task").is_some() {
+            event.payload["task"] = serde_json::to_value(&current.task)?;
+        }
+        event.message = Some(current);
+    }
+    Ok(Some(event))
+}
+impl Board {
     pub fn activity_seen(&self, actor: &str) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
         let key = self.access_on(&tx)?.private_key(actor)?;

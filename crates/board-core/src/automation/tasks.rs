@@ -28,7 +28,7 @@ pub struct Task {
     pub state: String,
     pub holder: Option<String>,
     pub epoch: i64,
-    /// A fresh secret returned by claim only, never by reads, lists, or events.
+    /// Only the current claim/recovery/renewal response carries its private proof.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub claim_token: Option<String>,
     pub lease_until: Option<i64>,
@@ -390,6 +390,30 @@ pub fn create_task_and_claim(
     assignee: Option<&str>,
     claim: Option<ClaimRequest<'_>>,
 ) -> Result<(Task, bool)> {
+    create_task_inner(board, actor, target, needs, assignee, claim, None)
+}
+
+/// Publish exactly the composing actor's saved task entry or leave it intact.
+pub fn create_task_draft(
+    board: &Board,
+    actor: &str,
+    target: TaskTarget<'_>,
+    needs: &[i64],
+    assignee: Option<&str>,
+    stamp: &str,
+) -> Result<Task> {
+    Ok(create_task_inner(board, actor, target, needs, assignee, None, Some(stamp))?.0)
+}
+
+fn create_task_inner(
+    board: &Board,
+    actor: &str,
+    target: TaskTarget<'_>,
+    needs: &[i64],
+    assignee: Option<&str>,
+    claim: Option<ClaimRequest<'_>>,
+    draft: Option<&str>,
+) -> Result<(Task, bool)> {
     crate::validate_actor(actor)?;
     if let Some(who) = assignee {
         validate_assignee(actor, who)?;
@@ -398,6 +422,36 @@ pub fn create_task_and_claim(
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
+    if let Some(stamp) = draft {
+        let mismatch = || {
+            Conflict.error(
+                "draft_changed",
+                "task draft was already sent, edited, or moved",
+            )
+        };
+        let TaskTarget::New {
+            channel,
+            text,
+            options,
+        } = &target
+        else {
+            return Err(mismatch().into());
+        };
+        let saved = board.check_composer_options_on(&tx, actor, "tasks", text, options, None)?;
+        let route = board
+            .composer_settings_on(&tx, actor, "tasks")?
+            .task
+            .context(mismatch())?;
+        let who = route.assignee.trim();
+        ensure!(
+            saved.channel == *channel
+                && saved.reply_to.is_none()
+                && route.parsed_needs()? == needs
+                && (!who.is_empty()).then_some(who) == assignee,
+            mismatch()
+        );
+        board.consume_composer_on(&tx, actor, "tasks", stamp)?;
+    }
     let channel = match &target {
         TaskTarget::New {
             channel, options, ..
@@ -1411,8 +1465,11 @@ pub fn change_task(
             }
         }
     }
-    let t = visible(&access, &tx, t)?;
+    let mut t = visible(&access, &tx, t)?;
     tx.commit()?;
+    if name == "renewed" {
+        t.claim_token = token.map(str::to_owned);
+    }
     Ok(t)
 }
 

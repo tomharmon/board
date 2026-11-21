@@ -14,10 +14,14 @@ use board_local::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "inspector/composing.rs"]
+mod composing;
 #[path = "inspector/picker.rs"]
 mod picker;
 #[path = "inspector/task_conversation.rs"]
 mod task_conversation;
+#[path = "inspector/video.rs"]
+mod video;
 #[path = "inspector/work_views.rs"]
 mod work_views;
 
@@ -617,7 +621,7 @@ fn split_composers_keep_root_and_reply_drafts_separate_across_focus_send_and_res
     let sent = f.at_mark(&mut cmd, "drafts-separated", || {
         pending = Some((
             db.load_draft("reader", &scope),
-            db.load_draft("reader", "new"),
+            db.load_draft("reader", "channel:desk"),
             db.thread(root).unwrap().len(),
         ));
     });
@@ -646,13 +650,24 @@ fn split_composers_keep_root_and_reply_drafts_separate_across_focus_send_and_res
         ("Reply from the thread\nSecond line", Some(root), None)
     );
     assert!(db.load_draft("reader", &scope).unwrap().is_none());
-    assert_eq!(db.load_draft("reader", "new").unwrap().unwrap().body, main);
-    let restored = f.render(json!([]), DESKTOP, "0.5");
+    assert_eq!(
+        db.load_draft("reader", "channel:desk")
+            .unwrap()
+            .unwrap()
+            .body,
+        main
+    );
+    assert!(db.load_draft("reader", "new").unwrap().is_none());
+    let restored = f.render(
+        json!([{"t":0.12,"type":"tap","key":"nav-desk"}]),
+        DESKTOP,
+        "0.5",
+    );
     restored.expect_key("message-body");
     restored.expect_text(main);
     f.render(
         json!([
-            {"t":0.15,"type":"tap","key":"message-body"},{"t":0.4,"type":"key","name":"Enter"}
+            {"t":0.12,"type":"tap","key":"nav-desk"},{"t":0.34,"type":"tap","key":"message-body"},{"t":0.6,"type":"key","name":"Enter"}
         ]),
         DESKTOP,
         "0.85",
@@ -668,7 +683,7 @@ fn split_composers_keep_root_and_reply_drafts_separate_across_focus_send_and_res
         ),
         (main, "desk", None, None)
     );
-    assert!(db.load_draft("reader", "new").unwrap().is_none());
+    assert!(db.load_draft("reader", "channel:desk").unwrap().is_none());
 }
 
 #[test]
@@ -1782,6 +1797,78 @@ fn schema_examples_append_to_real_drafts_and_unsolved_shapes_offer_only_the_defi
 }
 
 #[test]
+fn gif_webp_and_avif_previews_render_the_attachment_pixels() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let mut gif = Vec::new();
+    {
+        let mut encoder = image::codecs::gif::GifEncoder::new(&mut gif);
+        for (rgba, ms) in [([0, 255, 255, 255], 250), ([255, 0, 255, 255], 2000)] {
+            encoder
+                .encode_frame(image::Frame::from_parts(
+                    image::RgbaImage::from_pixel(24, 16, image::Rgba(rgba)),
+                    0,
+                    0,
+                    image::Delay::from_numer_denom_ms(ms, 1),
+                ))
+                .unwrap();
+        }
+    }
+    // Both animations start cyan. A magenta framebuffer proves we actually advanced.
+    let mut files = vec![
+        ("swatch.gif".into(), gif),
+        (
+            "swatch.webp".into(),
+            include_bytes!("fixtures/animated.webp").to_vec(),
+        ),
+    ];
+    if Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|s| s.status.success())
+    {
+        files.push((
+            "swatch.avif".into(),
+            include_bytes!("fixtures/magenta.avif").to_vec(),
+        ));
+    }
+    let root = b
+        .post(
+            "studio",
+            "artist",
+            "Color proof",
+            &PostOptions {
+                files,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    for attachment in root.attachments {
+        let png = f.dir.path().join(format!("{}.png", attachment.name));
+        let cmd = f.command(json!([{"t":0.2,"type":"tap","key":format!("preview-{}-{}",root.id,attachment.id)}]),"820x630","0.8")
+            .arg("--thread").arg(root.id.to_string()).arg("--snap").arg(&png).output().unwrap();
+        assert!(
+            cmd.status.success(),
+            "{}: {}",
+            attachment.name,
+            String::from_utf8_lossy(&cmd.stderr)
+        );
+        f.tree().expect_key("preview-image");
+        f.tree().expect_text("24 x 16 px");
+        let frame = image::open(&png).unwrap().into_rgb8();
+        assert!(
+            frame
+                .pixels()
+                .filter(|c| c[0] > 215 && c[1] < 35 && c[2] > 215)
+                .count()
+                > 8000,
+            "{} didn't paint magenta",
+            attachment.name
+        );
+    }
+}
+
+#[test]
 fn local_raster_previews_render_pixels_and_never_overwrite_exports() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
@@ -2641,7 +2728,7 @@ fn exact_message_delivery_failures_are_scoped_and_local_only_replies_are_not_que
 }
 
 #[test]
-fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
+fn opt_in_h264_playback_steps_real_frames_and_degrades_without_the_decoder() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let m = b
@@ -2674,12 +2761,8 @@ fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
         String::from_utf8_lossy(&output.stderr)
     );
     f.tree()
-        .expect_text("Video preview needs a local FFmpeg executable");
-    if !Command::new("ffmpeg")
-        .arg("-version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
+        .expect_text("Video playback needs local ffmpeg and ffprobe executables");
+    if !video::available("h264") {
         return;
     }
     let shot = f.dir.path().join("frame.png");
@@ -2687,7 +2770,7 @@ fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
         json!([open,{"t":1.0,"type":"tap","key":"clip-next"},
         {"t":1.4,"type":"tap","key":"clip-play"}]),
         "820x640",
-        "2.8",
+        "4.3",
     );
     let o = cmd
         .arg("--thread")
@@ -2700,7 +2783,7 @@ fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let t = f.tree();
     t.expect_key("clip-frame");
-    t.expect_text("Silent sample   Frame 4 of 4");
+    t.expect_text("Silent video   0:01 / 0:02   Frame 24 of 24");
     let painted = image::open(&shot).unwrap().into_rgb8();
     assert!(
         painted

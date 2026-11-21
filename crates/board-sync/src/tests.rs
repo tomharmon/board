@@ -486,6 +486,11 @@ fn linear_uses_canonical_issue_id_and_paginates_before_linking_nested_comments()
         (
             "POST /graphql ",
             200,
+            json!({"data":{"issue":{"id":"id-7","team":{"key":"ENG"}},"comment":{"id":"c1","issue":{"id":"id-7"}}}}),
+        ),
+        (
+            "POST /graphql ",
+            200,
             json!({"data":{"commentCreate":{"success":true,"comment":{"id":"c3","url":"https://linear.app/demo/issue/ENG-7#c3"}}}}),
         ),
     ]);
@@ -508,7 +513,144 @@ fn linear_uses_canonical_issue_id_and_paginates_before_linking_nested_comments()
     let req = mock.finish();
     assert_eq!(req[1].1["variables"]["after"], "p");
     assert_eq!(
-        req[2].1["variables"]["input"],
+        req[3].1["variables"]["input"],
         json!({"issueId":"id-7","parentId":"c1","body":"ack"})
+    );
+}
+
+#[test]
+fn linear_explicit_joins_verify_the_current_team_before_any_mutation() {
+    let id = "30facd12-fd14-4bde-aaa1-ba7b616853d2";
+    let issue = |team| json!({"data":{"issue":{"id":id,"identifier":"ENG-7","team":{"key":team}}}});
+    let create = |b: &Board| {
+        b.set_outbound("ada", "test", true).unwrap();
+        let root = b
+            .post_with_targets(
+                "team/review",
+                "ada",
+                "Never send this local root",
+                &Default::default(),
+                &[format!("test:{id}")],
+            )
+            .unwrap()
+            .0;
+        assert!(
+            b.inbox("ada", "test", Direction::Out, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
+        b.reply(root.id, "ada", "Limited to this team", &Default::default())
+            .unwrap()
+    };
+    let denied = Mock::new(vec![("POST /graphql ", 200, issue("OTHER"))]);
+    let (db, api) = setup(Provider::Linear, "ENG", &denied);
+    let root = create(&db);
+    assert!(
+        api.send_next(&db, "ada", "test")
+            .unwrap_err()
+            .to_string()
+            .contains("nothing sent")
+    );
+    let job = &db.inbox("ada", "test", Direction::Out, 0, 10).unwrap()[0];
+    assert_eq!(job.state, "pending");
+    assert!(job.error.as_deref().unwrap().contains("team"));
+    assert!(db.source_copies("ada", "test", root.id).unwrap().is_empty());
+    let seen = denied.finish();
+    assert_eq!(seen.len(), 1);
+    assert!(seen[0].1["query"].as_str().unwrap().starts_with("query "));
+    assert_eq!(seen[0].1["variables"], json!({"id":id}));
+    assert!(!seen[0].1.to_string().contains("Limited to this team"));
+
+    let allowed = Mock::new(vec![
+        ("POST /graphql ", 200, issue("ENG")),
+        (
+            "POST /graphql ",
+            200,
+            json!({"data":{"commentCreate":{"success":true,"comment":{"id":"c3"}}}}),
+        ),
+        ("POST /graphql ", 200, issue("MOVED")),
+    ]);
+    let (db, api) = setup(Provider::Linear, "ENG", &allowed);
+    let first = create(&db);
+    assert_eq!(
+        api.send_next(&db, "ada", "test").unwrap().unwrap().state,
+        "done"
+    );
+    assert_eq!(
+        db.source_copies("ada", "test", first.id).unwrap()[0].external,
+        "comment:c3"
+    );
+    db.reply(
+        first.id,
+        "ada",
+        "Do not follow a moved issue",
+        &Default::default(),
+    )
+    .unwrap();
+    assert!(api.send_next(&db, "ada", "test").is_err());
+    let seen = allowed.finish();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].1["query"].as_str().unwrap().starts_with("query "));
+    assert!(
+        seen[1].1["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("mutation ")
+    );
+    assert_eq!(
+        seen[1].1["variables"]["input"],
+        json!({"issueId":id,"body":"Limited to this team"})
+    );
+    assert!(seen[2].1["query"].as_str().unwrap().starts_with("query "));
+    assert!(!seen[2].1.to_string().contains("Do not follow"));
+}
+
+#[test]
+fn linear_rejects_a_mapped_parent_comment_belonging_to_another_issue() {
+    let fixture = Mock::new(vec![(
+        "POST /graphql ",
+        200,
+        json!({"data":{"issue":{"id":"issue-1","team":{"key":"ENG"}},"comment":{"id":"other-comment","issue":{"id":"issue-2"}}}}),
+    )]);
+    let (db, api) = setup(Provider::Linear, "ENG", &fixture);
+    let root = db
+        .post("team/review", "ada", "Root", &Default::default())
+        .unwrap();
+    db.attach_source("ada", "test", "issue-1", "issue", root.id, None)
+        .unwrap();
+    let mapped = db
+        .reply(root.id, "ada", "Reference", &Default::default())
+        .unwrap();
+    db.attach_source(
+        "ada",
+        "test",
+        "issue-1",
+        "comment:other-comment",
+        mapped.id,
+        None,
+    )
+    .unwrap();
+    db.set_outbound("ada", "test", true).unwrap();
+    db.reply(mapped.id, "ada", "Private context", &Default::default())
+        .unwrap();
+    assert!(api.send_next(&db, "ada", "test").is_err());
+    let records = fixture.finish();
+    assert_eq!(
+        records[0].1["variables"],
+        json!({"id":"issue-1","comment":"other-comment"})
+    );
+    assert!(
+        records[0].1["query"]
+            .as_str()
+            .unwrap()
+            .starts_with("query ")
+    );
+    assert!(!records[0].1.to_string().contains("Private context"));
+    assert!(
+        db.inbox("ada", "test", Direction::Out, 0, 10).unwrap()[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("outside the verified issue")
     );
 }

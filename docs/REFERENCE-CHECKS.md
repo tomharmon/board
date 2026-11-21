@@ -13,9 +13,10 @@ git -C "$ref" rev-parse HEAD
 node scripts/compare-reference.mjs "$ref" "$bin"
 node scripts/compare-schema-values.mjs "$ref" "$bin"
 node scripts/compare-reactions.mjs "$ref" "$bin"
+node scripts/compare-profile-handles.mjs "$ref" "$bin"
 ```
 
-The first three load pure reference code. To exercise its actual local
+These scripts load pure reference code. To exercise its actual local
 SQLite backend, copy the reference source to a **new temporary directory**.
 Only this development setup fetches the four original backend dependencies;
 they are neither dependencies of Board nor shipped in a release:
@@ -31,9 +32,11 @@ node --disable-warning=MODULE_TYPELESS_PACKAGE_JSON scripts/compare-work.mjs "$a
 
 Both workflow scripts call real original backend methods and real Rust
 processes. They compare observable behavior (not arbitrary ID numbers) and
-fail on a mismatch. The work script separately asserts three intentional
-interface differences: attempt numbering, repeat acknowledgements, and
-whether renewal reprints a proof. The slow case waits for an actual lease
+fail on a mismatch. Their transcripts include ordinary versus all-event waits,
+individual reply cursors, zero-based retry numbers and the renewal proof seen
+by the successful holder and the strict `--if-pending` acknowledgement. The
+work script separately asserts one default response difference: repeating an acknowledgement returns success
+for the idempotent local resource rather than `no_match`. The slow case waits for an actual lease
 to expire. These comparisons do **not** certify wire compatibility, every
 possible input, or the operation of a third-party account.
 

@@ -76,6 +76,7 @@ fn attachments(s: &State) -> El {
             .on_press(move |s: &mut State| {
                 if i < s.desk.task_entry.files.len() {
                     s.desk.task_entry.files.remove(i);
+                    s.desk.task_entry.files_changed = true;
                 }
             }),
         );
@@ -116,7 +117,9 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
                 .padding(4.0)
                 .color(c(INK))
                 .on_input_key(|s: &mut State, k, _| {
-                    if k.key == Key::Enter
+                    if crate::state::markdown_key(&mut s.desk.task_entry.form.body, k) {
+                        true
+                    } else if k.key == Key::Enter
                         && !k.mods.shift
                         && s.desk.task_entry.form.body.preedit().is_none()
                     {
@@ -137,6 +140,9 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
             |s| &mut s.desk.task_entry.labels,
             true,
         ));
+    }
+    if t.reload_needed {
+        body = body.child(reload_task());
     }
     if !t.files.is_empty() {
         body = body.child(attachments(s));
@@ -334,7 +340,7 @@ fn task_row(s: &State, t: &Task, compact: bool) -> El {
 
 pub(super) fn new_task(s: &State) -> El {
     let d = &s.desk;
-    col()
+    let form = col()
         .w_full()
         .gap(12.0)
         .child(field(
@@ -383,7 +389,15 @@ pub(super) fn new_task(s: &State) -> El {
             action("create-task", "Create task", true)
                 .disabled(!ready(s))
                 .on_press(|s: &mut State| s.create_task(None)),
-        )
+        );
+    if d.task_entry.reload_needed {
+        form.child(reload_task())
+    } else {
+        form
+    }
+}
+fn reload_task() -> El {
+    action("reload-task-draft", "Reload saved task draft", false).on_press(State::reload_task_entry)
 }
 pub(super) fn list(s: &State, compact: bool) -> El {
     let d = &s.desk;

@@ -203,6 +203,9 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
     }
     let mut d: Delivery = serde_json::from_value(job.payload)?;
     let m = Board::get_on(tx, d.message)?;
+    let predates_join: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_explicit_joins WHERE source=? AND thread=? AND joined_at>=?)",
+        params![source.name, job.thread, m.id], |r| r.get(0))?;
     let private: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM private_messages WHERE id IN (?,?))",
         params![m.id, m.re],
@@ -236,6 +239,9 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
         "file.delete" => true,
         _ => !m.deleted && copy,
     };
+    if predates_join {
+        current = false;
+    }
     if current
         && !private
         && matches!(
@@ -572,18 +578,73 @@ impl Board {
     }
     /// Intentionally start a remote conversation from a local root; a stopped/offline connector does nothing.
     pub fn start_source_thread(&self, who: &str, name: &str, root: i64) -> Result<Job> {
-        self.write(|tx|{let s=self.authorized_source(tx,name,who)?;ensure!(s.outbound,"publishing must be explicitly enabled");
-            ensure!(s.settings.github_items!=GithubItems::Pulls,"a pull-request-only source cannot open an issue");
-            let m=Self::get_on(tx,root)?;ensure!(m.channel==s.channel&&m.re.is_none()&&!m.no_sync&&!m.deleted,"expected a live shareable root in the mapped channel");
-            if let Some(id)=tx.query_row("SELECT item FROM sync_starts WHERE source=? AND root=?",params![name,root],|r|r.get(0)).optional()?{return get(tx,name,id);}
-            ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_threads WHERE source=? AND root=?)",params![name,root],|r|r.get::<_,bool>(0))?,Kind::Conflict.error("already_linked","thread already linked at this provider"));
-            let lane=format!("pending:{}",Uuid::new_v4());tx.execute("INSERT INTO sync_threads VALUES(?,?,?)",params![name,lane,root])?;
-            let d=Delivery{event:"thread.start".into(),message:root,cursor:root,text:m.text,parent:None,emoji:None,asset:None};
-            tx.execute("INSERT INTO sync_queue(source,direction,thread,event_key,payload,raw) VALUES(?,'out',?,?,?,'null')",params![name,lane,root.to_string(),serde_json::to_string(&d)?])?;
-            let id=tx.last_insert_rowid();tx.execute("INSERT INTO sync_starts VALUES(?,?,?)",params![name,root,id])?;
-            backfill(tx,&s,&lane,root)?;
-            Self::event_tx(tx,"thread.sync_requested",who,Some(root),json!({"source":name,"item":id}))?;
-            get(tx,name,id)})
+        self.write(|tx| self.start_source_thread_on(tx, who, name, root))
+    }
+    pub(super) fn start_source_thread_on(
+        &self,
+        tx: &Transaction<'_>,
+        who: &str,
+        name: &str,
+        root: i64,
+    ) -> Result<Job> {
+        let s = self.authorized_source(tx, name, who)?;
+        ensure!(s.outbound, "publishing must be explicitly enabled");
+        ensure!(
+            s.settings.github_items != GithubItems::Pulls,
+            "a pull-request-only source cannot open an issue"
+        );
+        let m = Self::get_on(tx, root)?;
+        ensure!(
+            m.channel == s.channel && m.re.is_none() && !m.no_sync && !m.deleted,
+            "expected a live shareable root in the mapped channel"
+        );
+        if let Some(id) = tx
+            .query_row(
+                "SELECT item FROM sync_starts WHERE source=? AND root=?",
+                params![name, root],
+                |r| r.get(0),
+            )
+            .optional()?
+        {
+            return get(tx, name, id);
+        }
+        ensure!(
+            !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sync_threads WHERE source=? AND root=?)",
+                params![name, root],
+                |r| r.get::<_, bool>(0)
+            )?,
+            Kind::Conflict.error("already_linked", "thread already linked at this provider")
+        );
+        let lane = format!("pending:{}", Uuid::new_v4());
+        tx.execute(
+            "INSERT INTO sync_threads VALUES(?,?,?)",
+            params![name, lane, root],
+        )?;
+        let d = Delivery {
+            event: "thread.start".into(),
+            message: root,
+            cursor: root,
+            text: m.text,
+            parent: None,
+            emoji: None,
+            asset: None,
+        };
+        tx.execute("INSERT INTO sync_queue(source,direction,thread,event_key,payload,raw) VALUES(?,'out',?,?,?,'null')",params![name,lane,root.to_string(),serde_json::to_string(&d)?])?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO sync_starts VALUES(?,?,?)",
+            params![name, root, id],
+        )?;
+        backfill(tx, &s, &lane, root)?;
+        Self::event_tx(
+            tx,
+            "thread.sync_requested",
+            who,
+            Some(root),
+            json!({"source":name,"item":id}),
+        )?;
+        get(tx, name, id)
     }
     pub fn backfill_source(&self, who: &str, name: &str, thread: &str) -> Result<usize> {
         self.write(|tx| {
@@ -637,15 +698,34 @@ impl Board {
         after: i64,
         limit: usize,
     ) -> Result<Vec<Job>> {
+        Ok(self.inbox_page(who, name, dir, after, limit)?.1)
+    }
+    /// Unlike the board event cursor, this continuation advances through this source queue's IDs.
+    pub fn inbox_page(
+        &self,
+        who: &str,
+        name: &str,
+        dir: Direction,
+        after: i64,
+        limit: usize,
+    ) -> Result<(i64, Vec<Job>)> {
         ensure!(
             after >= 0 && (1..=500).contains(&limit),
             "invalid cursor or limit"
         );
         let tx = self.conn.unchecked_transaction()?;
         self.authorized_source(&tx, name, who)?;
-        let rows=tx.prepare(&format!("SELECT {COLS} FROM sync_queue WHERE source=? AND direction=? AND id>? ORDER BY id LIMIT ?"))?.query_map(params![name,dir.sql(),after,limit as i64],item)?.collect::<rusqlite::Result<_>>()?;
+        let rows=tx.prepare(&format!("SELECT {COLS} FROM sync_queue WHERE source=? AND direction=? AND id>? ORDER BY id LIMIT ?"))?.query_map(params![name,dir.sql(),after,limit as i64],item)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let cursor = match rows.last() {
+            Some(last) => last.id,
+            None => tx.query_row(
+                "SELECT coalesce(max(id),0) FROM sync_queue WHERE source=? AND direction=?",
+                params![name, dir.sql()],
+                |r| r.get(0),
+            )?,
+        };
         tx.commit()?;
-        Ok(rows)
+        Ok((cursor, rows))
     }
     pub fn queue_item(&self, who: &str, name: &str, id: i64) -> Result<Job> {
         let tx = self.conn.unchecked_transaction()?;
@@ -831,10 +911,11 @@ impl Board {
     }
 }
 
-fn backfill(tx: &Transaction<'_>, s: &Source, thread: &str, root: i64) -> Result<usize> {
+pub(super) fn backfill(tx: &Transaction<'_>, s: &Source, thread: &str, root: i64) -> Result<usize> {
     Ok(tx.execute("INSERT INTO sync_queue(source,direction,thread,event_key,payload,raw)
       SELECT ?1,'out',?2,CAST(m.id AS TEXT),json_object('event','message.posted','message',m.id,'cursor',m.id,'text',m.text,'parent',m.reply_to),'null'
       FROM messages m WHERE m.re=?3 AND m.deleted=0 AND EXISTS(SELECT 1 FROM messages WHERE id=?3 AND deleted=0)
+      AND NOT EXISTS(SELECT 1 FROM sync_explicit_joins j WHERE j.source=?1 AND j.thread=?2 AND m.id<=j.joined_at)
       AND NOT EXISTS(SELECT 1 FROM private_messages WHERE id IN (m.id,m.re))
       AND NOT EXISTS (SELECT 1 FROM sync_copies sc WHERE sc.message=m.id AND sc.origin AND sc.source=?1) AND NOT EXISTS
         (SELECT 1 FROM sync_copies WHERE source=?1 AND thread=?2 AND message=m.id) ORDER BY m.id

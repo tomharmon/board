@@ -59,7 +59,7 @@ pub(crate) fn valid_file(name: &str, mime: &str) -> Result<()> {
     );
     Ok(())
 }
-pub(crate) fn valid_name(name: &str) -> Result<()> {
+pub fn valid_name(name: &str) -> Result<()> {
     static INVISIBLE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"[\p{Cf}\x{2028}\x{2029}]").expect("constant filename pattern")
     });
@@ -163,7 +163,9 @@ impl Access {
                 )
                 .optional()?
                 .context(missing())?;
-            if self.everywhere(Action::Read)
+            // Full channel visibility is not ownership of other people's unpublished uploads.
+            // Numeric compatibility IDs are enumerable; every delegate needs a live placement.
+            if self.is_trusted()
                 || (uploader.split('/').next() == Some(principal)
                     && [Action::Post, Action::Read, Action::Sync]
                         .into_iter()

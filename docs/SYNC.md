@@ -78,6 +78,20 @@ payloads.
 
 ## Publish deliberately
 
+To create a new Board root and request one or more destinations in **one
+SQLite transaction**, use `board post work/github "Triage note" --sync bugs:123`
+(join issue 123 at the configured `bugs` source), or `--sync bugs` to request a
+new issue. Both require publishing already enabled and a mapped channel you may
+use. Use an issue/PR number for GitHub, a thread timestamp for Slack and the
+issue UUID for Linear. The post fails as a unit for invalid or inaccessible
+local destinations. A link does not prove the remote thread exists. A join overrides an
+automatic new-thread mirror at that same source. It queues **zero** old messages:
+the provider keeps its own original, and only newly posted replies are eligible.
+A retry with the same post key does not add destinations.
+`board sync targets MESSAGE` shows pending versus confirmed state;
+`board read URL` and `board sync locate URL` resolve retained links without
+contacting the provider. Nothing is sent until an operator runs the connector.
+
 ```sh
 board sources publishing bugs on
 board reply "$(board sync find bugs 1)" 'A reply to share'
@@ -88,9 +102,11 @@ board sources publishing bugs off
 
 By default, enabling publishing only queues subsequent changes in **linked**
 threads. Use `sync start NAME LOCAL_ROOT` to deliberately queue a *new*
-provider conversation and its current local replies. Use `sync link NAME
-REMOTE_THREAD EXTERNAL_ID LOCAL_ID` to assert an existing copy, and
-`sync backfill NAME REMOTE_THREAD` to explicitly queue old unshared replies.
+provider conversation and its current local replies. For an existing conversation
+use `sync join-thread NAME REMOTE_THREAD LOCAL_ROOT`: older replies and the root
+stay off that destination even on explicit backfill. Use `sync link NAME
+REMOTE_THREAD EXTERNAL_ID LOCAL_ID` only to assert an actual, writable message
+copy. `sync backfill NAME REMOTE_THREAD` queues eligible unshared replies.
 Do not link an object you do not control for editing. Delivered messages
 preserve their confirmed external ID/permalink; `sync linked NAME URL` and
 `sync copies NAME LOCAL_ID` recover them. Inbound posts do not echo back

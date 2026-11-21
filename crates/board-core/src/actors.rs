@@ -75,18 +75,59 @@ const CARDS:&str="SELECT k.id,p.handle,p.name,coalesce(p.verified,0),
   coalesce(sp.source,(SELECT cp.source FROM sync_copies cp JOIN messages seen ON seen.id=cp.message WHERE cp.origin AND seen.actor=k.id LIMIT 1)),
   sp.name,coalesce(sp.avatar,av.url) FROM known k LEFT JOIN actor_profiles p ON p.id=k.id
   LEFT JOIN sync_profiles sp ON sp.actor=k.id LEFT JOIN actor_avatars av ON av.id=k.id";
+fn imported_handle(source: &str, name: Option<&str>, fallback: &str) -> String {
+    static MARKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"\p{M}+").expect("Unicode category"));
+    fn slug(s: &str) -> String {
+        let decomposed = icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd()
+            .normalize_iter(s.chars())
+            .collect::<String>();
+        let mut out = String::new();
+        let mut space = false;
+        for c in MARKS
+            .replace_all(&decomposed, "")
+            .chars()
+            .flat_map(char::to_lowercase)
+        {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                if space {
+                    out.push('-');
+                    space = false;
+                }
+                out.push(c);
+            } else {
+                space = true;
+            }
+        }
+        out.trim_matches(['.', '_', '-']).to_owned()
+    }
+    let mut leaf = name.map_or_else(String::new, slug);
+    if leaf.is_empty() {
+        leaf = slug(fallback);
+    }
+    let room = 128usize.saturating_sub(source.len() + 1);
+    if leaf.len() > room {
+        leaf.truncate(room);
+        leaf.truncate(leaf.trim_end_matches(['.', '_', '-']).len());
+    }
+    format!("{source}/{leaf}")
+}
 fn card(r: &rusqlite::Row<'_>) -> rusqlite::Result<ActorEntry> {
     let id: String = r.get(0)?;
     let source: Option<String> = r.get(4)?;
     let external = source.is_some();
     let profile = id.split_once('/');
+    let remote_name: Option<String> = r.get(5)?;
     let default_handle = if let Some(source) = &source {
-        format!("{source}/{}", profile.map_or(id.as_str(), |p| p.1))
+        imported_handle(
+            source,
+            remote_name.as_deref(),
+            profile.map_or(id.as_str(), |p| p.1),
+        )
     } else {
         id.clone()
     };
-    let name = r
-        .get::<_, Option<String>>(5)?
+    let name = remote_name
         .or(r.get(2)?)
         .unwrap_or_else(|| profile.map_or(id.as_str(), |(_, s)| s).to_owned());
     Ok(ActorEntry {
@@ -118,40 +159,78 @@ pub(crate) fn valid_avatar(s: &str) -> Result<()> {
     ensure!(
         s.len() <= 2048
             && !s.chars().any(|c| c.is_control() || c.is_whitespace())
-            && uri.scheme() == "https"
+            && (uri.scheme() == "https"
+                || (uri.scheme() == "http"
+                    && matches!(uri.host_str(), Some("localhost" | "127.0.0.1"))))
             && uri.host().is_some()
             && uri.username().is_empty()
             && uri.password().is_none(),
-        "avatar must be an HTTPS URL without credentials"
+        "avatar must be HTTPS, or HTTP on localhost, without credentials"
     );
     Ok(())
 }
 
 impl Board {
     pub fn actor_directory(&self, query: Option<&str>) -> Result<Vec<ActorEntry>> {
+        Ok(self.actor_directory_page(query, &[])?.1)
+    }
+    /// A directory response and its event cursor come from the same read transaction.
+    /// Unknown and inaccessible requested IDs are indistinguishable.
+    pub fn actor_directory_page(
+        &self,
+        query: Option<&str>,
+        ids: &[String],
+    ) -> Result<(i64, Vec<ActorEntry>)> {
+        ensure!(
+            ids.len() <= 100,
+            Invalid.error("invalid_actor_ids", "at most 100 actor IDs")
+        );
+        for id in ids {
+            validate_actor(id)?;
+        }
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
-        let rows = Self::actor_directory_on(&tx, &a, query)?;
+        let rows = Self::directory_selected(&tx, &a, query, ids)?;
+        let cursor = crate::read::cursor_on(&tx)?;
         tx.commit()?;
-        Ok(rows)
+        Ok((cursor, rows))
     }
     pub(crate) fn actor_directory_on(
         tx: &Connection,
         a: &crate::access::Access,
         query: Option<&str>,
     ) -> Result<Vec<ActorEntry>> {
+        Self::directory_selected(tx, a, query, &[])
+    }
+    fn directory_selected(
+        tx: &Connection,
+        a: &crate::access::Access,
+        query: Option<&str>,
+        ids: &[String],
+    ) -> Result<Vec<ActorEntry>> {
         let channels = a
             .channels(tx, Action::Read)?
             .map(|v| serde_json::to_string(&v))
             .transpose()?;
-        let sql=format!("WITH known(id) AS (SELECT actor FROM events UNION SELECT id FROM actor_profiles UNION SELECT actor FROM sync_profiles UNION SELECT ?2 WHERE ?2 IS NOT NULL),
+        let known = if ids.is_empty() {
+            "SELECT actor FROM events WHERE ?3 IS NULL UNION SELECT id FROM actor_profiles UNION SELECT actor FROM sync_profiles UNION SELECT ?2 WHERE ?2 IS NOT NULL"
+        } else {
+            "SELECT DISTINCT w.value FROM json_each(?3) w WHERE w.value=?2 OR EXISTS(SELECT 1 FROM events WHERE actor=w.value)
+                OR EXISTS(SELECT 1 FROM actor_profiles WHERE id=w.value) OR EXISTS(SELECT 1 FROM sync_profiles WHERE actor=w.value)"
+        };
+        let wanted = if ids.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(ids)?)
+        };
+        let sql=format!("WITH known(id) AS ({known}),
            readable(id,actor) AS (SELECT id,actor FROM messages WHERE channel IN (SELECT value FROM json_each(?1))),
            visible(id) AS (SELECT actor FROM readable UNION SELECT r.actor FROM reactions r JOIN readable m ON m.id=r.message_id
            UNION SELECT e.actor FROM exact_mentions e JOIN readable m ON e.message_id=m.id UNION SELECT ?2 WHERE ?2 IS NOT NULL)
            {CARDS} WHERE ?1 IS NULL OR k.id IN (SELECT id FROM visible)");
         let rows = tx
             .prepare(&sql)?
-            .query_map(params![channels, a.bound_actor()], card)?
+            .query_map(params![channels, a.bound_actor(), wanted], card)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         let q = query.unwrap_or("").to_lowercase();
         let mut rows: Vec<_> = rows
@@ -230,14 +309,25 @@ impl Board {
         );
         let a = self.access_on(c)?;
         a.actor(actor)?;
-        if scope == "new" {
+        if matches!(scope, "new" | "tasks") {
+            return Ok(None);
+        }
+        if let Some(channel) = scope.strip_prefix("channel:") {
+            validate_channel(channel)?;
+            ensure!(
+                a.allows(Action::Read, channel) || a.allows(Action::Post, channel),
+                Missing.error("draft_not_found", "draft not found")
+            );
             return Ok(None);
         }
         let id = scope
             .strip_prefix("thread:")
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|v| *v > 0)
-            .context(Invalid.error("invalid_draft", "expected new or thread:ID"))?;
+            .context(Invalid.error(
+                "invalid_draft",
+                "expected new, tasks, channel:NAME or thread:ID",
+            ))?;
         a.message(c, id, Action::Read)?;
         let root: i64 = c.query_row(
             "SELECT coalesce(re,id) FROM messages WHERE id=?",
@@ -284,7 +374,9 @@ impl Board {
             let old:Option<String>=tx.query_row("SELECT channel FROM composer_drafts WHERE actor=? AND scope=?",[key.as_str(),scope],|r|r.get(0)).optional()?;
             ensure!(old.is_none_or(|s|s.is_empty() || a.allows(Action::Read,&s) || a.allows(Action::Post,&s)),Missing.error("draft_not_found","draft not found"));
             if let Some(d)=draft.filter(|d|!d.body.is_empty()){
-                ensure!(d.body.chars().count()<=10_000 && !d.body.contains('\0'),"draft exceeds message limits");
+                ensure!(d.body.encode_utf16().count()<=10_000 && !d.body.contains('\0'),"draft exceeds message limits");
+                ensure!(scope.strip_prefix("channel:").is_none_or(|ch| ch == d.channel),
+                    Invalid.error("invalid_draft", "draft destination differs from its channel"));
                 if !d.channel.is_empty(){validate_channel(&d.channel)?;a.require(Action::Post,&d.channel)?;}
                 if let Some(target)=d.reply_to{let channel=a.message(tx,target,Action::Read)?;
                     let parent:i64=tx.query_row("SELECT coalesce(re,id) FROM messages WHERE id=?",[target],|r|r.get(0))?;
@@ -444,11 +536,9 @@ pub(crate) fn mention_terms(
         return Ok(terms.into_iter().map(|t| format!("@[{t}]")).collect());
     }
     if a.everywhere(Action::Read) {
-        let rows=c.prepare("SELECT id,handle FROM actor_profiles UNION ALL SELECT actor,source||'/'||substr(actor,instr(actor,'/')+1) FROM sync_profiles")?
-            .query_map([],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        for (id, handle) in rows {
-            let id = crate::prose::term(&id);
-            let handle = crate::prose::term(&handle);
+        for person in Board::actor_directory_on(c, a, Some(&term))? {
+            let id = crate::prose::term(&person.id);
+            let handle = crate::prose::term(&person.handle);
             if id == term || handle == term {
                 terms.push(id);
                 terms.push(handle);

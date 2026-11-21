@@ -41,20 +41,18 @@ pub(super) struct ActorQuery {
     #[serde(default)]
     details: bool,
 }
-fn actor_query(raw: Option<String>) -> ApiResult<(ActorQuery, std::collections::BTreeSet<String>)> {
-    let mut ids = std::collections::BTreeSet::new();
-    let mut count = 0;
+fn actor_query(raw: Option<String>) -> ApiResult<(ActorQuery, Vec<String>)> {
+    let mut ids = Vec::new();
     let mut scalars = url::form_urlencoded::Serializer::new(String::new());
     for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes()) {
         if k == "id" {
-            count += 1;
-            if count > 100 || board_local::validate_actor(&v).is_err() {
+            if ids.len() == 100 || board_local::validate_actor(&v).is_err() {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "at most 100 valid actor IDs",
                 ));
             }
-            ids.insert(v.into_owned());
+            ids.push(v.into_owned());
         } else {
             scalars.append_pair(&k, &v);
         }
@@ -65,19 +63,13 @@ fn actor_query(raw: Option<String>) -> ApiResult<(ActorQuery, std::collections::
 }
 pub(super) async fn actors(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
     let (q, ids) = actor_query(raw)?;
-    let rows = a
-        .call(move |b, _| {
-            let mut rows = b.actor_directory(q.query.as_deref())?;
-            if !ids.is_empty() {
-                rows.retain(|a| ids.contains(&a.id));
-            }
-            Ok(rows)
-        })
+    let (cursor, rows) = a
+        .call(move |b, _| b.actor_directory_page(q.query.as_deref(), &ids))
         .await?;
     Ok(Json(if q.details {
-        json!({"actors":rows})
+        json!({"actors":rows,"cursor":cursor})
     } else {
-        json!({"actors":rows.into_iter().map(|a|a.id).collect::<Vec<_>>()})
+        json!({"actors":rows.into_iter().map(|a|a.id).collect::<Vec<_>>(),"cursor":cursor})
     }))
 }
 #[derive(Deserialize)]
@@ -216,13 +208,16 @@ pub(super) struct ThreadQuery {
 pub(super) async fn thread(
     State(a): State<App>,
     Path(id): Path<i64>,
-    Query(q): Query<ThreadQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Data {
+    let (q, terms) = query_terms::<ThreadQuery>(raw)?;
+    let label_terms = board_local::LabelTerm::parse(&terms)?;
     Ok(Json(json!(
         a.call(move |b, _| b.conversation_window(
             id,
             &Filter {
                 after: q.after,
+                label_terms,
                 ..Filter::default()
             },
             q.limit
@@ -244,6 +239,8 @@ pub(super) async fn message(State(a): State<App>, Path(id): Path<i64>) -> Data {
 pub(super) struct NewMessage {
     #[serde(default)]
     no_sync: bool,
+    #[serde(default)]
+    sync_targets: Vec<String>,
     channel: Option<String>,
     reply_to: Option<i64>,
     #[serde(default)]
@@ -296,8 +293,16 @@ pub(super) async fn post_message(
                 attachment_ids: super::files_api::resolve(b, actor, &input.attachment_ids)?,
             };
             match (input.channel, input.reply_to) {
-                (Some(c), None) => b.post_with_outcome(&c, actor, &input.text, &opts),
-                (None, Some(id)) => b.reply_with_outcome(id, actor, &input.text, &opts),
+                (Some(c), None) => {
+                    b.post_with_targets(&c, actor, &input.text, &opts, &input.sync_targets)
+                }
+                (None, Some(id)) => {
+                    anyhow::ensure!(
+                        input.sync_targets.is_empty(),
+                        "sync_targets applies only to a new thread"
+                    );
+                    b.reply_with_outcome(id, actor, &input.text, &opts)
+                }
                 _ => anyhow::bail!("provide exactly one of channel or reply_to"),
             }
         })
@@ -395,6 +400,8 @@ pub(super) async fn attachment(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EventQuery {
+    #[serde(default)]
+    all: bool,
     after: Option<i64>,
     from: Option<String>,
     limit: Option<usize>,
@@ -423,8 +430,15 @@ pub(super) async fn events(
                 .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "invalid Last-Event-ID"))
         })
         .transpose()?;
-    let pos = q.after.or(last_id);
-    if q.last.is_some() && (pos.is_some() || q.kind.is_some()) {
+    if q.after.is_some_and(|n| n < 0) || q.last.is_some_and(|n| n > 100) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "after must be nonnegative and last at most 100",
+        ));
+    }
+    // A reconnect keeps its original URL. The delivered ID must not replay the initial seed.
+    let pos = last_id.max(q.after);
+    if q.last.is_some() && (q.after.is_some() || q.kind.is_some()) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "last cannot be combined with a cursor or kind",
@@ -453,20 +467,16 @@ pub(super) async fn events(
         .call(move |b, who| {
             let mut f = f;
             resolve_me(&mut f, who);
+            f.validate()?;
             Ok((f, b.cursor()?))
         })
         .await?;
-    if pos.is_some_and(|n| n < 0) {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "after must be nonnegative",
-        ));
-    }
     let mut after = pos.unwrap_or(head).min(head);
     let mut history = std::collections::VecDeque::new();
-    if let Some(n) = q.last {
+    let seed = q.last.filter(|_| last_id.is_none());
+    if let Some(n) = seed {
         let filter = f.clone();
-        let (h, rows) = a.call(move |b, _| b.event_tail(n, &filter)).await?;
+        let (h, rows) = a.call(move |b, _| b.tail_feed(n, &filter, q.all)).await?;
         after = h;
         history = rows.into();
     }
@@ -481,9 +491,9 @@ pub(super) async fn events(
             })
         })
     {
-        return Ok(super::sse::stream(a, f, q.kind, after, history));
+        return Ok(super::sse::stream(a, f, q.kind, q.all, after, history));
     }
-    if q.last.is_some() {
+    if seed.is_some() {
         return Ok(Json(json!({"cursor":after,"events":history})).into_response());
     }
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait);
@@ -491,7 +501,7 @@ pub(super) async fn events(
         let filter = f.clone();
         let kind = q.kind.clone();
         let (pos, events) = a
-            .call(move |b, _| b.event_page(after, limit, &filter, kind.as_deref()))
+            .call(move |b, _| b.event_feed(after, limit, &filter, kind.as_deref(), q.all))
             .await?;
         after = pos;
         if !events.is_empty() || tokio::time::Instant::now() >= deadline {

@@ -21,6 +21,7 @@ fn body(s: &State, reply: bool) -> El {
         .on_input_paste(|s: &mut State, content, _| s.paste_file(content))
         .on_input_change(move |s: &mut State, _| {
             s.draft_changed();
+            s.update_inline(false);
             if reply {
                 s.note_typing();
             }
@@ -31,8 +32,27 @@ fn body(s: &State, reply: bool) -> El {
         .pt(10.)
         .pb(2.)
         .no_focus_ring()
-        .on_input_key(|s: &mut State, k, tx| {
-            if k.key == Key::Enter && !k.mods.shift && s.body.preedit().is_none() {
+        .on_input_key(move |s: &mut State, k, tx| {
+            if s.inline_key(k, tx) {
+                true
+            } else if crate::state::markdown_key(&mut s.body, k) {
+                s.draft_changed();
+                s.update_inline(false);
+                if reply {
+                    s.note_typing();
+                }
+                true
+            } else if k.key == Key::Up
+                && s.body.text.is_empty()
+                && s.body.preedit().is_none()
+                && !k.mods.shift
+                && !k.mods.cmd
+                && !k.mods.ctrl
+                && !k.mods.alt
+            {
+                s.edit_last_visible(tx);
+                true
+            } else if k.key == Key::Enter && !k.mods.shift && s.body.preedit().is_none() {
                 if can_send(s) {
                     s.send(tx);
                 }
@@ -233,6 +253,31 @@ pub(super) fn edit(s: &State, reply: bool, inset: f32) -> El {
         area = area.child(flags);
     }
     area = area.child(body(s, reply));
+    if s.inline_open() {
+        let mut choices = row().w_full().px(8.).flex_wrap().gap(3.);
+        for (i, person) in s.people.inline.rows.iter().enumerate() {
+            let id = person.id.clone();
+            choices = choices.child(
+                click(
+                    row().key(format!("mention-choice-{i}")).px(5.).py(2.).fill(
+                        if s.people.inline.selected == i {
+                            c(TINT)
+                        } else {
+                            Color::TRANSPARENT
+                        },
+                    ),
+                    &format!("Mention {}", person.name),
+                )
+                .child(
+                    label(format!("@{}", person.handle), 12., 400., INK)
+                        .max_w(190.)
+                        .truncate(),
+                )
+                .on_press_tx(move |s: &mut State, tx| s.complete_mention(&id, tx)),
+            );
+        }
+        area = area.child(choices);
+    }
     if !s.files.is_empty() {
         area = area.child(files(s));
     }

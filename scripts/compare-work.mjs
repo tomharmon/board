@@ -32,6 +32,7 @@ function reference() {
       watcher: d.watcher, message: d.event.message.id, key: d.id, receipt: d.lease, attempt: d.attempt,
     })),
     ack: (d, options) => b.ack(d.key, {lease: d.receipt, ...options}),
+    ackPending: d => b.ack(d.key, {lease:d.receipt}),
     schedule: (id, text, timing) => b.schedule({re: id}, {text, ...timing, labels, noSync: true}),
     schedules: (id, all) => b.schedules({re: id, all}),
     cancel: async id => (await b.cancelSchedule(id)).schedule, tick() {},
@@ -75,6 +76,7 @@ function port() {
     })),
     ack: (d, options = {}) => cli(['watchers', 'ack', d.watcher, d.cursor, '--receipt', d.receipt,
       ...(options.error ? ['--error', options.error] : []), ...(options.skip ? ['--skip'] : [])]),
+    ackPending: d => cli(['watchers','ack',d.watcher,d.cursor,'--receipt',d.receipt,'--if-pending']),
     schedule: (id, text, timing) => cli(['schedule', id, text, '--no-sync', '--label', 'project=comparison',
       ...Object.entries(timing).flatMap(([k, v]) => ['--' + k, v])]),
     schedules: (id, all) => cli(['schedules', id, ...(all ? ['--all'] : [])]),
@@ -133,7 +135,7 @@ async function transcript(open) {
     const right = await b.post(wch, 'right', true);
     const offered = await batch(2), l = offered.find(d => d.message === left.id), r = offered.find(d => d.message === right.id);
     watch('independentFilteredThreadHeads', [offered.length, l?.watcher, r?.watcher], [2, 'triage', 'triage']);
-    differences.firstAttempt = l.attempt;
+    watch('firstDeliveryAttemptStartsAtZero',l.attempt,0);
     watch('leaseBlocksOtherPull', await b.pull(), []);
     await b.register(true);
     await restart();
@@ -147,9 +149,10 @@ async function transcript(open) {
     watch('redeliveryPreservesInput', retry.message === next.id && retry.key === follow.key, true);
     watch('redeliveryRotatesProofAndCountsAttempt', retry.receipt !== follow.receipt && retry.attempt === follow.attempt + 1, true);
     rejected('watchers', 'staleAttemptCannotFinish', await failure(() => b.ack(follow)), 'stale_lease', 'delivery_conflict');
-    await b.ack(retry, {skip: true}); await b.ack(r);
+    await b.ack(retry, {skip: true}); await b.ackPending(r);
     watch('skipAndAckDrainQueue', await b.pull(), []);
     differences.repeatedAck = await failure(() => b.ack(r));
+    rejected('watchers','strictRepeatReportsNoMatch',await failure(()=>b.ackPending(r)),'no_match');
     await b.register(false);
     watch('emptySetRemovesSubscriptions', await b.names(), []);
 
@@ -193,7 +196,7 @@ async function transcript(open) {
     rejected('tasks', 'concurrentHolderRefused', await failure(() => b.claim(id, token(), 60)), 'task_claimed');
     task('proofNotInPublicThread', !JSON.stringify(await b.thread(id)).includes(chosen), true);
     const renewed = await b.renew(first, 300);
-    differences.renewResponseReturnsProof = renewed.proof === chosen;
+    task('renewReturnsOnlyTheHoldersPrivateProof',renewed.proof === chosen,true);
     const afterRenew = await b.claim(id, chosen, 60);
     task('renewKeepsProofAndEpoch', [afterRenew.proof === chosen && afterRenew.deadline === renewed.deadline, renewed.epoch === first.epoch, renewed.deadline - first.deadline >= 239000], [true, true, true]);
     await restart();
@@ -236,8 +239,8 @@ try {
   for (const r of results) if (r.status === 'rejected') throw r.reason;
   const [ref, rust] = results.map(r => r.value);
   assert.deepEqual(rust.out, ref.out);
-  assert.deepEqual(ref.differences, {firstAttempt: 0, repeatedAck: 'no_match', renewResponseReturnsProof: true});
-  assert.deepEqual(rust.differences, {firstAttempt: 1, repeatedAck: null, renewResponseReturnsProof: false});
+  assert.deepEqual(ref.differences, {repeatedAck: 'no_match'});
+  assert.deepEqual(rust.differences, {repeatedAck: null});
   const counts = Object.fromEntries(Object.entries(rust.out).map(([group, rows]) => [group, Object.keys(rows).length]));
   console.log('Equivalent measured outcomes:', counts, 'total', Object.values(counts).reduce((a, b) => a + b, 0));
   console.log('Measured differences (original, Rust):', ref.differences, rust.differences);

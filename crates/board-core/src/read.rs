@@ -372,16 +372,6 @@ impl Board {
             .map(|a| a.id)
             .collect())
     }
-    pub fn channels(&self) -> Result<Vec<Channel>> {
-        let tx = self.conn.unchecked_transaction()?;
-        let a = self.access_on(&tx)?;
-        let rows=tx.prepare("SELECT c.name,count(CASE WHEN m.id IS NOT NULL AND m.re IS NULL THEN 1 END),count(m.id),max(m.id) FROM channels c LEFT JOIN messages m ON m.channel=c.name GROUP BY c.name ORDER BY c.name")?.query_map([],|r|Ok(Channel{name:r.get(0)?,threads:r.get(1)?,messages:r.get(2)?,last:r.get(3)?}))?.collect::<rusqlite::Result<Vec<_>>>()?;
-        tx.commit()?;
-        Ok(rows
-            .into_iter()
-            .filter(|c| a.allows(Action::Read, &c.name))
-            .collect())
-    }
     pub fn cursor(&self) -> Result<i64> {
         self.access_on(&self.conn)?;
         cursor_on(&self.conn)
@@ -503,7 +493,7 @@ impl Board {
         let resume = if more && f.after.is_some() {
             ids[limit - 1]
         } else {
-            cursor.max(f.after.unwrap_or(0))
+            cursor
         };
         if f.after.is_none() {
             ids.reverse();
@@ -538,27 +528,58 @@ impl Board {
         let a = self.access_on(&tx)?;
         check_channel(&tx, &a, f)?;
         let cursor = cursor_on(&tx)?;
-        // Qualify a thread by any matching message. Rank and page the qualified
-        // threads by all of their live activity, not just by what happened to match.
-        let mut filter = f.clone();
-        filter.after = None;
-        let (pred, mut p) = visible_predicate(&tx, &a, &filter)?;
-        let bound = if let Some(n) = before {
+        f.validate()?;
+        let mut conditions = Vec::new();
+        let mut p = Vec::new();
+        if let Some(scope) = &f.channel {
+            if let Some(base) = scope.strip_suffix('/') {
+                conditions.push("(t.channel=? OR instr(t.channel,?)=1)".to_owned());
+                p.push(base.to_owned().into());
+            } else {
+                conditions.push("t.channel=?".to_owned());
+            }
+            p.push(scope.clone().into());
+        }
+        if f.by.is_some()
+            || f.from.is_some()
+            || f.mentions.is_some()
+            || f.re.is_some()
+            || f.text.is_some()
+            || !f.labels.is_empty()
+            || !f.label_terms.is_empty()
+        {
+            let filter = Filter {
+                after: None,
+                ..f.clone()
+            };
+            let (pred, params) = visible_predicate(&tx, &a, &filter)?;
+            conditions.push(format!(
+                "t.root IN (SELECT coalesce(m.re,m.id) FROM messages m WHERE {pred})"
+            ));
+            p.extend(params);
+        } else if f.channel.as_ref().is_none_or(|ch| ch.ends_with('/'))
+            && let Some(channels) = a.channels(&tx, Action::Read)?
+        {
+            conditions.push("t.channel IN (SELECT value FROM json_each(?))".to_owned());
+            p.push(serde_json::to_string(&channels)?.into());
+        }
+        if let Some(n) = before {
+            conditions.push("t.activity<?".into());
             p.push(n.into());
-            "WHERE activity<?"
         } else if let Some(n) = f.after {
+            conditions.push("t.activity>?".into());
             p.push(n.into());
-            "WHERE activity>?"
+        }
+        let pred = if conditions.is_empty() {
+            String::new()
         } else {
-            ""
+            format!(" WHERE {}", conditions.join(" AND "))
         };
         let order = if f.after.is_some() { "ASC" } else { "DESC" };
         p.push(((limit + 1) as i64).into());
         let sql = format!(
-            "WITH matched(root) AS (SELECT DISTINCT coalesce(m.re,m.id) FROM messages m WHERE {pred}),
-             summaries AS (SELECT root,coalesce(max(live.id),root) AS activity,count(live.id) AS replies,max(live.id) AS last
-               FROM matched LEFT JOIN messages live ON live.re=matched.root AND NOT live.deleted GROUP BY root)
-             SELECT root,activity,replies,last FROM summaries {bound} ORDER BY activity {order} LIMIT ?"
+            "SELECT t.root,t.activity,t.replies,CASE WHEN t.replies>0 THEN t.activity END
+            FROM thread_activity t{pred} ORDER BY t.activity {order} LIMIT ?"
         );
         let mut ids: Vec<(i64, i64, i64, Option<i64>)> = tx
             .prepare(&sql)?
@@ -572,7 +593,7 @@ impl Board {
         let resume = if more && f.after.is_some() {
             ids[limit - 1].1
         } else {
-            cursor.max(f.after.unwrap_or(0))
+            cursor
         };
         if f.after.is_none() {
             ids.reverse();

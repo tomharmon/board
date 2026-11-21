@@ -23,10 +23,13 @@ pub enum Commands {
     Schedules {
         #[arg(long)]
         all: bool,
-        /// Include replies scheduled anywhere in this message's thread
-        thread: Option<i64>,
+        /// A message ID lists its thread's timers; s<ID> shows one timer in any state.
+        target: Option<String>,
         #[arg(long)]
         by: Option<String>,
+        /// Exact channel, or a subtree ending in /.
+        #[arg(long)]
+        channel: Option<String>,
     },
     /// Durable named event subscriptions.
     Watchers {
@@ -244,6 +247,9 @@ pub struct ScheduleArgs {
     text: Option<String>,
     #[arg(long)]
     file: Option<PathBuf>,
+    /// Treat the text or file as JSON for a local name@version schema
+    #[arg(long)]
+    schema: Option<String>,
     #[arg(long = "attach", value_name = "FILE")]
     attachments: Vec<PathBuf>,
     #[arg(long = "attachment-id")]
@@ -324,6 +330,9 @@ pub enum WatchCmd {
         cursor: i64,
         #[arg(long, env = "BOARD_DELIVERY_RECEIPT", hide_env_values = true)]
         receipt: Option<String>,
+        /// Require a still-pending lease; a proven repeat reports no_match instead of success
+        #[arg(long, requires = "receipt")]
+        if_pending: bool,
         /// Intentionally skip this event, allowing its thread to advance
         #[arg(long, conflicts_with = "error")]
         skip: bool,
@@ -542,18 +551,13 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
             }
             let opts = PostOptions {
                 labels: crate::pairs(ls, false)?,
-                files: crate::attachment_files(attachments)?,
-                attachment_ids: attachment_ids
-                    .iter()
-                    .map(|key| board.file_id(actor, key))
-                    .collect::<Result<Vec<_>>>()?,
                 key: if text.is_some() || !attachments.is_empty() || !attachment_ids.is_empty() {
                     output_key(board, actor, key.as_deref())?
                 } else {
                     None
                 },
                 no_sync: *no_sync,
-                ..Default::default()
+                ..crate::attachments::placements(board, actor, target, attachments, attachment_ids)?
             };
             let input = match text.as_deref() {
                 Some("-") => Some(std::io::read_to_string(std::io::stdin().lock())?),
@@ -572,7 +576,7 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
                         ls.is_empty() && key.is_none() && !*no_sync,
                         "labels and idempotency apply to new threads only"
                     );
-                    TaskTarget::Existing(target.parse()?)
+                    TaskTarget::Existing(crate::parse_id(target).map_err(anyhow::Error::msg)?)
                 }
             };
             let cache = claim.then(cached).transpose()?;
@@ -704,13 +708,23 @@ impl Commands {
             Self::Tasks(cmd) => task_command(*cmd, board, actor, json, path),
             Self::Schedule(a) => {
                 let s = if a.target == "cancel" {
+                    ensure!(
+                        !a.no_sync
+                            && a.file.is_none()
+                            && a.schema.is_none()
+                            && a.attachments.is_empty()
+                            && a.attachment_ids.is_empty()
+                            && a.delay.is_none()
+                            && a.at.is_none()
+                            && a.every.is_none()
+                            && a.labels.is_empty(),
+                        "schedule cancel takes only a schedule ID"
+                    );
+                    let key = a.text.as_deref().context("cancel requires a schedule ID")?;
                     cancel_schedule(
                         board,
-                        a.text
-                            .as_deref()
-                            .ok_or_else(|| anyhow!("cancel requires a schedule id"))?
-                            .trim_start_matches('s')
-                            .parse()?,
+                        crate::parse_id(key.strip_prefix('s').unwrap_or(key))
+                            .map_err(anyhow::Error::msg)?,
                         actor,
                     )?
                 } else {
@@ -737,14 +751,14 @@ impl Commands {
                     } else {
                         a.until.as_deref().map(date).transpose()?
                     };
-                    let dest = a
-                        .target
-                        .parse::<i64>()
+                    let dest = crate::message_id(&a.target)
                         .map_or(Destination::Channel(&a.target), Destination::Reply);
-                    let text = match a.file.as_deref() {
-                        Some(p) => crate::load_text(p)?,
-                        None => a.text.unwrap_or_default(),
-                    };
+                    let text = crate::Body {
+                        text: a.text,
+                        file: a.file,
+                        schema: a.schema,
+                    }
+                    .read()?;
                     schedule_post(
                         board,
                         actor,
@@ -759,20 +773,48 @@ impl Commands {
                         &PostOptions {
                             no_sync: a.no_sync,
                             labels: crate::pairs(&a.labels, false)?,
-                            files: crate::attachment_files(&a.attachments)?,
-                            attachment_ids: a
-                                .attachment_ids
-                                .iter()
-                                .map(|key| board.file_id(actor, key))
-                                .collect::<Result<Vec<_>>>()?,
-                            ..Default::default()
+                            ..crate::attachments::placements(
+                                board,
+                                actor,
+                                &a.target,
+                                &a.attachments,
+                                &a.attachment_ids,
+                            )?
                         },
                     )?
                 };
                 print(&s, json, || sched_line(&s))
             }
-            Self::Schedules { all, thread, by } => {
-                let s = schedule_query(board, all, thread, by.as_deref(), 0, i64::MAX, false)?.1;
+            Self::Schedules {
+                all,
+                target,
+                by,
+                channel,
+            } => {
+                if let Some(id) = target.as_deref().and_then(|s| s.strip_prefix('s')) {
+                    ensure!(
+                        !all && by.is_none() && channel.is_none(),
+                        "a single schedule does not take list filters"
+                    );
+                    let s = get_schedule(board, crate::parse_id(id).map_err(anyhow::Error::msg)?)?;
+                    return print(&s, json, || sched_line(&s));
+                }
+                let thread = target
+                    .as_deref()
+                    .map(crate::parse_id)
+                    .transpose()
+                    .map_err(anyhow::Error::msg)?;
+                let s = schedule_query_in(
+                    board,
+                    all,
+                    thread,
+                    by.as_deref(),
+                    channel.as_deref(),
+                    0,
+                    i64::MAX,
+                    true,
+                )?
+                .1;
                 print(&s, json, || {
                     s.iter().map(sched_line).collect::<Vec<_>>().join("\n")
                 })
@@ -889,6 +931,7 @@ impl Commands {
                     name,
                     cursor,
                     receipt,
+                    if_pending,
                     skip,
                     error,
                 } => {
@@ -897,7 +940,14 @@ impl Commands {
                         (_, Some(why)) => (DeliveryOutcome::Error(why), "recorded failure for"),
                         _ => (DeliveryOutcome::Ack, "acknowledged"),
                     };
-                    settle_delivery(board, &name, cursor, receipt.as_deref(), outcome)?;
+                    settle_delivery_if(
+                        board,
+                        &name,
+                        cursor,
+                        receipt.as_deref(),
+                        outcome,
+                        if_pending,
+                    )?;
                     print(&cursor, json, || format!("{action} {cursor}"))
                 }
                 WatchCmd::Failures { name, after, limit } => {

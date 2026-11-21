@@ -420,7 +420,7 @@ fn etag(value: &str) -> ApiResult<HeaderValue> {
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "invalid receipt"))
 }
 fn conditional_failure(mut err: ApiError) -> ApiError {
-    if matches!(err.code, "claim_lost" | "delivery_conflict") {
+    if matches!(err.code, "claim_lost" | "delivery_conflict" | "no_match") {
         err.status = StatusCode::PRECONDITION_FAILED;
     }
     err
@@ -599,12 +599,22 @@ struct SchedulePage {
     limit: Option<usize>,
     re: Option<i64>,
     by: Option<String>,
+    channel: Option<String>,
 }
 async fn schedules(State(app): State<App>, Query(q): Query<SchedulePage>) -> Data {
     let (after, n) = (after(q.after)?, limit(q.limit)?);
     let (cursor, mut rows) = app
         .call(move |b, _| {
-            work::schedule_query(b, q.all, q.re, q.by.as_deref(), after, (n + 1) as i64, true)
+            work::schedule_query_in(
+                b,
+                q.all,
+                q.re,
+                q.by.as_deref(),
+                q.channel.as_deref(),
+                after,
+                (n + 1) as i64,
+                true,
+            )
         })
         .await?;
     let next = continuation(&mut rows, n, |s| s.id);
@@ -780,6 +790,7 @@ async fn ack(
     struct Ack {
         skip: bool,
         error: Option<String>,
+        if_pending: bool,
     }
     let input = if body.is_empty() {
         Ack::default()
@@ -801,6 +812,12 @@ async fn ack(
         return Err(invalid("provide skip or error, not both"));
     }
     let receipt = quoted_header(&headers)?.map(str::to_owned);
+    if input.if_pending && receipt.is_none() {
+        return Err(ApiError::new(
+            StatusCode::PRECONDITION_REQUIRED,
+            "if_pending requires the delivery ETag in If-Match",
+        ));
+    }
     let conditional = receipt.is_some();
     app.call(move |b, _| {
         let outcome = if let Some(error) = input.error.as_deref() {
@@ -810,7 +827,14 @@ async fn ack(
         } else {
             work::DeliveryOutcome::Ack
         };
-        work::settle_delivery(b, &name, cursor, receipt.as_deref(), outcome)
+        work::settle_delivery_if(
+            b,
+            &name,
+            cursor,
+            receipt.as_deref(),
+            outcome,
+            input.if_pending,
+        )
     })
     .await
     .map_err(|e| {

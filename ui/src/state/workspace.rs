@@ -42,6 +42,10 @@ pub struct TaskEntry {
     pub files: Vec<(String, Vec<u8>)>,
     pub no_sync: bool,
     pub show_labels: bool,
+    pub reload_needed: bool,
+    pub(super) stamp: Option<String>,
+    pub(super) baseline: Option<(board_local::Draft, board_local::ComposerSettings)>,
+    pub files_changed: bool,
 }
 impl Default for TaskEntry {
     fn default() -> Self {
@@ -52,6 +56,10 @@ impl Default for TaskEntry {
             files: Vec::new(),
             no_sync: false,
             show_labels: false,
+            reload_needed: false,
+            stamp: None,
+            baseline: None,
+            files_changed: false,
         }
     }
 }
@@ -422,14 +430,11 @@ impl Desk {
 }
 
 fn ids(text: &str) -> Result<Vec<i64>> {
-    text.split(|c: char| c.is_whitespace() || c == ',')
-        .filter(|s| !s.is_empty())
-        .map(|s| {
-            s.trim_start_matches('#')
-                .parse()
-                .context("Prerequisites must be task IDs")
-        })
-        .collect()
+    board_local::TaskDraftSettings {
+        needs: text.to_owned(),
+        ..Default::default()
+    }
+    .parsed_needs()
 }
 
 impl State {
@@ -535,13 +540,19 @@ impl State {
         self.history.clear();
         self.query.clear();
         self.browse = Browse::default();
-        self.starts.clear();
+        self.reset_feed();
         self.channel = None;
         self.go(Page::Feed);
         self.history.clear();
     }
 
     pub fn create_task(&mut self, existing: Option<i64>) {
+        if existing.is_none()
+            && let Err(e) = self.flush_task_entry()
+        {
+            self.error = Some(format!("Task draft not saved: {e:#}"));
+            return;
+        }
         let entry = &self.desk.task_entry;
         let form = &entry.form;
         let result = self.db().and_then(|db| {
@@ -574,14 +585,24 @@ impl State {
                 ids(&form.extra.text)?
             };
             let assignee = form.name.text.trim();
-            automation::create_task(
-                db,
-                &self.actor,
-                target,
-                &needs,
-                (existing.is_none() && !assignee.is_empty()).then_some(assignee),
-            )
+            if existing.is_some() {
+                automation::create_task(db, &self.actor, target, &needs, None)
+            } else {
+                automation::create_task_draft(
+                    db,
+                    &self.actor,
+                    target,
+                    &needs,
+                    (!assignee.is_empty()).then_some(assignee),
+                    entry.stamp.as_deref().context("Nothing to send")?,
+                )
+            }
         });
+        if let Err(ref error) = result
+            && board_local::errors::classify(error).1 == "draft_changed"
+        {
+            self.desk.task_entry.reload_needed = true;
+        }
         if let Some(t) = self.result(result) {
             if existing.is_none() {
                 self.desk.task_entry = TaskEntry::default();
@@ -651,6 +672,7 @@ impl State {
                     let outcome = read();
                     if let Some(file) = s.result(outcome) {
                         s.desk.task_entry.files.push(file);
+                        s.desk.task_entry.files_changed = true;
                     }
                 }
                 Ok(Some(_)) => s.error = Some("Task entry changed; file was not attached".into()),

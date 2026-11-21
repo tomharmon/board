@@ -2,6 +2,158 @@ use anyhow::Result;
 use board_local::{Board, Filter, PostOptions, access::Rules, automation::*, errors::classify};
 use serde_json::json;
 
+#[test]
+fn saved_task_submission_fences_private_routing_files_and_double_submits_after_reopen() -> Result<()>
+{
+    use board_local::{ComposerSettings, Draft, TaskDraftSettings};
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("task.db");
+    let b = Board::open(&db)?;
+    let blank = PostOptions::default();
+    let prep = create_task(&b, "ana", new("ops", "Prepare", &blank), &[], None)?;
+    let draft = Draft {
+        body: "Review package".into(),
+        channel: "ops".into(),
+        reply_to: None,
+    };
+    let settings = ComposerSettings {
+        task: Some(TaskDraftSettings {
+            needs: format!("#{}", prep.id),
+            assignee: "ana/build".into(),
+        }),
+        labels: "phase=review".into(),
+        no_sync: true,
+        ..Default::default()
+    };
+    let opts = PostOptions {
+        no_sync: true,
+        labels: settings.parsed_labels()?,
+        files: vec![("check.txt".into(), b"proof".to_vec())],
+        ..Default::default()
+    };
+    let stamp = b
+        .save_composer(
+            "ana",
+            "tasks",
+            None,
+            Some((&draft, &settings)),
+            Some(&opts.files),
+        )?
+        .unwrap();
+    let head = b.cursor()?;
+    let submit = |c: &str, o: &PostOptions, needs: &[i64], assignee: Option<&str>, stamp: &str| {
+        create_task_draft(&b, "ana", new(c, &draft.body, o), needs, assignee, stamp)
+    };
+    let wants = Some("ana/build");
+    for refused in [
+        submit("other", &opts, &[prep.id], wants, &stamp),
+        submit("ops", &opts, &[], wants, &stamp),
+        submit("ops", &opts, &[prep.id], None, &stamp),
+        submit("ops", &opts, &[prep.id], wants, "stale"),
+        submit(
+            "ops",
+            &PostOptions {
+                no_sync: false,
+                ..opts.clone()
+            },
+            &[prep.id],
+            wants,
+            &stamp,
+        ),
+        submit(
+            "ops",
+            &PostOptions {
+                files: vec![("check.txt".into(), b"wrong".to_vec())],
+                ..opts.clone()
+            },
+            &[prep.id],
+            wants,
+            &stamp,
+        ),
+    ] {
+        assert_eq!(classify(&refused.unwrap_err()).1, "draft_changed");
+    }
+    let raw = rusqlite::Connection::open(&db)?;
+    raw.execute_batch("CREATE TRIGGER fail_task_publish BEFORE INSERT ON tasks BEGIN SELECT RAISE(ABORT,'test commit failure'); END;")?;
+    assert!(submit("ops", &opts, &[prep.id], wants, &stamp).is_err());
+    assert_eq!(b.cursor()?, head);
+    assert_eq!(b.load_composer("ana", "tasks")?.unwrap().stamp, stamp);
+    raw.execute_batch("DROP TRIGGER fail_task_publish")?;
+    let t = submit("ops", &opts, &[prep.id], wants, &stamp)?;
+    assert_eq!(
+        (t.state.as_str(), t.needs, t.assignee.as_deref()),
+        ("waiting", vec![prep.id], wants)
+    );
+    let m = b.get(t.id)?;
+    assert!(m.no_sync);
+    assert_eq!(b.download(m.attachments[0].id)?.1, b"proof");
+    drop(b);
+    let b = Board::open(&db)?;
+    assert!(b.load_composer("ana", "tasks")?.is_none());
+    assert!(
+        create_task_draft(
+            &b,
+            "ana",
+            new("ops", &draft.body, &opts),
+            &[prep.id],
+            wants,
+            &stamp
+        )
+        .is_err()
+    );
+    assert_eq!(list_tasks(&b, None, Some("all"))?.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn scheduled_channel_draft_cannot_be_sent_to_another_destination_or_consume_the_all_channel_slot()
+-> Result<()> {
+    use board_local::{ComposerSettings, Draft};
+    let b = Board::memory()?;
+    let t = due();
+    let opts = ComposerSettings {
+        later: true,
+        due: chrono::DateTime::from_timestamp(t.due, 0)
+            .unwrap()
+            .to_rfc3339(),
+        ..Default::default()
+    };
+    let d = Draft {
+        body: "Hold meeting".into(),
+        channel: "studio".into(),
+        reply_to: None,
+    };
+    let global = b
+        .save_composer("ana", "new", None, Some((&d, &opts)), None)?
+        .unwrap();
+    let stamp = b
+        .save_composer("ana", "channel:studio", None, Some((&d, &opts)), None)?
+        .unwrap();
+    let send = |ch, guard| {
+        schedule_draft(
+            &b,
+            "ana",
+            Destination::Channel(ch),
+            &d.body,
+            Timing {
+                due: t.due,
+                every: None,
+                times: None,
+                until: None,
+            },
+            &Default::default(),
+            guard,
+        )
+    };
+    assert!(send("other", ("channel:studio", &stamp)).is_err());
+    assert!(send("studio", ("new", &stamp)).is_err());
+    let s = send("studio", ("channel:studio", &stamp))?;
+    assert_eq!(s.channel, "studio");
+    assert!(b.load_composer("ana", "channel:studio")?.is_none());
+    assert_eq!(b.load_composer("ana", "new")?.unwrap().stamp, global);
+    Ok(())
+}
+
 fn new<'a>(channel: &'a str, text: &'a str, options: &'a PostOptions) -> TaskTarget<'a> {
     TaskTarget::New {
         channel,
@@ -23,6 +175,48 @@ fn lease(b: &Board, id: i64) -> Result<Task> {
 fn grant(b: &Board, actor: &str, rules: &str) -> Result<String> {
     b.set_grant("root", None, actor, &Rules::parse(rules)?)?;
     Ok(b.issue_credential("root", actor, None, None)?.token)
+}
+
+#[test]
+fn schedule_filters_combine_actor_handles_exact_channels_subtrees_and_history() -> Result<()> {
+    let board = Board::memory()?;
+    board.set_actor_profile("ava", "editor", "Ava")?;
+    let mut ids = Vec::new();
+    for (ch, writer) in [
+        ("work", "ava"),
+        ("work/sub", "ava/agent"),
+        ("work/second", "sam"),
+        ("workbench", "ava"),
+    ] {
+        ids.push(
+            schedule(
+                &board,
+                writer,
+                Destination::Channel(ch),
+                "Later",
+                due(),
+                Default::default(),
+            )?
+            .id,
+        );
+    }
+    let rows = |ch: &str, by: Option<&str>, all| -> Result<Vec<i64>> {
+        Ok(
+            schedule_query_in(&board, all, None, by, Some(ch), 0, 10, true)?
+                .1
+                .into_iter()
+                .map(|s| s.id)
+                .collect(),
+        )
+    };
+    assert_eq!(rows("work/", Some("EDITOR"), false)?, ids[..2]);
+    assert_eq!(rows("work/", Some("@[ava]"), false)?, vec![ids[0]]);
+    assert_eq!(rows("work", None, false)?, vec![ids[0]]);
+    assert!(rows("work//", None, false).is_err());
+    cancel_schedule(&board, ids[0], "ava")?;
+    assert_eq!(rows("work/", Some("editor"), false)?, vec![ids[1]]);
+    assert_eq!(rows("work/", Some("editor"), true)?, ids[..2]);
+    Ok(())
 }
 
 #[test]

@@ -17,6 +17,7 @@ pub(super) fn models() -> Value {
         "attachment_ids":{"type":"array","maxItems":10,"items":{"oneOf":[n,s]}}});
     let mut post = obj(properties.clone(), &[]);
     post["oneOf"] = json!([{"required":["channel"]},{"required":["reply_to"]}]);
+    post["properties"]["sync_targets"] = json!({"type":"array","maxItems":32,"items":{"type":"string"},"description":"Configured SOURCE or SOURCE:THREAD; only for a new shareable root."});
     let p = properties.as_object_mut().unwrap();
     p.remove("after");
     p.remove("reply_to");
@@ -38,6 +39,10 @@ pub(super) fn models() -> Value {
         .as_object_mut()
         .unwrap()
         .remove("after");
+    schedule["properties"]
+        .as_object_mut()
+        .unwrap()
+        .remove("sync_targets");
     for k in ["due", "every", "times", "until"] {
         schedule["properties"][k] = n.clone();
     }
@@ -54,14 +59,47 @@ pub(super) fn models() -> Value {
         "LabelPatch":obj(json!({"set":labels,"unset":arr(s.clone()),"conditions":{"type":"object","additionalProperties":{"type":["string","null"]}}}),&[]),
         "Source":obj(json!({"name":s,"channel":s,"provider":{"enum":["github","slack","linear","local"]},"remote":s}),&["name","channel","provider","remote"]),
         "SourcePatch":obj(json!({"outbound":b,"mirror_roots":b,"mirror_files":b,"display_authors":b,"github_items":{"enum":["all","issues","pulls"]}}),&[]),
+        "JoinThread":obj(json!({"root":n}),&["root"]),
         "Rule":obj(json!({"priority":n,"script":{"type":"string","maxLength":8192}}),&["script"]),
         "Renderer":obj(json!({"script":{"type":"string","maxLength":8192}}),&["script"]),
         "Typing":obj(json!({"status":s,"seconds":n}),&[]),
         "WatcherPull":obj(json!({"limit":n,"lease_seconds":n,"wait_seconds":{"type":"integer","minimum":0,"maximum":60}}),&[]),
+        "WatcherAck":obj(json!({"skip":b,"error":{"type":"string","minLength":1,"maxLength":1000},"if_pending":{"type":"boolean","default":false,"description":"Require a live lease. Its winning receipt reports no_match on a completed delivery instead of replaying success."}}),&[]),
         "Definition":obj(json!({"description":s,"schema":{"type":"object"}}),&["schema"])
     })
 }
 pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
+    if verb == "get" {
+        let filters: &[&str] = match path {
+            "/threads" | "/messages" => &[
+                "channel", "from", "by", "text", "mentions", "re", "label", "after", "before",
+                "limit",
+            ],
+            "/threads/{id}" => &["label", "after", "limit"],
+            "/events" => &[
+                "channel", "from", "by", "text", "mentions", "re", "label", "after", "limit",
+                "kind", "all", "last", "wait_ms",
+            ],
+            "/links" => &["url"],
+            "/schedules" => &["channel", "by", "re", "all", "after", "limit"],
+            _ => &[],
+        };
+        if !filters.is_empty() {
+            let mut params: Vec<_> = filters.iter().map(|&name| {
+                let schema = match name {
+                    "label" => json!({"type":"array","items":{"type":"string"}}),
+                    "all" => json!({"type":"boolean","default":false}),
+                    "after" | "before" | "last" | "wait_ms" | "limit" | "re" => json!({"type":"integer","minimum": if matches!(name,"re"|"limit"|"before"){1}else{0}}),
+                    _ => json!({"type":"string"}),
+                };
+                json!({"name":name,"in":"query","required":name=="url","schema":schema})
+            }).collect();
+            if path == "/events" {
+                params.push(json!({"name":"Last-Event-ID","in":"header","schema":{"type":"string"},"description":"Resume after this delivered cursor, bypassing the original history seed."}));
+            }
+            op["parameters"] = json!(params);
+        }
+    }
     let input = match (path, verb) {
         ("/messages", "post") => "NewMessage",
         ("/messages/{id}", "patch") => "Edit",
@@ -70,16 +108,34 @@ pub(super) fn describe(op: &mut Value, path: &str, verb: &str) {
         ("/schedules", "post") => "NewSchedule",
         ("/sources", "post") => "Source",
         ("/sources/{name}", "patch") => "SourcePatch",
+        ("/sources/{name}/thread-links", "put") => "JoinThread",
         ("/sources/{name}/renderer", "put") => "Renderer",
         ("/rules/{name}", "put") => "Rule",
         ("/threads/{id}/typing", "put") => "Typing",
         ("/watcher-matches", "post") => "WatcherPull",
+        ("/watchers/{name}/acknowledgements/{cursor}", "put") => "WatcherAck",
         ("/schemas/{name}/{version}", "put") => "Definition",
         _ => "",
     };
     if !input.is_empty() {
-        op["requestBody"] =
-            json!({"required":true,"content":{"application/json":{"schema":reference(input)}}});
+        op["requestBody"] = json!({"required":input!="WatcherAck","content":{"application/json":{"schema":reference(input)}}});
+    }
+    if path == "/sources/{name}/thread-links" {
+        op["parameters"] = json!([{"name":"thread","in":"query","required":true,"schema":{"type":"string"},"description":"Existing provider conversation ID. Joining publishes no existing messages."}]);
+    }
+    if input == "WatcherAck" {
+        op["parameters"] = json!([{"name":"If-Match","in":"header","schema":{"type":"string"},"description":"Quoted delivery ETag. Required for a leased delivery and for if_pending."}]);
+        op["responses"].as_object_mut().unwrap().remove("2XX");
+        op["responses"]["204"] = json!({"description":"Settled, or by default an exact replay."});
+        for (code, desc) in [
+            (
+                "412",
+                "Strict replay by the winning proof: no_match. An unknown, unreadable, wrong or stale delivery receipt: delivery_conflict.",
+            ),
+            ("428", "if_pending requires a quoted ETag in If-Match."),
+        ] {
+            op["responses"][code] = json!({"description":desc,"content":{"application/json":{"schema":reference("Problem")}}});
+        }
     }
     let success = json!({"description":"Current message","content":{"application/json":{"schema":reference("Message")}}});
     if matches!(

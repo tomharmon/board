@@ -30,7 +30,10 @@ pub struct Delivery {
     pub trigger: String,
     pub receipt: String,
     pub lease_until: i64,
+    /// Number of earlier tries; zero on the first delivery.
     pub attempt: i64,
+    /// Number of tries including this lease; the callback invocation is one-based.
+    pub attempts: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -576,7 +579,7 @@ fn expire(tx: &Transaction<'_>, name: &str, at: i64) -> Result<()> {
     let n = tx.execute(
         "UPDATE watcher_queue SET
             state=CASE WHEN attempts>=CASE WHEN EXISTS(SELECT 1 FROM watcher_registry WHERE internal=?1) THEN ?4 ELSE ?3 END THEN 'failed' ELSE 'pending' END,
-            error='delivery lease expired',receipt=NULL,lease_until=NULL,offered=0
+            error='delivery lease expired',receipt=NULL,last_receipt=NULL,lease_until=NULL,offered=0
             WHERE name=?1 AND state='pending' AND lease_until<=?2",
         params![name, at, MAX_INTERRUPTED_ATTEMPTS,MAX_ATTEMPTS],
     )?;
@@ -600,7 +603,7 @@ fn available(tx: &Transaction<'_>, w: &Watcher, at: i64, p: &Policies) -> Result
         if let Some(cursor) = found {
             after = cursor;
             let Some(e) = p.registered(tx, event_at(tx, cursor)?)? else {
-                tx.execute("UPDATE watcher_queue SET state='skipped',receipt=NULL,lease_until=NULL,offered=0 WHERE name=? AND cursor=?",params![w.key,cursor])?;
+                tx.execute("UPDATE watcher_queue SET state='skipped',receipt=NULL,last_receipt=NULL,lease_until=NULL,offered=0 WHERE name=? AND cursor=?",params![w.key,cursor])?;
                 checkpoint(tx, &w.key)?;
                 continue;
             };
@@ -666,9 +669,9 @@ fn lease_one(
     let out = if let Some(event) = available(tx, w, at, policy)? {
         // A deadline stored in whole seconds must not truncate a one-second lease to milliseconds.
         let lease_until = at + lease_seconds + 1;
-        let (receipt, attempt) = tx.query_row(
+        let (receipt, attempts): (String,i64) = tx.query_row(
             "UPDATE watcher_queue SET receipt=lower(hex(randomblob(24))),
-            lease_until=?, attempts=attempts+1, offered=0 WHERE name=? AND cursor=? RETURNING receipt,attempts",
+            lease_until=?, attempts=attempts+1,last_receipt=NULL, offered=0 WHERE name=? AND cursor=? RETURNING receipt,attempts",
             params![lease_until, name, event.cursor],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
@@ -685,7 +688,8 @@ fn lease_one(
             event,
             receipt,
             lease_until,
-            attempt,
+            attempt: attempts - 1,
+            attempts,
         })
     } else {
         None
@@ -792,6 +796,25 @@ pub fn settle_delivery(
     receipt: Option<&str>,
     outcome: DeliveryOutcome<'_>,
 ) -> Result<()> {
+    settle_delivery_if(board, name, cursor, receipt, outcome, false)
+}
+
+/// Strict settlement never treats a historical proof as a live lease.
+pub fn settle_delivery_if(
+    board: &Board,
+    name: &str,
+    cursor: i64,
+    receipt: Option<&str>,
+    outcome: DeliveryOutcome<'_>,
+    if_pending: bool,
+) -> Result<()> {
+    ensure!(
+        !if_pending || receipt.is_some_and(|s| !s.is_empty()),
+        crate::errors::Kind::Invalid.error(
+            "receipt_required",
+            "if_pending requires a delivery lease receipt"
+        )
+    );
     if let DeliveryOutcome::Error(reason) = &outcome {
         ensure!(
             !reason.trim().is_empty() && reason.chars().count() <= 1000,
@@ -803,7 +826,12 @@ pub fn settle_delivery(
     let name = &w.key;
     let at = now();
     expire(&tx, name, at)?;
-    let first = available(&tx, &w, at, &policy)?.map(|e| e.cursor);
+    let first = if if_pending {
+        None
+    } else {
+        available(&tx, &w, at, &policy)?.map(|e| e.cursor)
+    };
+    let stale = || Conflict.error("delivery_conflict", "not the current delivery or lease");
     let row = tx
         .query_row(
             "SELECT state,receipt,attempts,offered,last_receipt,error
@@ -821,11 +849,23 @@ pub fn settle_delivery(
             },
         )
         .optional()?
-        .with_context(|| Conflict.error("delivery_conflict", "not a pending delivery"))?;
+        .with_context(stale)?;
     ensure!(
         policy.delivered(&tx, event_at(&tx, cursor)?)?.is_some(),
-        Conflict.error("delivery_conflict", "not a pending delivery")
+        stale()
     );
+    // A legacy expired/skipped row could retain a previous, failed attempt's receipt.
+    let settled = match row.state.as_str() {
+        "acked" => true,
+        "skipped" => row.error.is_none(),
+        "failed" => row.error.as_deref() != Some("delivery lease expired"),
+        _ => false,
+    };
+    if if_pending && settled && row.last.as_deref() == receipt {
+        return Err(Conflict
+            .error("no_match", "this lease has already been settled")
+            .into());
+    }
     let succeeded = match &outcome {
         DeliveryOutcome::Ack => row.state == "acked",
         DeliveryOutcome::Skip => row.state == "skipped",
@@ -833,7 +873,7 @@ pub fn settle_delivery(
             receipt.is_some() && row.error.as_deref() == Some(*reason)
         }
     };
-    if succeeded && row.last.as_deref() == receipt {
+    if !if_pending && succeeded && row.last.as_deref() == receipt {
         tx.commit()?;
         return Ok(());
     }
@@ -841,10 +881,7 @@ pub fn settle_delivery(
         Some(proof) => row.receipt.as_deref() == Some(proof),
         None => row.receipt.is_none() && (row.offered || first == Some(cursor)),
     };
-    ensure!(
-        row.state == "pending" && valid,
-        Conflict.error("delivery_conflict", "not the current delivery or lease")
-    );
+    ensure!(row.state == "pending" && valid, stale());
     let (state, attempts, retry_at, error) = match outcome {
         DeliveryOutcome::Ack => ("acked", row.attempts, 0, None),
         DeliveryOutcome::Skip => ("skipped", row.attempts, 0, None),

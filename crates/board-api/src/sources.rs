@@ -9,6 +9,8 @@ use serde::Deserialize;
 type Data = ApiResult<Json<Value>>;
 pub(super) fn routes() -> Router<App> {
     Router::new()
+        .route("/messages/{id}/sync", get(targets))
+        .route("/links", get(locate))
         .route("/messages/{id}/deliveries", get(notices))
         .route("/sources", get(list).post(add))
         .route("/sources/{name}", get(one).patch(configure))
@@ -18,6 +20,10 @@ pub(super) fn routes() -> Router<App> {
         )
         .route("/sources/{name}/imports", post(import))
         .route("/sources/{name}/links", put(link).get(find))
+        .route(
+            "/sources/{name}/thread-links",
+            get(thread_link).put(join_thread),
+        )
         .route("/sources/{name}/starts", post(start))
         .route("/sources/{name}/backfills", post(backfill))
         .route("/sources/{name}/files/{id}", get(files).post(share_file))
@@ -29,6 +35,19 @@ pub(super) fn routes() -> Router<App> {
         .route("/sources/{name}/deliveries/{id}/receipt", put(ack))
         .route("/sources/{name}/deliveries/{id}/failure", post(fail))
         .route("/sources/{name}/deliveries/{id}/resolution", put(resolve))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Permalink {
+    url: String,
+}
+async fn locate(State(a): State<App>, Query(q): Query<Permalink>) -> Data {
+    Ok(Json(json!(
+        a.call(move |b, _| b.locate_link(&q.url)).await?
+    )))
+}
+async fn targets(State(a): State<App>, Path(id): Path<i64>) -> Data {
+    Ok(Json(json!(a.call(move |b, _| b.sync_targets(id)).await?)))
 }
 async fn notices(State(a): State<App>, Path(id): Path<i64>) -> Data {
     Ok(Json(
@@ -154,6 +173,40 @@ async fn copies(State(a): State<App>, Path((n, id)): Path<(String, i64)>) -> Dat
 struct Start {
     root: i64,
 }
+async fn thread_link(
+    State(a): State<App>,
+    Path(n): Path<String>,
+    Query(q): Query<Backfill>,
+) -> Data {
+    Ok(Json(json!(
+        a.call(move |b, u| b.source_thread_link(u, &n, &q.thread))
+            .await?
+    )))
+}
+async fn join_thread(
+    State(a): State<App>,
+    Path(n): Path<String>,
+    Query(q): Query<Backfill>,
+    Json(i): Json<Start>,
+) -> ApiResult<Response> {
+    let (link, fresh) = a
+        .call(move |b, u| b.join_source_thread(u, &n, &q.thread, i.root))
+        .await?;
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("thread", &link.thread)
+        .finish();
+    let loc = format!("/v1/sources/{}/thread-links?{query}", link.source);
+    Ok((
+        if fresh {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        [(header::LOCATION, loc)],
+        Json(link),
+    )
+        .into_response())
+}
 async fn start(
     State(a): State<App>,
     Path(n): Path<String>,
@@ -238,12 +291,10 @@ struct Page {
 }
 async fn queue(a: App, n: String, q: Page, d: Direction) -> Data {
     let pos = q.after.unwrap_or(0);
-    let rows = a
-        .call(move |b, u| b.inbox(u, &n, d, pos, q.limit.unwrap_or(50)))
+    let (cursor, rows) = a
+        .call(move |b, u| b.inbox_page(u, &n, d, pos, q.limit.unwrap_or(50)))
         .await?;
-    Ok(Json(
-        json!({"cursor":rows.last().map_or(pos,|r|r.id),"items":rows}),
-    ))
+    Ok(Json(json!({"cursor":cursor,"items":rows})))
 }
 async fn inbox(State(a): State<App>, Path(n): Path<String>, Query(q): Query<Page>) -> Data {
     queue(a, n, q, Direction::In).await

@@ -1,13 +1,17 @@
 mod browse;
+mod compose_keys;
 mod drafts;
 mod files;
 mod layout;
 mod people;
+mod raster_motion;
 mod sources;
+mod task_drafts;
 mod templates;
 mod video;
 mod workspace;
 pub use browse::{Browse, Position};
+pub use compose_keys::markdown_key;
 pub use drafts::Delivery;
 pub use files::{AttachmentPreview, Preview};
 pub use layout::Layout;
@@ -44,6 +48,9 @@ pub enum Page {
 }
 
 impl Page {
+    fn has_task_entry(self) -> bool {
+        matches!(self, Self::Tasks | Self::Task(_) | Self::NewTask)
+    }
     pub fn is_feed(self) -> bool {
         matches!(self, Self::Feed | Self::Compose)
     }
@@ -135,6 +142,7 @@ pub struct State {
     draft_dirty: bool,
     pub error: Option<String>,
     pub starts: Vec<i64>,
+    pub feed_size: usize,
     pub older: Option<i64>,
     pub nav: bool,
     pub layout: Layout,
@@ -192,6 +200,7 @@ impl State {
             delivery: Delivery::default(),
             draft_dirty: false,
             starts: Vec::new(),
+            feed_size: 50,
             older: None,
             nav: false,
             layout: Layout::load(),
@@ -248,6 +257,18 @@ impl State {
         // Sample before reading: a concurrent writer during the load forces another refresh.
         let version = db.data_version()?;
         let mut hide_draft = false;
+        let mut hide_task = false;
+        if self.delegated
+            && self.page.has_task_entry()
+            && self.desk.task_entry.stamp.is_some()
+            && let Err(e) = db.load_draft(&self.actor, "tasks")
+        {
+            use board_local::errors::{Kind, classify};
+            match classify(&e).0 {
+                Kind::Missing | Kind::Forbidden | Kind::Gone => hide_task = true,
+                _ => return Err(e),
+            }
+        }
         if self.delegated
             && self.delivery.stamp.is_some()
             && let Some(scope) = self.draft_scope()
@@ -290,10 +311,10 @@ impl State {
         }
         let before = self.starts.last().copied();
         let (threads, activity_messages, older) = if has_feed && self.is_timeline() {
-            let window = db.messages_window(&filter, before, 50)?;
+            let window = db.messages_window(&filter, before, self.feed_size)?;
             (Vec::new(), window.rows, window.older)
         } else if has_feed {
-            let window = db.threads_window(&filter, before, 50)?;
+            let window = db.threads_window(&filter, before, self.feed_size)?;
             (window.rows, Vec::new(), window.older)
         } else {
             (Vec::new(), Vec::new(), None)
@@ -329,7 +350,7 @@ impl State {
             let other = if self.root_editor_in_thread {
                 format!("thread:{root}")
             } else {
-                "new".into()
+                self.root_scope()
             };
             db.load_draft(&self.actor, &other)
                 .ok()
@@ -352,6 +373,11 @@ impl State {
         if hide_draft {
             self.hide_unavailable_draft();
         }
+        if hide_task {
+            self.desk.task_entry = Default::default();
+            self.error =
+                Some("This saved task draft is no longer visible to the active credential".into());
+        }
         Ok(())
     }
 
@@ -369,33 +395,35 @@ impl State {
             self.preview = None;
             self.typing.clear();
             self.people.rows.clear();
+            self.people.inline = Default::default();
             self.desk.clear_data();
             self.error = Some(format!("{e:#}"));
-        } else if self.access_blocked {
-            self.access_blocked = false;
-            self.error = None;
+        } else {
+            if self.access_blocked {
+                self.access_blocked = false;
+                self.error = None;
+            }
+            self.update_inline(true);
         }
     }
 
     pub fn select(&mut self, channel: Option<String>) {
-        // A populated draft keeps its explicit destination when the user browses away.
-        if self.page.is_feed()
-            && self.body.text.is_empty()
-            && self.files.is_empty()
-            && self.delivery.stamp.is_none()
-        {
-            self.destination = TextEdit::new(
-                channel
-                    .as_deref()
-                    .unwrap_or("general")
-                    .trim_end_matches('/'),
-            );
+        // A channel change can replace the active draft without changing the page.
+        // Park the old scope before changing either pointer or destination.
+        if let Err(e) = self.flush_drafts() {
+            self.error = Some(format!("Draft not saved: {e:#}"));
+            return;
         }
+        let changed_in_place = self.page == Page::Feed && self.channel != channel;
         self.channel = channel;
         self.query.clear();
         self.browse.search_open = false;
-        self.starts.clear();
+        self.reset_feed();
         self.go(Page::Feed);
+        if changed_in_place && let Err(e) = self.restore_draft() {
+            self.hide_unavailable_draft();
+            self.error = Some(format!("Draft not available: {e:#}"));
+        }
     }
 
     pub fn open_search(&mut self, tx: &mut Tx) {
@@ -404,7 +432,7 @@ impl State {
         }
         if self.page.is_feed() {
             self.browse.search_open = true;
-            self.starts.clear();
+            self.reset_feed();
             self.refresh();
             tx.focus_when_shown("search", true);
         }
@@ -413,7 +441,7 @@ impl State {
     pub fn close_search(&mut self) {
         self.query.clear();
         self.browse.search_open = false;
-        self.starts.clear();
+        self.reset_feed();
         self.refresh();
     }
 
@@ -434,10 +462,10 @@ impl State {
     pub fn go(&mut self, page: Page) {
         let mut draft_warning = None;
         if self.page != page
-            && let Err(e) = self.flush_draft()
+            && let Err(e) = self.flush_drafts()
         {
             self.error = Some(format!("Draft not saved: {e:#}"));
-            self.delivery.open = true;
+            self.delivery.open = self.draft_dirty;
             return;
         }
         self.properties = None;
@@ -446,6 +474,7 @@ impl State {
         self.browse.filter_open = false;
         self.people = People::default();
         if self.page != page {
+            let entering_tasks = !self.page.has_task_entry() && page.has_task_entry();
             self.clear_typing();
             self.root_editor_in_thread = false;
             self.history.push(self.page);
@@ -466,6 +495,12 @@ impl State {
             self.desk.enter_from(self.page, page);
             self.browse.reset_thread();
             self.page = page;
+            if !page.has_task_entry() {
+                self.desk.task_entry = Default::default();
+            } else if entering_tasks && let Err(e) = self.restore_task_entry() {
+                self.desk.task_entry = Default::default();
+                draft_warning = Some(format!("Task draft not available: {e:#}"));
+            }
             if let Err(e) = self.restore_draft() {
                 self.body.clear();
                 self.reply_to = None;
@@ -559,6 +594,11 @@ impl State {
             Err(e) => self.error = Some(e.to_string()),
         }
     }
+    pub fn has_visible_label(&self, id: i64, key: &str, value: &str) -> bool {
+        self.db()
+            .and_then(|db| db.get(id))
+            .is_ok_and(|m| !m.deleted && m.labels.get(key).is_some_and(|v| v == value))
+    }
 
     pub fn close_properties(&mut self, tx: &mut Tx) {
         if let Some(p) = self.properties.take() {
@@ -642,11 +682,36 @@ impl State {
             tx.scroll_into_view(key);
         }
         let frame_changed = if let Some(AttachmentPreview {
-            content: Preview::Clip(clip),
-            ..
+            content: Preview::Image {
+                motion: Some(m), ..
+            },
+            message,
+            file,
         }) = &mut self.preview
         {
-            clip.poll(now, tx)
+            let changed = m.poll(now, tx);
+            if changed && !video::visible(self.board.as_ref(), *message, file.id) {
+                self.preview = None;
+                self.refresh();
+                return true;
+            }
+            changed
+        } else if let Some(AttachmentPreview {
+            content: Preview::Clip(clip),
+            message,
+            file,
+        }) = &mut self.preview
+        {
+            match clip.poll(now, tx, || {
+                video::visible(self.board.as_ref(), *message, file.id)
+            }) {
+                Some(changed) => changed,
+                None => {
+                    self.preview = None;
+                    self.refresh();
+                    return true;
+                }
+            }
         } else {
             false
         };
@@ -656,8 +721,8 @@ impl State {
         self.next_poll = now + 1.0;
         tx.wake_after(Duration::from_millis(1050));
         let mut draft_update = false;
-        if self.draft_dirty {
-            match self.flush_draft() {
+        if self.draft_dirty || self.page.has_task_entry() {
+            match self.flush_drafts() {
                 Ok(()) => {
                     if self
                         .error

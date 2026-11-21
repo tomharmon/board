@@ -72,11 +72,37 @@ fn mentions_resolve_only_visible_full_handles_prefer_thread_authors_and_preserve
 #[test]
 fn profile_headers_edit_timestamps_limits_and_noop_events_hold_in_the_database() -> Result<()> {
     let mut b = Board::memory()?;
+    assert_eq!(
+        board_local::local::profile_name("FIRST-Agent")?,
+        "first-agent"
+    );
+    for invalid in [
+        "1starts-with-digit",
+        "under_score",
+        "has.dot",
+        &"a".repeat(33),
+    ] {
+        assert!(
+            b.with_profile_request(None, "owner", None, Some(invalid), |_, _| Ok(()))
+                .is_err()
+        );
+        assert!(board_local::local::profile_name(invalid).is_err());
+    }
+    b.with_profile_request(
+        None,
+        "owner",
+        None,
+        Some("Local; avatar=\"http://127.0.0.1/picture\""),
+        |_, who| {
+            assert_eq!(who, "owner/local");
+            Ok(())
+        },
+    )?;
     let root = b.with_profile_request(
         None,
         "owner",
         None,
-        Some("Helper; avatar=\"https://example.invalid/a.png\""),
+        Some(r#" "Helper";flag;v=1.02;old=:QQ==:;note="not;an\"avatar";avatar="https://old.invalid";avatar="https://example.invalid/a.png" "#),
         |b, actor| {
             assert_eq!(actor, "owner/helper");
             b.post("public", actor, "written locally", &Default::default())
@@ -95,6 +121,22 @@ fn profile_headers_edit_timestamps_limits_and_noop_events_hold_in_the_database()
         profile.avatar.as_deref(),
         Some("https://example.invalid/a.png")
     );
+    for malformed in [
+        "helper;avatar=bare",
+        "helper;avatar",
+        "helper ;flag",
+        "helper;p=?3",
+        "helper;Flag",
+        "helper;p=1234567890123456",
+        r#"helper;bad="unfinished"#,
+        r#"helper;bad="bad\q""#,
+    ] {
+        assert!(
+            b.with_profile_request(None, "owner", None, Some(malformed), |_, _| Ok(()))
+                .is_err(),
+            "{malformed}"
+        );
+    }
     b.with_profile_request(None, "owner", None, Some("other"), |b, actor| {
         assert!(b.edit(root.id, actor, "not mine", None).is_err());
         Ok(())
@@ -169,7 +211,7 @@ fn profile_headers_edit_timestamps_limits_and_noop_events_hold_in_the_database()
 
 #[test]
 fn source_filter_selects_inbound_origin_not_outbound_locations_before_paging() -> Result<()> {
-    use board_local::sources::{Change, Envelope, Import, Provider};
+    use board_local::sources::{AuthorInfo, Change, Envelope, Import, Provider};
     let b = Board::memory()?;
     b.create_source("owner", "origin", Provider::Local, "remote-room", "work")?;
     let inbound = b.import_source(
@@ -182,8 +224,11 @@ fn source_filter_selects_inbound_origin_not_outbound_locations_before_paging() -
                 links: Vec::new(),
                 external: "msg".into(),
                 thread: "thread".into(),
-                author: "external".into(),
-                profile: None,
+                author: "U123".into(),
+                profile: Some(AuthorInfo {
+                    name: "Jürgen Ubl".into(),
+                    avatar: None,
+                }),
                 parent: None,
                 url: None,
                 updated_at: None,
@@ -212,6 +257,23 @@ fn source_filter_selects_inbound_origin_not_outbound_locations_before_paging() -
                 .id,
             id
         );
+    }
+    let (_, directory) =
+        b.actor_directory_page(Some("jurgen"), std::slice::from_ref(&inbound.actor))?;
+    assert_eq!(directory.len(), 1);
+    assert_eq!(directory[0].handle, "origin/jurgen-ubl");
+    let ping = b.post("work", "owner", "@origin/jurgen-ubl", &Default::default())?;
+    assert_eq!(ping.text, format!("@[{}]", inbound.actor));
+    for (by, mentions, want) in [
+        (Some("origin/jurgen-ubl"), None, inbound.id),
+        (None, Some("origin/jurgen-ubl"), ping.id),
+    ] {
+        let f = Filter {
+            by: by.map(str::to_owned),
+            mentions: mentions.map(str::to_owned),
+            ..Default::default()
+        };
+        assert_eq!(b.messages(&f, 1)?[0].id, want);
     }
     let e = b
         .post(

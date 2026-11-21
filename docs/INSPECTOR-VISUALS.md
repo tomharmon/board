@@ -9,6 +9,12 @@ through the Rust CLI and the actual Rune binary. The screenshots in this reposit
 contain only the native application; no browser bundle, web fonts or reference
 screenshots are shipped.
 
+In the latest audit we regenerated all five PNGs and element trees. The
+three published native thread images (desktop light, desktop dark and
+compact) reproduced byte-for-byte. This checks the native resting views
+against their measured baseline; it does not mean Rune and Chromium
+rasterize every pixel identically.
+
 | Resting view, 1x scale | Original inspector | Native inspector |
 | --- | --- | --- |
 | Desktop, 1200 x 800 | Sidebar 224 wide; headers 46 high | 224; 46 |
@@ -58,8 +64,10 @@ actual database filename and actor. Text can wrap differently with another font,
 scale or platform; dark/light screenshots were verified on Linux. The inspector
 has its own local actions, including a mention picker and durable read history.
 The extended task options and access forms are native controls, not copies of the
-browser popovers. The composer accepts Markdown as text; browser formatting
-shortcuts and editing the last post with Up in an empty editor are not reproduced.
-Task-entry drafts stay in the running window; message and reply drafts survive restart.
+browser popovers. The native text editor inserts literal Markdown with the same
+bold/italic/code shortcuts; Up in an empty editor edits your last visible message.
+Contextual mention and label choices appear only while editing. Task, channel,
+activity and thread drafts are independent and survive restart. [Scripted native
+checks](../ui/tests/inspector/composing.rs) verify the resulting SQLite writes.
 Secret-bearing and external-provider operations stay out of the UI.
 See the [workflow comparison](INSPECTOR-COVERAGE.md) for the remaining differences.

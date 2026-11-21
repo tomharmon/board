@@ -100,10 +100,33 @@ pub(crate) fn capture(tx: &Transaction<'_>, id: i64, channel: &str, text: &str) 
             continue;
         }
         let slack = slack_address(url);
-        let (remote, external) = slack.as_ref().map_or(("", ""), |(r, x, _)| (r, x));
-        let local=tx.query_row("SELECT m.id,m.actor,m.text FROM sync_copies c JOIN messages m ON c.message=m.id JOIN sync_sources s ON s.name=c.source
-            WHERE m.channel=?1 AND m.id!=?2 AND m.deleted=0 AND (c.url=?3 OR (s.provider='slack' AND s.remote=?4 AND c.external=?5)) ORDER BY c.origin DESC,m.id LIMIT 1",
-            params![channel,id,url,remote,external],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+        let mut local=tx.query_row("SELECT m.id,m.actor,m.text FROM sync_copies c JOIN messages m ON c.message=m.id
+            WHERE m.channel=?1 AND m.id!=?2 AND m.deleted=0 AND c.url=?3 ORDER BY c.origin DESC,m.id LIMIT 1",
+            params![channel,id,url],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?))).optional()?;
+        if local.is_none()
+            && let Some((remote, external, parent)) = &slack
+        {
+            // A Slack conversation ID is local to its workspace; the matching timestamp alone
+            // cannot authorize attaching a quote from a different workspace.
+            let requested = url::Url::parse(url)?;
+            let mut stmt=tx.prepare("SELECT m.id,m.actor,m.text,coalesce(c.url,rc.url) FROM sync_copies c
+                JOIN messages m ON c.message=m.id JOIN sync_sources s ON s.name=c.source
+                LEFT JOIN sync_copies rc ON rc.source=c.source AND rc.thread=c.thread AND rc.message=coalesce(m.re,m.id)
+                WHERE m.channel=?1 AND m.id!=?2 AND m.deleted=0 AND s.provider='slack' AND s.remote=?3
+                AND c.external=?4 AND (?5 IS NULL OR c.thread=?5) ORDER BY c.origin DESC,m.id")?;
+            let mut rows = stmt.query(params![channel, id, remote, external, parent])?;
+            while let Some(row) = rows.next()? {
+                let recorded: Option<String> = row.get(3)?;
+                if recorded
+                    .as_deref()
+                    .and_then(|s| url::Url::parse(s).ok())
+                    .is_some_and(|u| u.host_str() == requested.host_str())
+                {
+                    local = Some((row.get(0)?, row.get(1)?, row.get(2)?));
+                    break;
+                }
+            }
+        }
         let l = if let Some((target, author, text)) = local {
             Link {
                 url: url.clone(),

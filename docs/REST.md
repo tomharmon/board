@@ -20,21 +20,21 @@ task, schedule, source and write-rule write bodies also have machine-readable sc
 | --- | --- |
 | `GET /channels` | Optional `scope=studio`, lexical `after`, `limit`; returns channel counts, snapshot `cursor` and `next_after`. |
 | `POST /channels` | `{"name":"studio/build"}`; 201 with Location, or 200 with `created:false`. First post creates its channel without a separate request. |
-| `GET /channels/studio/build` | One channel summary. `GET /actors` lists observed handles. |
-| `POST /messages` | Exactly one of `channel` or `reply_to`, plus `text`, optional `labels`, `attachments`, `attachment_ids`, `no_sync`, and (replies only) `after`. 201 with message and Location. Same key, author and target: 200 with the recorded message, not an edit. Reuse by another author or target: 409. |
+| `GET /channels/studio/build` | One channel summary. `GET /actors` lists visible actor IDs or, with `details=true`, their cards. Repeated `id` and optional `query` narrow the list; `cursor` belongs to that same snapshot. |
+| `POST /messages` | Exactly one of `channel` or `reply_to`, plus `text`, optional `labels`, `attachments`, `attachment_ids`, `no_sync`, and (replies only) `after`. Shareable roots can include `sync_targets:["source","another:thread"]`: the first queues a new remote conversation, the second joins an existing one without sending the root. Both commit with the post or neither does. 201 with message and Location. Same key, author and target: 200 with the recorded message, not an edit or a new publication. Reuse by another author or target: 409. |
 | `GET /posts/{key}` | Recover the current message for the local server author's client key; 404 for missing keys and other authors' keys. URL-encode the key. |
 | `GET /messages/{id}` | One current message. `re` is the root ID for a reply; `reply_to` is the individual parent when different from the root. |
 | `PATCH /messages/{id}` | `{"text":"Replacement","if_revision":5}`; revision condition is optional. Returns the updated message. |
 | `DELETE /messages/{id}?if_revision=5` | Optional revision condition. Returns 204; the message remains readable as a tombstone. |
 | `PATCH /messages/{id}/labels` | `{"set":{"state":"done"},"unset":["pending"],"conditions":{"state":"open","holder":null}}`. All conditions must hold together. `board.*` labels are reserved. |
 | `PUT`, `DELETE /messages/{id}/reactions/{name}` | Add/remove the server actor's reaction. 204, including unchanged requests. |
-| `GET /attachments/{id}` | Original bytes as `application/octet-stream`; never a filesystem path. |
+| `GET /attachments/{id}` | Original bytes with their stored media type, `Content-Disposition: attachment` and `nosniff`; never a filesystem path. |
 | `GET /messages`, `GET /threads` | A page of flat messages or summaries. Filters: `channel` (trailing slash for subtree), `text`, `by`, `re`, `mentions`, `from=SOURCE` (`board` for native posts), repeated `label=key` or `label=key=value`. |
 | `GET /messages/{id}/deliveries` | Up to 100 most recent outbound jobs for this exact message at sources the caller may administer; statuses and reasons, not raw payloads or lease secrets. |
 | `GET /rules`, `GET/PUT/DELETE /rules/{name}` | Trusted owner only. Install/update `{priority,script}`; 201 with Location when new. [Offline write rules](RULES.md). |
-| `GET /threads/{id}` | Accepts any message in the thread. One snapshot: `{message,replies,schedules,cursor}`; replies in creation order and pending reminders. With `after`, supply a message ID from this thread. Optional `limit` bounds replies; omit it to read the whole thread. |
-| `GET /events` | Ordered event-time views. Without a cursor start at the live head; use `after=0` for all history or resume from your last cursor. Same filters as lists, plus optional `kind` and `wait_ms` (0..30000). Returns `{events,cursor}`; timeout returns an empty page, not an error. |
-| `GET /events` with `Accept: text/event-stream` | SSE with event type, numeric ID and JSON data. Supports `Last-Event-ID`; an explicit `after` takes precedence. Credentials are checked again during delivery. For a current-view seed use `last=1..100` instead of a cursor/kind. |
+| `GET /threads/{id}` | Accepts any message in the thread. One snapshot: `{message,replies,schedules,cursor}`. Use repeated `label` predicates (each can match the root or reply), an `after` message from this thread and an optional reply `limit`. Omit these to read the whole thread. |
+| `GET /events` | Ordered conversation changes. Without a cursor start at the live head; use `after=0` to start at the beginning. Add `all=true` for permitted bookkeeping, or name a specific `kind`. Same filters as lists; `wait_ms` takes 0..30000. Returns `{events,cursor}`; a timeout returns an empty page, not an error. |
+| `GET /events` with `Accept: text/event-stream` | SSE event type, numeric ID and JSON data. Start at a cursor, or seed with the newest `last=1..100` matching events. On reconnect, `Last-Event-ID` skips the seed and resumes past the later of it and the original `after`. Credentials are checked again during delivery. |
 | `GET/PUT/DELETE /threads/{id}/typing` | List active statuses, set yours (`{"status":"Reviewing","seconds":15}`), or clear. Presence expires and does not append a durable event. |
 | `GET /schemas`, `GET /schemas/{name}/{version}` | Local schema definitions. New databases include `git-commit@1` and a provider-neutral `deployment@1`; an upgrade never replaces a site's own deployment schema. |
 | `PUT /schemas/{name}/{version}` | `{"description":"...","schema":{"type":"object",...}}`. 201 with Location, 204 if identical; immutable definitions conflict. |
@@ -91,14 +91,14 @@ create-and-claim, plans, queue waits, schedule authorization and handler contrac
 | Method and resource | Input / response |
 | --- | --- |
 | `POST /schedules` | `{"channel":"work","text":"Check in","due":1893456000,"every":600,"times":3}` (use an actual due time within the next year). Or use `reply_to` instead of `channel`. Unix seconds; `every`, `times` or `until`, and `labels` are optional. |
-| `GET /schedules`, `GET /schedules/{id}` | Pending collection by default; `all=true` includes completed/canceled entries. |
+| `GET /schedules`, `GET /schedules/{id}` | Pending collection by default; `all=true` includes completed/canceled entries. Filter before pagination by `channel` (a trailing slash includes the subtree), `re` (any message in a thread) or `by`. |
 | `DELETE /schedules/{id}` | Cancel pending sends, 204. Does not delete the schedule's history. A worker fires messages; the API alone does not. |
 | `POST /watchers` | `{"name":"qa","kind":"message.posted","filter":{"channel":"work/","labels":{"step":"check"}}}`. A new subscription begins at the current head. |
 | `GET /watchers`, `GET`, `DELETE /watchers/{name}` | List, inspect or remove a subscription. |
 | `PUT /watchers`, `POST /watcher-matches` | Atomically replace this actor's registrations with `{watchers:[...]}`, retaining cursors for unchanged filters; lease a bounded group with `{limit,lease_seconds,wait_seconds}`. |
 | `GET /watchers/{name}/next` | Oldest unacknowledged match as an event, 204 if none available. Repeatable before ack; no exclusive lease in this mode. |
 | `POST /watchers/{name}/deliveries` | `{"lease_seconds":30}` (1..3600); returns event, receipt, deadline and ETag, or 204 if unavailable. |
-| `PUT /watchers/{name}/acknowledgements/{cursor}` | Ack precisely this delivery. Include its quoted ETag in `If-Match` for leased deliveries. No body for success, `{"skip":true}` to skip, or `{"error":"reason"}` to retry with backoff. |
+| `PUT /watchers/{name}/acknowledgements/{cursor}` | Ack precisely this delivery. Include its quoted ETag in `If-Match` for leased deliveries. No body for success, `{"skip":true}` to skip, or `{"error":"reason"}` to retry with backoff. An exact success replay returns 204 by default. Set `"if_pending":true` to require a new settlement: 412 `no_match` for the winning receipt after completion, 412 `delivery_conflict` for a stale, wrong or unknown delivery, 428 without the receipt. |
 | `GET /watchers/{name}/failures` | Inspect failed deliveries after their retry budget; accepts `after` and `limit`. An outstanding event holds up only its own thread. |
 
 Matches are based on the event-time message state, including entering/leaving
@@ -113,10 +113,13 @@ belongs in an HTTP request to Board. See [connector examples and envelopes](SYNC
 
 | Method and resource | Input / response |
 | --- | --- |
+| `GET /links?url=...` | Resolve a recorded provider permalink to exact `message`, thread `root` and snapshot `cursor`. No network. Absent and unreadable links both return 404. |
+| `GET /messages/{id}/sync` | Read-authorized targets, state and safe public copy URLs. Unlike administrative deliveries below, there are no raw payloads, errors or private receipts. Pending is not confirmation of delivery. |
 | `GET/POST /sources`, `GET/PATCH /sources/{name}` | List/create `{name,provider,remote,channel}`. PATCH accepts `outbound`, `mirror_roots`, `mirror_files` (Slack only), `display_authors`, `github_items` (all/issues/pulls); omitted settings retain their values. Create returns 201 + Location (200 on identical replay). |
 | `GET/PUT/DELETE /sources/{name}/renderer` | Trusted owner only. Read, install `{"script":"message.text"}` or clear a bounded Rhai renderer. A newly created renderer returns 201 with Location. |
 | `POST /sources/{name}/imports` | Apply one normalized envelope and return the local message. |
 | `PUT/GET /sources/{name}/links` | Attach `{thread,external,message,url?}`; find via `?thread=T&external=K`, just a thread, or `?url=...`. |
+| `PUT/GET /sources/{name}/thread-links?thread=T` | Join an existing conversation with `{"root":123}`, or read its binding. Returns 201 with its canonical Location, 200 on an identical retry, 409 if already bound to another root. This is not a writable message copy: no local root, pre-join reply or edit to either goes to this target. |
 | `GET /sources/{name}/copies/{id}` | All confirmed external copies for a local message at that source. |
 | `GET/POST /sources/{name}/files/{id}` | Inspect confirmed file copies for a message; `{thread,attachment}` stages a deliberate Slack file share (202). No external operation is performed by the HTTP server. |
 | `POST /sources/{name}/starts`, `POST /sources/{name}/backfills` | Explicitly stage a new conversation from `{root}` or unshared replies from `{thread}`. A start returns 202 and the queued delivery's Location. |

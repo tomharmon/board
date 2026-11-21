@@ -44,6 +44,373 @@ fn parse(buf: &[u8]) -> Value {
 }
 
 #[tokio::test]
+async fn future_inbox_and_outbox_cursors_resume_at_their_own_queues() {
+    use Method as M;
+    let app = api();
+    assert_eq!(
+        send(
+            &app,
+            M::POST,
+            "/v1/sources",
+            json!({"name":"audit","channel":"desk","provider":"local","remote":"archive"}),
+            None
+        )
+        .await
+        .0,
+        201
+    );
+    assert_eq!(
+        send(
+            &app,
+            M::PATCH,
+            "/v1/sources/audit",
+            json!({"outbound":true}),
+            None
+        )
+        .await
+        .0,
+        200
+    );
+    let inbound = |key: &str| {
+        send(
+            &app,
+            M::POST,
+            "/v1/sources/audit/inbox",
+            json!({"key":key,"import":{"thread":key,"external":key,"author":"writer","change":{"op":"post","text":key}},"raw":{}}),
+            None,
+        )
+    };
+    let outbound = || {
+        send(
+            &app,
+            M::POST,
+            "/v1/messages",
+            json!({"channel":"desk","text":"new issue","sync_targets":["audit"]}),
+            None,
+        )
+    };
+    assert_eq!(inbound("first").await.0, 202);
+    assert_eq!(outbound().await.0, 201);
+    let mut checkpoints = Vec::new();
+    for queue in ["inbox", "outbox"] {
+        let path = format!("/v1/sources/audit/{queue}");
+        let (status, _, raw) = send(&app, M::GET, &path, Value::Null, None).await;
+        assert_eq!(status, 200);
+        let first = parse(&raw)["items"][0]["id"].as_i64().unwrap();
+        let (status, _, raw) = send(
+            &app,
+            M::GET,
+            &format!("{path}?after=9999999"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let page = parse(&raw);
+        assert_eq!(page["items"], json!([]));
+        assert_eq!(page["cursor"], first);
+        checkpoints.push((path, page["cursor"].as_i64().unwrap()));
+    }
+    assert_eq!(inbound("second").await.0, 202);
+    assert_eq!(outbound().await.0, 201);
+    for (path, cursor) in checkpoints {
+        let (status, _, raw) = send(
+            &app,
+            M::GET,
+            &format!("{path}?after={cursor}"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(status, 200);
+        let page = parse(&raw);
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert!(page["cursor"].as_i64().unwrap() > cursor);
+        assert_eq!(page["cursor"], page["items"][0]["id"]);
+    }
+}
+
+#[tokio::test]
+async fn thread_reads_by_reply_accept_repeated_labels_and_inherit_each_root_label() {
+    let app = api();
+    let post = |data| send(&app, Method::POST, "/v1/messages", data, None);
+    let root = parse(
+        &post(json!({"channel":"triage","text":"Root","labels":{"team":"oncall"}}))
+            .await
+            .2,
+    )["id"]
+        .clone();
+    let reply = parse(
+        &post(json!({"reply_to":root,"text":"Ready","labels":{"state":"ready"}}))
+            .await
+            .2,
+    )["id"]
+        .clone();
+    post(json!({"reply_to":root,"text":"Later","labels":{"state":"later"}})).await;
+    let path = format!("/v1/threads/{reply}?label=team%3Doncall&label=state%3Dready%7Cactive");
+    let (status, _, body) = send(&app, Method::GET, &path, Value::Null, None).await;
+    assert_eq!(status, 200);
+    let body = parse(&body);
+    assert_eq!(body["message"]["id"], root);
+    assert_eq!(body["replies"].as_array().unwrap().len(), 1);
+    assert_eq!(body["replies"][0]["id"], reply);
+}
+
+#[tokio::test]
+async fn explicit_source_targets_create_no_remote_copy_and_cannot_partially_commit() {
+    use Method as M;
+    let app = api();
+    send(
+        &app,
+        M::POST,
+        "/v1/sources",
+        json!({"name":"notes","channel":"desk","provider":"local","remote":"archive"}),
+        None,
+    )
+    .await;
+    let p = json!({"channel":"desk","text":"publish deliberately","sync_targets":["notes"]});
+    let attempt = || {
+        send(
+            &app,
+            M::POST,
+            "/v1/messages",
+            p.clone(),
+            Some("queued-once"),
+        )
+    };
+    assert_eq!(attempt().await.0, 422, "no implicit publishing");
+    assert_eq!(
+        send(&app, M::GET, "/v1/posts/queued-once", Value::Null, None)
+            .await
+            .0,
+        404
+    );
+    assert_eq!(
+        send(
+            &app,
+            M::PATCH,
+            "/v1/sources/notes",
+            json!({"outbound":true}),
+            None
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, h, body) = attempt().await;
+    assert_eq!(s, 201);
+    let id = parse(&body)["id"].clone();
+    assert_eq!(h["location"], format!("/v1/messages/{id}"));
+    assert_eq!(attempt().await.0, 200);
+    let (_, _, outbox) = send(&app, M::GET, "/v1/sources/notes/outbox", Value::Null, None).await;
+    assert_eq!(parse(&outbox)["items"].as_array().unwrap().len(), 1);
+    let (_, _, body) = send(
+        &app,
+        M::GET,
+        &format!("/v1/messages/{id}/sync"),
+        Value::Null,
+        None,
+    )
+    .await;
+    let targets = parse(&body);
+    assert_eq!(targets["targets"][0]["state"], "pending");
+    assert!(targets["targets"][0]["url"].is_null());
+    assert_eq!(
+        send(
+            &app,
+            M::POST,
+            "/v1/messages",
+            json!({"reply_to":id,"text":"wrong","sync_targets":["notes"]}),
+            None
+        )
+        .await
+        .0,
+        422
+    );
+}
+
+#[tokio::test]
+async fn explicit_provider_joins_use_canonical_offline_lane_ids() {
+    use Method as M;
+    let app = api();
+    for (source, provider, remote) in [
+        ("bugs", "github", "team/project"),
+        ("chat", "slack", "C123"),
+        ("issues", "linear", "DEV"),
+    ] {
+        assert_eq!(
+            send(
+                &app,
+                M::POST,
+                "/v1/sources",
+                json!({"name":source,"provider":provider,"remote":remote,"channel":"desk"}),
+                None
+            )
+            .await
+            .0,
+            201
+        );
+        assert_eq!(
+            send(
+                &app,
+                M::PATCH,
+                &format!("/v1/sources/{source}"),
+                json!({"outbound":true}),
+                None
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    for dest in [
+        "bugs:0",
+        "bugs:other/repo:21",
+        "chat:word",
+        "issues:other-team",
+    ] {
+        assert_eq!(
+            send(
+                &app,
+                M::POST,
+                "/v1/messages",
+                json!({"channel":"desk","text":"no","sync_targets":[dest]}),
+                None
+            )
+            .await
+            .0,
+            422,
+            "{dest}"
+        );
+    }
+    let (s,_,body)=send(&app,M::POST,"/v1/messages",json!({"channel":"desk","text":"one root","sync_targets":["bugs:#0021","bugs:21","chat:123.456","issues:8A42B68F-0265-4033-89E0-8BA8532CED51"]}),None).await;
+    assert_eq!(s, 201);
+    let id = parse(&body)["id"].as_i64().unwrap();
+    let (_, _, body) = send(
+        &app,
+        M::GET,
+        &format!("/v1/messages/{id}/sync"),
+        Value::Null,
+        None,
+    )
+    .await;
+    let targets = parse(&body);
+    let ids: Vec<_> = targets["targets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["thread"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids,
+        ["21", "123.456", "8a42b68f-0265-4033-89e0-8ba8532ced51"]
+    );
+    for source in ["bugs", "chat", "issues"] {
+        let (_, _, out) = send(
+            &app,
+            M::GET,
+            &format!("/v1/sources/{source}/outbox"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(
+            parse(&out)["items"],
+            json!([]),
+            "a join never publishes the root to {source}"
+        );
+    }
+    let join = "/v1/sources/bugs/thread-links?thread=%230022";
+    let (status, headers, body) = send(&app, M::PUT, join, json!({"root":id}), None).await;
+    assert_eq!(status, 201);
+    let location = headers["location"].to_str().unwrap();
+    assert_eq!(location, "/v1/sources/bugs/thread-links?thread=22");
+    assert_eq!(
+        parse(&body),
+        parse(&send(&app, M::GET, location, Value::Null, None).await.2)
+    );
+    assert_eq!(
+        send(&app, M::PUT, join, json!({"root":id}), None).await.0,
+        200
+    );
+}
+
+#[tokio::test]
+async fn sse_reconnect_resumes_both_seeded_and_cursor_urls_without_replays() {
+    use futures_util::StreamExt;
+    let app = api();
+    let post = |word| {
+        send(
+            &app,
+            Method::POST,
+            "/v1/messages",
+            json!({"channel":"desk","text":word}),
+            None,
+        )
+    };
+    let one = parse(&post("one").await.2)["id"].as_i64().unwrap();
+    let two = parse(&post("two").await.2)["id"].as_i64().unwrap();
+    send(
+        &app,
+        Method::POST,
+        "/v1/channels",
+        json!({"name":"empty"}),
+        None,
+    )
+    .await;
+    for suffix in ["?after=0", "?last=2"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/events{suffix}"))
+                    .header("authorization", "Bearer test-local-token")
+                    .header("accept", "text/event-stream")
+                    .header("last-event-id", one.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{suffix}");
+        let mut stream = resp.into_body().into_data_stream();
+        let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let data = std::str::from_utf8(&next).unwrap();
+        assert!(data.lines().any(|l| l == format!("id: {two}")), "{data}");
+    }
+    for (suffix, expect_control) in [
+        ("", false),
+        ("&all=true", true),
+        ("&kind=channel.created", true),
+    ] {
+        let (s, _, body) = send(
+            &app,
+            Method::GET,
+            &format!("/v1/events?after={two}{suffix}"),
+            Value::Null,
+            None,
+        )
+        .await;
+        assert_eq!(s, 200);
+        let body = parse(&body);
+        assert!(body["cursor"].as_i64().unwrap() > two);
+        assert_eq!(
+            body["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["type"] == "channel.created"),
+            expect_control,
+            "{body}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn advertised_resources_exist_and_sources_round_trip_offline() {
     use Method as M;
     let app = api();

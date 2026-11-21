@@ -229,7 +229,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 11;
+const DB_VERSION: i64 = 13;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -357,6 +357,7 @@ impl Board {
         crate::presence::init(&tx)?;
         crate::files::init(&tx)?;
         crate::actors::init(&tx)?;
+        crate::projections::init(&tx)?;
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         tx.pragma_update(None, "user_version", DB_VERSION)?;
         tx.commit()?;
@@ -517,7 +518,23 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
-        self.post_guarded(channel, actor, text, opts, None)
+        self.post_with_targets(channel, actor, text, opts, &[])
+    }
+    /// Commit a root and all explicitly requested outgoing conversations together, without network I/O.
+    pub fn post_with_targets(
+        &self,
+        channel: &str,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        targets: &[String],
+    ) -> Result<(Message, bool)> {
+        ensure!(targets.len() <= 32, "at most 32 sync targets");
+        ensure!(
+            targets.is_empty() || !opts.no_sync,
+            "a local-only message cannot have sync targets"
+        );
+        self.post_guarded(channel, actor, text, opts, None, targets)
     }
     pub fn post_composer(
         &self,
@@ -527,8 +544,18 @@ impl Board {
         opts: &PostOptions,
         stamp: &str,
     ) -> Result<Message> {
+        self.post_scoped_composer(channel, actor, text, opts, ("new", stamp))
+    }
+    pub fn post_scoped_composer(
+        &self,
+        channel: &str,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        guard: (&str, &str),
+    ) -> Result<Message> {
         Ok(self
-            .post_guarded(channel, actor, text, opts, Some(stamp))?
+            .post_guarded(channel, actor, text, opts, Some(guard), &[])?
             .0)
     }
     fn post_guarded(
@@ -537,16 +564,21 @@ impl Board {
         actor: &str,
         text: &str,
         opts: &PostOptions,
-        stamp: Option<&str>,
+        guard: Option<(&str, &str)>,
+        targets: &[String],
     ) -> Result<(Message, bool)> {
         self.write(|tx| {
-            if let Some(stamp) = stamp {
-                let draft = self.check_composer_options_on(tx, actor, "new", text, opts, None)?;
+            if let Some((scope, stamp)) = guard {
+                ensure!(
+                    crate::drafts::root_scope(scope, channel),
+                    Conflict.error("draft_changed", "draft destination no longer matches")
+                );
+                let draft = self.check_composer_options_on(tx, actor, scope, text, opts, None)?;
                 ensure!(
                     draft.channel == channel && draft.reply_to.is_none(),
                     Conflict.error("draft_changed", "draft destination no longer matches")
                 );
-                self.consume_composer_on(tx, actor, "new", stamp)?;
+                self.consume_composer_on(tx, actor, scope, stamp)?;
             }
             let a = self.access_on(tx)?;
             a.actor(actor)?;
@@ -557,6 +589,9 @@ impl Board {
             }
             let (text, mentions) = crate::actors::settle(tx, &a, actor, None, text)?;
             let (m, created) = Self::post_tx_with_outcome(tx, channel, actor, &text, opts)?;
+            if created && !targets.is_empty() {
+                self.queue_post_targets_on(tx, actor, &m, targets)?;
+            }
             if a.allows(Action::Read, channel) {
                 return Ok((
                     crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
@@ -680,8 +715,8 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
-        validate_post(channel, actor, text, opts)?;
         if let Some(key) = &opts.key {
+            validate_client_key(key)?;
             crate::automation::authorize_callback_key(tx, actor, key)?;
         }
         let re = parent.map(|p| p.0);
@@ -709,6 +744,8 @@ impl Board {
             );
             return Ok((original, false));
         }
+        // A stored receipt recovers the original write; only a new post needs its payload again.
+        validate_post(channel, actor, text, opts)?;
         if let Some(after) = opts.after {
             let (root, _) = parent.context("after is only valid for replies")?;
             let valid: bool = tx.query_row(

@@ -11,6 +11,7 @@ pub(super) fn stream(
     app: App,
     filter: Filter,
     kind: Option<String>,
+    all: bool,
     after: i64,
     history: VecDeque<board_local::Event>,
 ) -> Response {
@@ -34,7 +35,7 @@ pub(super) fn stream(
                             if let Some(event) = backlog {
                                 return Ok((cursor, b.recheck_event(event)?, true));
                             }
-                            let (pos, rows) = b.event_page(cursor, 1, &f, k.as_deref())?;
+                            let (pos, rows) = b.event_feed(cursor, 1, &f, k.as_deref(), all)?;
                             Ok((pos, rows.into_iter().next(), false))
                         }),
                     )

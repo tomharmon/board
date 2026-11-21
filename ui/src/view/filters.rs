@@ -37,7 +37,7 @@ pub(super) fn summary(s: &State) -> El {
 
 pub(super) fn view(s: &State, inset: f32) -> El {
     let b = &s.browse;
-    let content = col()
+    let mut content = col()
         .w_full()
         .px(inset)
         .py(18.0)
@@ -62,7 +62,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                     |s: &mut State| {
                         s.tasks_only = !s.tasks_only;
                         s.browse.filter_open = false;
-                        s.starts.clear();
+                        s.reset_feed();
                         s.refresh();
                     },
                 ))
@@ -121,17 +121,18 @@ pub(super) fn view(s: &State, inset: f32) -> El {
             &b.labels,
             |s| &mut s.browse.labels,
             true,
-        ))
-        .child(
-            row()
-                .w_full()
-                .center_y()
-                .gap(8.0)
-                .child(
-                    action("clear-filters", "Clear filters", false).on_press(State::clear_filters),
-                )
-                .child(el().grow(1.0))
-                .child(action("apply-filters", "Apply", true).on_press(State::apply_filters)),
-        );
+        ));
+    if let Some(choices) = suggestions::labels(s, suggestions::Field::Filter) {
+        content = content.child(choices);
+    }
+    content = content.child(
+        row()
+            .w_full()
+            .center_y()
+            .gap(8.0)
+            .child(action("clear-filters", "Clear filters", false).on_press(State::clear_filters))
+            .child(el().grow(1.0))
+            .child(action("apply-filters", "Apply", true).on_press(State::apply_filters)),
+    );
     scroll("filter-scroll", content)
 }

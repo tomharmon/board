@@ -118,6 +118,202 @@ fn http_headers(
 }
 
 #[test]
+fn strict_ack_over_loopback_and_cli_shares_the_proven_outcome_but_default_put_replays() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("conformance.sqlite");
+    let master = "strict-ack-contract";
+    cli(
+        &db,
+        &[
+            "watchers",
+            "add",
+            "notes",
+            "ops",
+            "--kind",
+            "message.posted",
+        ],
+        None,
+    );
+    let (_server, addr) = launch(&db, master);
+    let (s, api) = http(&addr, "GET", "openapi.json", master, None, Value::Null);
+    assert_eq!(s, 200);
+    let ack_schema = &api["paths"]["/watchers/{name}/acknowledgements/{cursor}"]["put"];
+    assert_eq!(ack_schema["requestBody"]["required"], false);
+    assert!(ack_schema["responses"]["412"].is_object());
+    assert_eq!(
+        api["components"]["schemas"]["WatcherAck"]["properties"]["if_pending"]["default"],
+        false
+    );
+    for cli_first in [false, true] {
+        cli(&db, &["post", "ops", "One event"], None);
+        let (status, d) = http(
+            &addr,
+            "POST",
+            "watchers/notes/deliveries",
+            master,
+            None,
+            json!({"lease_seconds":60}),
+        );
+        assert_eq!(status, 200);
+        let cursor = d["event"]["cursor"].as_i64().unwrap();
+        let id = cursor.to_string();
+        let receipt = d["receipt"].as_str().unwrap();
+        let url = format!("watchers/notes/acknowledgements/{id}");
+        let tag = format!("If-Match: \"{receipt}\"\r\n");
+        let strict = json!({"if_pending":true});
+        let put =
+            |url: &str, tag: &str, data: Value| http_headers(&addr, "PUT", url, master, tag, data);
+        let ack = [
+            "watchers",
+            "ack",
+            "notes",
+            id.as_str(),
+            "--receipt",
+            receipt,
+            "--if-pending",
+        ];
+        assert_eq!(put(&url, "", strict.clone()).0, 428);
+        if cli_first {
+            assert_eq!(cli(&db, &ack, None), cursor);
+        } else {
+            assert_eq!(put(&url, &tag, strict.clone()).0, 204);
+        }
+        let (s, result, _) = put(&url, &tag, strict.clone());
+        assert_eq!(s, 412);
+        assert_eq!(result["code"], "no_match");
+        let retry = board(&db).args(ack).output().unwrap();
+        assert_eq!(retry.status.code(), Some(1));
+        assert_eq!(
+            serde_json::from_slice::<Value>(&retry.stderr).unwrap()["code"],
+            "no_match"
+        );
+        let wrong = put(&url, "If-Match: \"other\"\r\n", strict.clone());
+        let missing = put(
+            &format!("watchers/notes/acknowledgements/{}", cursor + 1000),
+            &tag,
+            strict,
+        );
+        assert_eq!(wrong.0, 412);
+        assert_eq!(wrong.1["code"], "delivery_conflict");
+        assert_eq!(wrong.1, missing.1);
+        assert_eq!(put(&url, &tag, json!({})).0, 204);
+        assert_eq!(cli(&db, &ack[..6], None), cursor);
+    }
+}
+
+#[test]
+fn read_only_sync_lookups_and_schedule_scopes_observe_live_cli_and_rest_data() {
+    use board_local::{
+        Board,
+        access::Rules,
+        automation::{Destination, Timing, schedule},
+        sources::Provider,
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("board.sqlite");
+    let owner = Board::open(&db).unwrap();
+    let mut examples = vec![];
+    for (name, ch) in [
+        ("hidden", "work/secret"),
+        ("open", "work/public"),
+        ("second", "work/public/sub"),
+        ("near", "work/public-other"),
+    ] {
+        let url = format!("https://test.invalid/{name}");
+        let root = owner
+            .post(ch, "owner", "root", &Default::default())
+            .unwrap();
+        owner
+            .create_source("owner", name, Provider::Local, name, ch)
+            .unwrap();
+        owner
+            .attach_source("owner", name, "t", "r", root.id, Some(&url))
+            .unwrap();
+        let row = schedule(
+            &owner,
+            "owner",
+            Destination::Channel(ch),
+            "Later",
+            Timing {
+                due: chrono::Utc::now().timestamp() + 3600,
+                every: None,
+                times: None,
+                until: None,
+            },
+            Default::default(),
+        )
+        .unwrap();
+        examples.push((root.id, row.id));
+    }
+    owner
+        .set_grant(
+            "owner",
+            None,
+            "reader",
+            &Rules::parse("work/public/=read").unwrap(),
+        )
+        .unwrap();
+    let issued = owner
+        .issue_credential("owner", "reader", None, None)
+        .unwrap();
+    drop(owner);
+    let token = issued.token.as_str();
+    let (_server, addr) = launch(&db, "local-read-only-contract");
+    let get = |path: &str| http(&addr, "GET", path, token, None, Value::Null);
+    let locate = cli(
+        &db,
+        &["sync", "locate", "https://test.invalid/open"],
+        Some(token),
+    );
+    assert_eq!(locate["message"], examples[1].0);
+    assert_eq!(
+        get("links?url=https%3A%2F%2Ftest.invalid%2Fopen"),
+        (200, locate)
+    );
+    let targets = cli(
+        &db,
+        &["sync", "targets", &examples[1].0.to_string()],
+        Some(token),
+    );
+    assert_eq!(targets["targets"][0]["state"], "confirmed");
+    assert_eq!(
+        get(&format!("messages/{}/sync", examples[1].0)),
+        (200, targets)
+    );
+    let hidden = get("links?url=https%3A%2F%2Ftest.invalid%2Fhidden");
+    assert_eq!(hidden.0, 404);
+    assert_eq!(hidden.1["code"], "message_not_found");
+    assert_eq!(get("links?url=https%3A%2F%2Ftest.invalid%2Fabsent"), hidden);
+    assert_eq!(get(&format!("messages/{}/sync", examples[0].0)).0, 404);
+    assert!(matches!(get("sources/open/inbox").0, 403 | 404));
+    let (s, page) = get("schedules?channel=work%2F&limit=1");
+    assert_eq!(s, 200);
+    assert_eq!(page["schedules"][0]["id"], examples[1].1);
+    assert_eq!(page["next_after"], examples[1].1);
+    let next = get(&format!(
+        "schedules?channel=work%2F&limit=1&after={}",
+        page["next_after"]
+    ))
+    .1;
+    assert_eq!(next["schedules"][0]["id"], examples[2].1);
+    assert!(next["next_after"].is_null());
+    let exact = get("schedules?channel=work%2Fpublic").1;
+    assert_eq!(exact["schedules"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        cli(&db, &["schedules", "--channel", "work/public"], Some(token)),
+        exact["schedules"]
+    );
+    assert_eq!(
+        cli(&db, &["schedules", "--channel", "work/"], Some(token)),
+        json!([page["schedules"][0], next["schedules"][0]])
+    );
+    assert_eq!(
+        get("schedules?channel=work%2Fsecret").1["schedules"],
+        json!([])
+    );
+}
+
+#[test]
 fn real_rest_installs_a_rule_cli_obeys_and_restart_keeps_source_privacy() {
     let temp = tempfile::tempdir().unwrap();
     let db = temp.path().join("board");

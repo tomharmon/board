@@ -8,6 +8,8 @@ both implementations. They do not run the upstream wire suite unchanged.
 The [protocol inventory](docs/PARITY-AUDIT.md) maps all reference method
 families and distinguishes covered behavior, deliberately local alternatives
 and provider-specific limits. No claim of byte-for-byte or SDK compatibility.
+The [latest audit findings and their regression tests](docs/PARITY-AUDIT.md#latest-pass-findings-and-fixes)
+show what the previous checklist missed.
 
 | Reference contract | Local design | Executable proof (test name) |
 | --- | --- | --- |
@@ -63,35 +65,52 @@ every workspace member and the real-clock lease test, not only the default
 CLI build. `board conformance` is a separate seven-invariant smoke check on
 a fresh temporary board. It is not a replacement for the full tests.
 
-The locked release-profile workspace run on **2026-11-21 passed 207 tests**, with none
-ignored: 102 core/storage, 18 CLI/process, 17 REST, 23 provider protocol,
-and 47 native UI (46 scripted inspector cases and one Rune clipboard test).
+Exact release-suite invocation (including the native inspector and the slow
+lease test):
+
+```sh
+cargo +stable test --offline --locked --release -j 4 --workspace -- --include-ignored --test-threads=3
+```
+
+The locked release-profile workspace run on **2026-11-21 passed 250 tests**, with none
+ignored: 119 core/storage, 24 CLI/process, 22 REST, 25 provider protocol,
+and 60 native UI (58 scripted inspector cases, a Rune clipboard test and a
+media-container check).
 The [visual audit](docs/INSPECTOR-VISUALS.md) compares actual browser and native
-renders. The work includes additive migration of previous Rust boards to schema
-11 for per-channel, per-identity read marks; upgrading does not advance board events.
+renders. V11 introduced per-channel, per-identity read marks; v12 backfills
+indexed channel counts, live thread activity and source lookup indexes. A
+populated v11 upgrade is tested against an independent fold of its raw messages;
+upgrading does not advance board events. V13 records the join cursor for
+existing external conversations. An upgrade test opens a populated early
+v12 database, retires an unsent root without erasing delivery history, and
+proves that the later reply remains eligible.
 Both debug and release binaries built offline. Workspace formatting and
-all-target Clippy with warnings denied passed. In the earlier workflow audit
-(`7b6951c`), a clean export also built both binaries offline in a separate target directory;
-its CLI passed the seven-invariant smoke check. An anonymous live pull of
+all-target Clippy with warnings denied passed. A separate locked release
+build of the current CLI from an empty target directory passed the
+seven-invariant smoke check without compiling Rune or windowing/GPU crates.
+In the earlier workflow audit (`7b6951c`), a clean export also built both
+binaries offline in a separate target directory. An anonymous live pull of
 [public GitHub issue #1](https://github.com/BurntSushi/ripgrep/issues/1)
 applied 31 records, zero on replay, and left the outbox empty.
 Slack, Linear and all external writes were tested using local fixtures only.
 
 [Reproduce the reference checks](docs/REFERENCE-CHECKS.md). The original
-SQLite backend and the Rust binary agreed on **36 message/storage/sync
-outcomes and 44 watcher/schedule/task outcomes**, including restart and a
-real-clock stale lease. Three interface differences were explicitly
-observed and asserted, not normalized out: attempt numbering, repeat ack
-and whether renewal echoes the proof. Separate pure-contract comparisons
+SQLite backend and the Rust binary agreed on **40 message/storage/sync
+outcomes and 47 watcher/schedule/task outcomes**, including restart and a
+real-clock stale lease. The leased event's attempt number and a
+holder's private renewal response now match. One interface difference is
+explicitly asserted: an exact retry succeeds by default on the local
+idempotent resource. With `--if-pending`, the same successful holder gets
+`no_match`, as it does in the original. Separate pure-contract comparisons
 matched **17 schema definitions, 83 schema values, 13 block inputs,
-16 mention queries, 16 provider tag names and 276 reaction spellings**.
+16 mention queries, 16 provider tag names, 8 imported handles and 276 reaction spellings**.
 
 The [round-trip script](scripts/roundtrip.py) also ran from outside the checkout
 with just the two installed release binaries, in a network namespace containing
 only loopback. The CLI created message #1;
 the API read it and replied with #2 as `ada/desk`. A real-time Rune input
 mark confirmed the thread was already open before the HTTP write. Both texts
-appeared in the [rendered native window](docs/inspector.png) and in its
+appeared in the rendered native window and in its
 element tree. The API and UI exited, then fresh CLI, API and UI processes
 read the same IDs and text. Opening the independent backup returned the same
 root and reply; SQLite's integrity and foreign-key checks were clean. No worker

@@ -78,6 +78,8 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/messages", "get post"),
     ("/messages/{id}", "get patch delete"),
     ("/messages/{id}/deliveries", "get"),
+    ("/messages/{id}/sync", "get"),
+    ("/links", "get"),
     ("/posts/{key}", "get"),
     ("/messages/{id}/labels", "patch"),
     ("/messages/{id}/reactions/{name}", "put delete"),
@@ -122,6 +124,7 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/sources/{name}", "get patch"),
     ("/sources/{name}/renderer", "get put delete"),
     ("/sources/{name}/links", "get put"),
+    ("/sources/{name}/thread-links", "get put"),
     ("/sources/{name}/imports", "post"),
     ("/sources/{name}/inbox", "get post"),
     ("/sources/{name}/outbox", "get"),
@@ -155,9 +158,6 @@ fn spec() -> Value {
                 .filter(|s| !s.is_empty())
                 .unwrap_or("discovery");
             let mut op = json!({"summary":format!("{} {path}",method.to_uppercase()),"tags":[tag],"responses":{"2XX":{"description":"Successful local operation"},"default":{"description":"Rejected request","content":{"application/problem+json":{"schema":{"$ref":"#/components/schemas/Problem"}}}}}});
-            if method == "get" && matches!(path, "/messages" | "/threads" | "/events") {
-                op["parameters"]=json!(["after","limit","channel","re","by","mentions","text","label","from"].into_iter().chain(if path=="/events"{vec!["last","kind","wait_ms"]}else{vec!["before"]}).map(|n|json!({"name":n,"in":"query","schema":if n=="label"{json!({"type":"array","items":{"type":"string"}})}else{json!({"type":"string"})}})).collect::<Vec<_>>());
-            }
             if matches!(method, "post" | "put" | "patch")
                 && !path.contains("/reactions/")
                 && !path.ends_with("/completion")

@@ -51,6 +51,7 @@ impl Delivery {
             times: self.times.text.clone(),
             until: self.until.text.clone(),
             labels: self.labels.text.clone(),
+            task: None,
         }
     }
     fn timing(&self) -> Result<automation::Timing> {
@@ -67,9 +68,18 @@ impl State {
     pub fn edits_root(&self) -> bool {
         self.page.is_feed() || (self.root_editor_in_thread && matches!(self.page, Page::Thread(_)))
     }
+    pub(super) fn root_scope(&self) -> String {
+        if self.page != Page::Compose
+            && let Some(ch) = &self.channel
+        {
+            format!("channel:{}", ch.trim_end_matches('/'))
+        } else {
+            "new".into()
+        }
+    }
     pub(super) fn draft_scope(&self) -> Option<String> {
         if self.edits_root() {
-            return Some("new".into());
+            return Some(self.root_scope());
         }
         self.page.thread_id().map(|id| format!("thread:{id}"))
     }
@@ -93,6 +103,7 @@ impl State {
         // Leave the sealed SQLite copy alone. A narrower grant may still be
         // valid for the rest of the board, but not for this saved destination.
         self.body.clear();
+        self.people.inline = Default::default();
         self.files.clear();
         self.destination.clear();
         self.reply_to = None;
@@ -199,11 +210,20 @@ impl State {
             return Ok(());
         };
         let saved = self.db()?.load_composer(&self.actor, &scope)?;
+        self.people.inline = Default::default();
         self.draft_dirty = false;
         self.body.clear();
         self.reply_to = None;
         self.files.clear();
         self.delivery = Delivery::default();
+        if self.edits_root() {
+            self.destination = TextEdit::new(
+                self.channel
+                    .as_deref()
+                    .unwrap_or("general")
+                    .trim_end_matches('/'),
+            );
+        }
         if let Some(d) = saved {
             self.body = TextEdit::new(d.draft.body);
             self.reply_to = d.draft.reply_to;
@@ -259,9 +279,13 @@ impl State {
                 Ok(Sent::Later)
             } else {
                 let m = match dest {
-                    automation::Destination::Channel(ch) => {
-                        db.post_composer(ch, &self.actor, &self.body.text, &options, stamp)?
-                    }
+                    automation::Destination::Channel(ch) => db.post_scoped_composer(
+                        ch,
+                        &self.actor,
+                        &self.body.text,
+                        &options,
+                        (&scope, stamp),
+                    )?,
                     automation::Destination::Reply(id) => db.reply_composer(
                         id,
                         &self.actor,
@@ -300,7 +324,7 @@ impl State {
                     self.channel = None;
                     self.query.clear();
                     self.tasks_only = false;
-                    self.starts.clear();
+                    self.reset_feed();
                     if self.db().is_ok_and(|db| db.get(root).is_ok()) {
                         self.channel = Some(m.channel);
                     } else {
@@ -321,7 +345,7 @@ impl State {
 }
 impl Drop for State {
     fn drop(&mut self) {
-        let _ = self.flush_draft();
+        let _ = self.flush_drafts();
         self.clear_typing();
     }
 }

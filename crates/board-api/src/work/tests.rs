@@ -539,6 +539,17 @@ async fn task_round_trip() {
     let claim = request(&router, "POST", &path, json!({"lease_seconds":30}), &[]).await;
     assert_eq!(claim.status, StatusCode::CREATED, "{}", claim.body);
     let tag = claim.headers[header::ETAG].to_str().unwrap();
+    let renewal = request(
+        &router,
+        "PATCH",
+        &path,
+        json!({"epoch":claim.body["epoch"],"token":claim.body["claim_token"],"lease_seconds":90}),
+        &[],
+    )
+    .await;
+    assert_eq!(renewal.status, StatusCode::OK);
+    assert_eq!(renewal.body["claim_token"], claim.body["claim_token"]);
+    assert_eq!(renewal.headers[header::CACHE_CONTROL], "no-store");
     let occupied = request(&router, "POST", &path, json!({}), &[]).await;
     assert_eq!(occupied.status, StatusCode::CONFLICT);
     let lease = request(&router, "GET", &path, Value::Null, &[]).await;

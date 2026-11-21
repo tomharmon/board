@@ -247,6 +247,36 @@ pub(super) fn validate(i: &Import) -> Result<()> {
     );
     Ok(())
 }
+fn meet_authors(tx: &Transaction<'_>, s: &Source, i: &Import, actor: &str) -> Result<()> {
+    let text = match &i.change {
+        Change::Post { text, .. }
+        | Change::Upsert { text, .. }
+        | Change::Reconcile { text, .. }
+        | Change::Edit { text } => text.as_str(),
+        Change::Signal {
+            reply: Some(text), ..
+        } => text,
+        _ => "",
+    };
+    let terms = crate::prose::tokens(text);
+    for (id, p) in &i.mentioned {
+        let id = format!("source:{}/{}", s.name, id);
+        if id != actor && terms.iter().any(|t| t.exact && t.value == id) {
+            // Imports can introduce a new person but cannot rename a known actor on their behalf.
+            tx.execute(
+                "INSERT INTO sync_profiles(actor,source,name,avatar) SELECT ?1,?2,?3,?4
+                WHERE NOT EXISTS(SELECT 1 FROM events WHERE actor=?1)
+                  AND NOT EXISTS(SELECT 1 FROM actor_profiles WHERE id=?1)
+                ON CONFLICT(actor) DO NOTHING",
+                params![id, s.name, p.name, p.avatar],
+            )?;
+        }
+    }
+    if let Some(p) = &i.profile {
+        tx.execute("INSERT INTO sync_profiles VALUES(?,?,?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name,avatar=coalesce(excluded.avatar,sync_profiles.avatar)",params![actor,s.name,p.name,p.avatar])?;
+    }
+    Ok(())
+}
 pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Message> {
     validate(i)?;
     ensure!(
@@ -255,23 +285,6 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
     );
     let actor = format!("source:{}/{}", s.name, i.author);
     crate::validate_actor(&actor)?;
-    let text = match &i.change {
-        Change::Post { text, .. }
-        | Change::Upsert { text, .. }
-        | Change::Reconcile { text, .. }
-        | Change::Edit { text } => text.as_str(),
-        _ => "",
-    };
-    let terms = crate::prose::tokens(text);
-    for (id, p) in &i.mentioned {
-        let id = format!("source:{}/{}", s.name, id);
-        if terms.iter().any(|t| t.exact && t.value == id) {
-            tx.execute("INSERT INTO sync_profiles VALUES(?,?,?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name,avatar=coalesce(excluded.avatar,sync_profiles.avatar)",params![id,s.name,p.name,p.avatar])?;
-        }
-    }
-    if let Some(p) = &i.profile {
-        tx.execute("INSERT INTO sync_profiles VALUES(?,?,?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name,avatar=excluded.avatar",params![actor,s.name,p.name,p.avatar])?;
-    }
     let copy = find_on(tx, &s.name, &i.thread, &i.external)?;
     if let Change::Signal {
         conditions,
@@ -289,13 +302,23 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         if m.deleted || !conditions.iter().all(|(k, v)| m.labels.get(k) == Some(v)) {
             return Ok(m);
         }
+        meet_authors(tx, s, i, &actor)?;
         let updated = if set.is_empty() && unset.is_empty() {
             m
         } else {
             Board::labels_tx(tx, root, &actor, set, unset, &BTreeMap::new())?
         };
         if let Some(text) = reply {
-            let m = Board::reply_tx(tx, root, &actor, text, &Default::default())?;
+            let m = Board::reply_tx(
+                tx,
+                root,
+                &actor,
+                text,
+                &PostOptions {
+                    no_sync: i.no_sync,
+                    ..Default::default()
+                },
+            )?;
             bind(tx, s, &i.thread, &i.external, &m, true, i.url.as_deref())?;
             let m = Board::get_on(tx, m.id)?;
             Board::snapshot(tx, m.id, &m, None)?;
@@ -312,6 +335,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             if old.deleted {
                 return Ok(old);
             }
+            meet_authors(tx, s, i, &actor)?;
             return Board::react_tx(tx, old.id, &actor, emoji, *remove);
         }
         // Copies we delivered can be echoed back by the provider. Do not impersonate the local author.
@@ -319,11 +343,15 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             return Ok(old);
         }
         let (last,labels):(Option<i64>,String)=tx.query_row("SELECT modified,managed_labels FROM sync_copies WHERE source=? AND thread=? AND external=?",params![s.name,i.thread,i.external],|r|Ok((r.get(0)?,r.get(1)?)))?;
-        if stamp.zip(last).is_some_and(|(a, b)| a < b) || old.deleted {
+        if stamp.zip(last).is_some_and(|(a, b)| a < b)
+            || old.deleted
+            || matches!(i.change, Change::Post { .. })
+        {
             return Ok(old);
         }
+        meet_authors(tx, s, i, &actor)?;
         match &i.change {
-            Change::Post { .. } => return Ok(old),
+            Change::Post { .. } => unreachable!("handled above"),
             Change::Upsert { text, labels: next }
             | Change::Reconcile {
                 text, labels: next, ..
@@ -431,17 +459,24 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                     })?
                     .message,
             ),
-            None => {
-                ensure!(
-                    root_on(tx, &s.name, &i.thread)?.is_none(),
-                    Kind::Conflict.error(
-                        "already_synced",
-                        "this external thread already has a different root"
-                    )
-                );
-                None
-            }
+            None => match root_on(tx, &s.name, &i.thread)? {
+                None => None,
+                Some(local) => {
+                    // A join links conversations without equating their two original roots.
+                    // Import that root once, as a distinct message, so later reply targets stay exact.
+                    let first = tx.execute("UPDATE sync_explicit_joins SET remote_root=? WHERE source=? AND thread=? AND remote_root IS NULL",params![i.external,s.name,i.thread])?;
+                    ensure!(
+                        first == 1,
+                        Kind::Conflict.error(
+                            "already_synced",
+                            "this external thread already has a different root"
+                        )
+                    );
+                    Some(local)
+                }
+            },
         };
+        meet_authors(tx, s, i, &actor)?;
         let m = match parent {
             Some(p) => Board::reply_tx(tx, p, &actor, text, &opts)?,
             None => Board::post_tx(tx, &s.channel, &actor, text, &opts)?,

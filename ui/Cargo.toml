@@ -10,7 +10,7 @@ publish = false
 anyhow = "1"
 board-local = { path = "../crates/board-core" }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 rune = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf", default-features = false, features = ["embedded-fonts", "tooling", "native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf", default-features = false, features = ["markdown"] }

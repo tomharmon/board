@@ -169,6 +169,13 @@ pub enum Command {
     /// Start a thread in a channel, or reply to a message ID
     Post {
         target: String,
+        /// Also enqueue publication to a configured source. SOURCE:THREAD joins an existing conversation.
+        #[arg(
+            long = "sync",
+            value_name = "SOURCE[:THREAD]",
+            conflicts_with = "no_sync"
+        )]
+        sync_targets: Vec<String>,
         #[command(flatten)]
         options: WriteOptions,
     },
@@ -249,6 +256,9 @@ pub enum Command {
         query: Query,
         #[arg(long, conflicts_with = "after")]
         last: Option<usize>,
+        /// Include board bookkeeping and claim renewals, subject to your read permissions
+        #[arg(short, long)]
+        all: bool,
     },
     /// Wait for one matching event, including replies already posted after an ID
     Wait {
@@ -257,6 +267,9 @@ pub enum Command {
         query: Query,
         #[arg(long, default_value = "30m")]
         timeout: String,
+        /// Also match bookkeeping events, subject to your read permissions
+        #[arg(short, long)]
+        all: bool,
     },
     /// Register and inspect versioned JSON schemas for structured messages
     Schemas {

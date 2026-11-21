@@ -150,6 +150,7 @@ pub(super) fn feed(s: &State, inset: f32) -> El {
         };
         list = list.child(label(msg, 13.0, 400.0, FAINT).px(inset).py(10.0));
     } else {
+        let mut first = true;
         for (m, summary) in rows {
             let active = summary.and_then(|t| t.last.as_ref()).unwrap_or(m);
             if prev_activity.is_none_or(|p| !same_day(p, &active.created_at)) {
@@ -160,14 +161,25 @@ pub(super) fn feed(s: &State, inset: f32) -> El {
             } else {
                 Place::Channel
             };
-            list = list.child(message(
-                s,
-                m,
-                place,
-                continues(prev, m, prev_replies),
-                summary,
-                now,
-            ));
+            let mut item = message(s, m, place, continues(prev, m, prev_replies), summary, now);
+            if first
+                && s.feed_size < 200
+                && let Some(cursor) = s.older
+            {
+                let key = feed_key(m);
+                let size = s.feed_size;
+                item = item.on_visible(move |s: &mut State, visible, tx| {
+                    if visible && s.feed_size == size && s.older == Some(cursor) {
+                        tx.keep_on_screen(&key);
+                        s.feed_size += 50;
+                        s.refresh();
+                    } else {
+                        tx.live_only();
+                    }
+                });
+            }
+            first = false;
+            list = list.child(item);
             prev = Some(m);
             prev_activity = Some(&active.created_at);
             prev_replies = summary.is_some_and(|t| t.replies > 0);

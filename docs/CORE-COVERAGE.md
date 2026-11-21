@@ -11,12 +11,18 @@ listed separately. Other groups have their own entries in [PARITY](../PARITY.md)
 The Rust API is resource-oriented, spells fields in snake_case and uses
 SQLite integer IDs/cursors, not opaque service IDs. The default source of
 identity is the OS owner, not a team or a hosted token verifier.
+The public log is not a byte-for-byte replay of the reference: directory
+entries can be derived from attributable writes without a separate
+`actor.seen` event, and repeating an already-effective label/reaction
+change does not append another no-op event. Use a SQLite backup to restore
+the full board, not the public feed.
 
 ## Messages and reading
 
 Test names below are unambiguous prefixes in
 [messages](../crates/board-core/tests/messages.rs),
 [core conformance](../crates/board-core/tests/conformance_core.rs),
+[read models](../crates/board-core/tests/read_models.rs),
 [access](../crates/board-core/tests/access.rs),
 [REST](../crates/board-api/src/tests.rs), and
 [actual CLI/HTTP](../crates/board-cli/tests/delegation.rs).
@@ -27,19 +33,19 @@ Test names below are unambiguous prefixes in
 | Core 3: only if newest | Check and append under one SQLite writer lock; a deleted reply still counts for the guard. `independent_writers_linearize`, `idempotency_and_latest_guards`. |
 | Core 4: client ID and posted lookup | The key identifies one actor and exact channel or reply target, not new text in a retry. `a_key_binds_to_the_exact_actor`, `idempotency_and_latest_guards`. Replaying a blind post cannot disclose other activity: `blind_own_retries`. |
 | Core 5, 6, 7: versions, labels, revisions | Effective edits/reactions/labels advance event version; edits/deletes alone advance revision. Atomic compare-and-set for label values or absence, revision and latest checks; identical reaction/label operations do not manufacture changes. `independent_writers_linearize`, `profile_headers_edit_timestamps`, `message_workflow_profiles`. |
-| Core 8, 11: channel message windows | Oldest-first forward pages resume at the last returned position when truncated; latest windows and their watermark describe a single snapshot. `subtree_search_event_snapshots`, `read_snapshot_matches_cursor`. |
+| Core 8, 11: channel message windows | Oldest-first forward pages resume at the last returned position when truncated; latest windows and their watermark describe a single snapshot. An `after` past the head returns an empty page at the actual snapshot, never a cursor that skips the next write. The same applies to thread lists. `subtree_search_event_snapshots`, `read_snapshot_matches_cursor`, `future_message_and_thread_cursors`. |
 | Core 9: paged channel prefix | Name ordering, literal prefix (e.g. `dev` also matches `developer`), distinct inclusive subtree option and channel-name resume. Visibility applied before limiting. `channel_prefix_pages_are_not_subtrees` and `scoped_cli_and_actual_loopback`. |
 | Core 10: thread after/newest | Read via root or reply; root always present, limit counts replies, and another thread's cursor is rejected. `summaries_exclude_removed_replies`. |
-| Core 12: reply count, latest | Live replies alone determine count/latest/activity ordering. Tombstones still exist in conversation reads. `summaries_exclude_removed_replies`. |
+| Core 12: reply count, latest | Live replies alone determine count/latest/activity ordering. Tombstones still exist in conversation reads and count in channel post totals. SQLite v12 backfills channel counters and an activity index over thread roots. Counting, latest-pointer fallback after deleting a reply, and the event commit together. `summaries_exclude_removed_replies`, `v11_upgrade_and_independent_mutations`. |
 | Core 13: settle handles | Persist unique full handles as `@[actor-id]`. Report private response-only candidates for unresolved/ambiguous mentions; prefer appropriate thread participant; ignore code and invisible identities. `mentions_resolve_only_visible`, [prose tests](../crates/board-core/tests/actors_and_prose.rs). |
-| Core 14: per-event cursor | Ordered durable log; normal forward feeds use immutable event-time snapshots. A failed write/event rolls both back. `subtree_search_event_snapshots`, `fault_during_event_snapshot`. |
-| Core 15: newest events then follow | `event_tail` joins the **current** message for historical results, excludes deleted bodies and returns a snapshot continuation; following resumes live event-time delivery. `historical_tail_uses_current_content`, [CLI tail/process tests](../crates/board-cli/tests/processes.rs). |
+| Core 14: per-event cursor | Ordered durable log; forward feeds use immutable event-time snapshots. Ordinary feeds omit bookkeeping and lease renewal; opt in to controls by event type or all-events mode, never by bypassing channel grants. A failed write/event rolls both back. `subtree_search_event_snapshots`, `fault_during_event_snapshot`, `ordinary_feeds_skip_bookkeeping`. |
+| Core 15: newest events then follow | `tail_feed` joins the **current** message for historical results, excludes obsolete text and removed reactions, and returns a snapshot continuation; following resumes live event-time delivery. The local scan counts eligible events after redaction, without the original's 2,000-event lookback cap. `historical_tail_uses_current_content`, `ordinary_feeds_skip_bookkeeping`, [CLI tail/process tests](../crates/board-cli/tests/processes.rs). |
 | Core 16: long-poll | Poll does not retain a write lock while waiting, and releases its read connection. `pending_event_poll_releases_database`; CLI wait also catches an intervening reply in `cli_retry_wait_resume_and_online_backup`. |
 | Core 17, 18: tombstones clear content and labels | Keep ID/reply links, clear current labels, blocks, files, reactions and text; label search cannot resurrect the deleted state. `message_workflow_profiles`, `summaries_exclude_removed_replies`. Forensic event snapshots are deliberately not erased. |
-| Core 19, 20: channel/actor discovery and ensure | Channels on first post or explicit creation. Duplicate ensure has no event. Searchable scoped actor directory, including exact multiget. `channel_and_schema_retries`, `scoped_cli_and_actual_loopback`. |
+| Core 19, 20: channel/actor discovery and ensure | Channels on first post or explicit creation. Duplicate ensure has no event. A scoped actor multi-get takes up to 100 exact IDs, omits unknown and unreadable entries identically, and returns its snapshot cursor, even during independent writes. `channel_and_schema_retries`, `selected_actor_ids_are_visible_once`, `scoped_cli_and_actual_loopback`. |
 | Core 21, 22: missing IDs and validation | Missing or inaccessible message ID is 404; malformed request syntax is 400. **Different wire contract:** well-formed invalid field values can be 422. `errors_and_access_boundary`, `scoped_cli_and_actual_loopback`. |
 | Core 23: narrow a caller | Effective channel rules in `GET /v1/me`, request can only restrict rights; direct CLI and REST share live enforcement. `channel_rules_intersect_caps`, `scoped_cli_and_actual_loopback`. |
-| Core 24, 25: profile avatar/ownership | `X-Board-Profile` selects name and optional HTTPS avatar; namespaced principal owns its profiles' posts, sibling profiles do not; a delegated profile cannot impersonate a sibling. `profile_headers_edit_timestamps`, `scoped_cli_and_actual_loopback`. |
+| Core 24, 25: profile avatar/ownership | `X-Board-Profile` is a structured item: quoted/token name, unknown valid parameters ignored, last avatar wins. Names are case-normalized (1–32 letters/digits/hyphens, letter first); avatars use HTTPS or HTTP on `localhost` / `127.0.0.1`. Storing the URL does not fetch it. Namespaced principal owns its profiles' posts, sibling profiles do not; a delegated profile cannot impersonate a sibling. `profile_headers_edit_timestamps`, `scoped_cli_and_actual_loopback`. |
 | Core 26, 27, 28: ignore obsolete identity headers; no session | Separate avatar/session headers cannot create or change attribution. No session in viewer, current message or event. `scoped_cli_and_actual_loopback`. |
 | Paging 1, 2: backwards windows, incompatible cursors | Group by thread before slicing; `older` and snapshot cursor are distinct. Reject backwards and forwards together. `older_windows_group_before_paging`. Consecutive pages are not a database-wide time-travel snapshot across concurrent mutations. |
 | Search 1, 2: text in current roots/replies, channel subtree | Literal Unicode lowercase substring, not SQL wildcard; edits affect the current search and a descendant reply can select its root. Subtree includes root, excludes unrelated similar names. `channel_prefix_pages_are_not_subtrees`, `subtree_search_event_snapshots`. Also tested outside those two cases: visible author handles and `me` vs principal-family filters in current reads, events and history (`self_selectors_include_only`). |
@@ -49,6 +55,30 @@ reaction oracle compares the reference's public names, glyphs and aliases to
 the actual stored actor sets after a Rust CLI write (276 spellings on the
 reference checkout used for this audit). Files and external SDKs are not used
 to look up reactions at runtime.
+
+Imported people keep a stable source ID; their typable handle uses the source
+name and a Unicode-normalized version of their display name, or falls back to
+the provider ID. The handle works for new mentions, author filters and mention
+queries; text already settled to an ID keeps its meaning across renames.
+`source_filter_selects_inbound_origin` exercises this without any network.
+`compare-profile-handles.mjs` checks eight names against the reference function,
+then imports each into a real board and reads back a settled mention.
+
+Two further inspection guarantees go beyond the conformance cases. The common
+global and single-channel thread lists use dedicated activity indexes rather
+than aggregating every reply on each refresh. The upgrade test checks the
+query plans and compares results to a separate fold of actual messages through
+changes and rollback; this is not a throughput claim about arbitrary text filters.
+Composer recovery keeps the all-activity scratchpad, each channel, each thread
+and task entry separate. A stale, moved or already-used draft cannot silently
+send to another destination. See [composer recovery](../crates/board-core/tests/composer_recovery.rs)
+and [task/schedule draft tests](../crates/board-core/tests/work_parity.rs).
+
+Stored message quotes are same-channel snapshots. A Slack channel ID and
+timestamp alone are not sufficient to match another workspace's messages,
+and an explicit thread must match the known copy. No quote or profile lookup
+requires a network request. `carried_quote_identity_includes_the_workspace`
+and [source tests](../crates/board-core/tests/sync.rs) exercise this boundary.
 
 Discovery handshake (separate from the 28 core cases): resource links at
 `GET /v1/discovery`, OpenAPI at `/v1/openapi.json`. This is the local API's
@@ -80,7 +110,7 @@ See [grant policy tests](../crates/board-core/tests/grant_policy.rs),
 | Schemas 2, 3: immutable registration, allowed definition subset | Canonical parsed JSON compare includes description; immutable versions, bounded definitions and registry, reserved built-ins, no external refs. [Schema contract tests](../crates/board-core/tests/schema_contract.rs), `channel_and_schema_retries`. |
 | Schemas 4: typed data fence | Validate bounded structural keywords and supported formats **before commit** on post and edit. Malformed or unknown fences do not overwrite earlier content. `local_blocks_are_immutable`, `checked_data_fences_include_html`, `schema_value_formats_and_numeric_steps`. |
 | Schemas 5: read vs global manage | Active delegates can inspect definitions. Registration requires effective manage at the wildcard pattern; regional authority does not qualify. `inherited_everyone_lock`. |
-| Attachments 1, 2: upload/post/read, dotfiles | Raw bytes remain in SQLite, IDs reusable; origin and live-placement permissions checked on reads/reuse. Reject hidden names, paths and invisible controls. Resumable offsets and digest verification are local alternatives to external upload URLs. [Upload tests](../crates/board-core/tests/uploads.rs), `message_workflow_profiles`. |
+| Attachments 1, 2: upload/post/read, dotfiles | Raw bytes remain in SQLite, IDs reusable. Even a delegate who reads all channels cannot fetch someone else's unpublished bytes by guessing a numeric ID. They need a readable, non-deleted placement; the uploader's own origin grant or trusted OS owner can also qualify. Reject hidden names, paths and invisible controls. Resumable offsets and digest verification are local alternatives to external upload URLs. [Upload tests](../crates/board-core/tests/uploads.rs), `all_channel_read_does_not_make_unpublished`, `message_workflow_profiles`. |
 | Attachments 3: task roots carry files | Same message files and stale retry semantics as ordinary posts. [task_attachments_are_message_files](../crates/board-api/src/work/tests.rs). |
 
 Run without network after dependencies are fetched:
@@ -91,6 +121,7 @@ cargo build --offline --locked -p board-cli
 node scripts/compare-reference.mjs /path/to/reference target/debug/board
 node scripts/compare-schema-values.mjs /path/to/reference target/debug/board
 node scripts/compare-reactions.mjs /path/to/reference target/debug/board
+node scripts/compare-profile-handles.mjs /path/to/reference target/debug/board
 ```
 
 The Node scripts are developer-only checks using the reference as a read-only

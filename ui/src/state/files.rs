@@ -19,6 +19,7 @@ pub enum Preview {
         pixels: Pixels,
         width: u32,
         height: u32,
+        motion: Option<super::raster_motion::Motion>,
     },
     Text {
         body: String,
@@ -57,19 +58,30 @@ fn raster(bytes: &[u8], format: ImageFormat) -> Result<Preview> {
         pixels,
         width,
         height,
+        motion: super::raster_motion::Motion::open(bytes, format, limits, (width, height)),
     })
 }
 
 fn preview(file: &Attachment, bytes: &[u8]) -> Preview {
-    if matches!(file.content_type.as_str(), "video/mp4" | "video/quicktime")
-        && bytes.get(4..8) == Some(b"ftyp")
-    {
-        return Preview::Clip(Clip::decode(bytes.to_owned()));
+    if let Some(format) = video::Format::detect(&file.content_type, bytes) {
+        return Clip::open(format, bytes).map_or_else(
+            |_| Preview::Other("Could not open a private video handle".into()),
+            Preview::Clip,
+        );
     }
-    if let Some(format) = image::guess_format(bytes)
-        .ok()
-        .filter(|f| matches!(f, ImageFormat::Png | ImageFormat::Jpeg))
-    {
+    if image::guess_format(bytes).ok() == Some(ImageFormat::Avif) {
+        // The in-process AVIF decoder allocates a picture before ImageReader's limits apply.
+        // Decode only on explicit preview, with the same bounded local child as native video.
+        return video::avif_png(bytes)
+            .and_then(|png| raster(&png, ImageFormat::Png))
+            .unwrap_or_else(|e| Preview::Other(e.to_string()));
+    }
+    if let Some(format) = image::guess_format(bytes).ok().filter(|f| {
+        matches!(
+            f,
+            ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
+        )
+    }) {
         return raster(bytes, format).unwrap_or_else(|e| Preview::Other(e.to_string()));
     }
     if matches!(
@@ -159,7 +171,14 @@ impl State {
         };
         match load() {
             Ok(p) => {
-                if matches!(p.content, Preview::Clip(_)) {
+                if matches!(
+                    p.content,
+                    Preview::Clip(_)
+                        | Preview::Image {
+                            motion: Some(_),
+                            ..
+                        }
+                ) {
                     tx.wake_after(Duration::from_millis(30));
                 }
                 self.preview = Some(p);

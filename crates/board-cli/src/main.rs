@@ -1,4 +1,5 @@
 mod access_cli;
+mod attachments;
 mod automation_cli;
 mod cli;
 mod conformance;
@@ -78,43 +79,32 @@ impl Body {
     }
 }
 
-fn attachment_files(paths: &[PathBuf]) -> Result<Vec<(String, Vec<u8>)>> {
-    let mut files = Vec::new();
-    ensure!(paths.len() <= 10, "at most 10 attachments per message");
-    for path in paths {
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .context("attachment needs a UTF-8 filename")?;
-        let mut bytes = Vec::new();
-        let file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
-        ensure!(file.metadata()?.is_file(), "expected a regular file");
-        file.take(4 * 1024 * 1024 + 1).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() <= 4 * 1024 * 1024,
-            "attachment exceeds 4 MiB: {name}"
-        );
-        files.push((name.to_owned(), bytes));
-    }
-    Ok(files)
-}
-
 impl WriteOptions {
-    fn prepare(self, board: &Board, actor: &str) -> Result<(String, PostOptions)> {
-        let files = attachment_files(&self.attach)?;
+    fn prepare(self, board: &Board, actor: &str, target: &str) -> Result<(String, PostOptions)> {
+        let key = automation_cli::output_key(board, actor, self.key.as_deref())?;
+        let text = self.body.read()?;
+        let labels = pairs(&self.label, false)?;
+        // A retried, committed post must not upload a second file, even if the local path is gone.
+        // The actual post still verifies the target, writer and current permissions.
+        let attachments = if let Some(key) = &key
+            && (!self.attach.is_empty() || !self.attachment_id.is_empty())
+            && match board.posted(actor, key) {
+                Ok(_) => true,
+                Err(e) if classify(&e).0 == Kind::Missing => false,
+                Err(e) => return Err(e),
+            } {
+            PostOptions::default()
+        } else {
+            attachments::placements(board, actor, target, &self.attach, &self.attachment_id)?
+        };
         Ok((
-            self.body.read()?,
+            text,
             PostOptions {
                 no_sync: self.no_sync,
-                labels: pairs(&self.label, false)?,
-                key: automation_cli::output_key(board, actor, self.key.as_deref())?,
+                labels,
+                key,
                 after: self.after,
-                files,
-                attachment_ids: self
-                    .attachment_id
-                    .iter()
-                    .map(|id| board.file_id(actor, id))
-                    .collect::<Result<Vec<_>>>()?,
+                ..attachments
             },
         ))
     }
@@ -233,15 +223,59 @@ fn written(m: Message, outcome: &str, json_output: bool) {
     }
 }
 
+enum Follow {
+    Tail { last: Option<usize> },
+    Wait { timeout: Duration },
+}
+
+fn resume_hint(cursor: i64) -> String {
+    let fallback = || format!("resume with --after {cursor}");
+    let mut words = vec!["board".to_string()];
+    let mut args = env::args_os().skip(1);
+    let mut positional = false;
+    let mut appended = false;
+    while let Some(raw) = args.next() {
+        let Ok(arg) = raw.into_string() else {
+            return fallback();
+        };
+        if arg.chars().any(char::is_control) {
+            return fallback();
+        }
+        if !positional && arg == "--after" {
+            args.next();
+            continue;
+        }
+        if !positional && arg.starts_with("--after=") {
+            continue;
+        }
+        if !positional && arg == "--" {
+            positional = true;
+            words.extend(["--after".into(), cursor.to_string()]);
+            appended = true;
+        }
+        words.push(arg);
+    }
+    if !appended {
+        words.extend(["--after".into(), cursor.to_string()]);
+    }
+    shlex::try_join(words.iter().map(String::as_str))
+        .map(|cmd| format!("next: {cmd}"))
+        .unwrap_or_else(|_| fallback())
+}
+
 fn stream(
     board: &Board,
     target: Option<String>,
     q: Query,
     actor: &str,
-    timeout: Option<Duration>,
-    last: Option<usize>,
+    follow: Follow,
+    all: bool,
     js: bool,
 ) -> Result<()> {
+    let (timeout, last) = match follow {
+        Follow::Wait { timeout } => (Some(timeout), None),
+        Follow::Tail { last } => (None, last),
+    };
     let id = target.as_deref().and_then(message_id);
     let mut f = q.filter(target.filter(|_| id.is_none()), actor)?;
     if let Some(id) = id {
@@ -262,12 +296,15 @@ fn stream(
             if let Some(m) = ev.message {
                 show_message(&m);
             }
+            if timeout.is_some() {
+                println!("{}", resume_hint(ev.cursor));
+            }
         }
         io::stdout().flush()?;
         Ok(())
     };
     if let Some(last) = last {
-        let (head, rows) = board.event_tail(last, &f)?;
+        let (head, rows) = board.tail_feed(last, &f, all)?;
         for event in rows {
             output(event)?;
         }
@@ -275,8 +312,13 @@ fn stream(
     }
     let started = Instant::now();
     loop {
-        let (pos, batch) =
-            board.event_page(cursor, if timeout.is_some() { 1 } else { 200 }, &f, None)?;
+        let (pos, batch) = board.event_feed(
+            cursor,
+            if timeout.is_some() { 1 } else { 200 },
+            &f,
+            None,
+            all,
+        )?;
         cursor = pos;
         let len = batch.len();
         for ev in batch {
@@ -340,15 +382,11 @@ fn run(args: Args) -> Result<()> {
         .db
         .or_else(|| args.name.as_deref().map(local::named_database_path))
         .unwrap_or_else(local::database_path);
-    let profile = args.profile;
-    if let Some(p) = &profile {
-        ensure!(
-            p.len() <= 32
-                && p.starts_with(|c: char| c.is_ascii_alphabetic())
-                && p.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-'),
-            "profile must start with a letter and contain up to 32 letters, digits, or hyphens"
-        );
-    }
+    let profile = args
+        .profile
+        .as_deref()
+        .map(local::profile_name)
+        .transpose()?;
     if let Command::Inspect { thread } = args.cmd {
         return inspector(path, profile, thread);
     }
@@ -473,17 +511,10 @@ fn run(args: Args) -> Result<()> {
             query,
             ids,
         } => {
-            ensure!(ids.len() <= 100, "at most 100 actor IDs");
-            for id in &ids {
-                board_local::validate_actor(id)?;
-            }
-            let mut rows = board.actor_directory(query.as_deref())?;
-            if !ids.is_empty() {
-                rows.retain(|entry| ids.contains(&entry.id));
-            }
+            let (cursor, rows) = board.actor_directory_page(query.as_deref(), &ids)?;
             if details {
                 if js {
-                    println!("{}", json!({"actors":rows}));
+                    println!("{}", json!({"actors":rows,"cursor":cursor}));
                 } else {
                     for a in rows {
                         println!(
@@ -499,7 +530,7 @@ fn run(args: Args) -> Result<()> {
             }
             let actors = rows.into_iter().map(|a| a.id).collect::<Vec<_>>();
             if js {
-                println!("{}", json!({"actors":actors}));
+                println!("{}", json!({"actors":actors,"cursor":cursor}));
             } else {
                 for a in actors {
                     println!("{}", safe(&a));
@@ -542,6 +573,9 @@ fn run(args: Args) -> Result<()> {
                         c.messages
                     );
                 }
+                if let Some(after) = next {
+                    println!("more channels: --after {}", safe(&after));
+                }
             }
         }
         Command::Channel { name } => {
@@ -552,12 +586,23 @@ fn run(args: Args) -> Result<()> {
                 println!("{}", safe(&name));
             }
         }
-        Command::Post { target, options } => {
-            let (text, o) = options.prepare(&board, &actor)?;
-            let m = if let Some(id) = message_id(&target) {
+        Command::Post {
+            target,
+            options,
+            sync_targets,
+        } => {
+            let id = message_id(&target);
+            ensure!(
+                id.is_none() || sync_targets.is_empty(),
+                "--sync is for new threads, not replies"
+            );
+            let (text, o) = options.prepare(&board, &actor, &target)?;
+            let m = if let Some(id) = id {
                 board.reply(id, &actor, &text, &o)?
             } else {
-                board.post(&target, &actor, &text, &o)?
+                board
+                    .post_with_targets(&target, &actor, &text, &o, &sync_targets)?
+                    .0
             };
             written(m, "posted", js);
         }
@@ -570,7 +615,7 @@ fn run(args: Args) -> Result<()> {
             }
         }
         Command::Reply { id, options } => {
-            let (text, o) = options.prepare(&board, &actor)?;
+            let (text, o) = options.prepare(&board, &actor, &id.to_string())?;
             written(board.reply(id, &actor, &text, &o)?, "posted", js);
         }
         Command::Edit {
@@ -619,40 +664,7 @@ fn run(args: Args) -> Result<()> {
             file,
             content_type,
         } => {
-            let mut src = fs::File::open(&file)?;
-            let metadata = src.metadata()?;
-            ensure!(
-                metadata.is_file() && metadata.len() <= board_local::MAX_DIRECT_BYTES as u64,
-                "expected a regular file up to 100 MiB"
-            );
-            let name = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .context("expected a UTF-8 filename")?;
-            let uploaded = if metadata.len() <= board_local::MAX_ATTACHMENT_BYTES as u64 {
-                let mut bytes = Vec::new();
-                src.take((board_local::MAX_ATTACHMENT_BYTES + 1) as u64)
-                    .read_to_end(&mut bytes)?;
-                board.upload(&actor, &channel, name, &content_type, &bytes)?
-            } else {
-                let mut upload = board.start_upload(
-                    &actor,
-                    &channel,
-                    name,
-                    &content_type,
-                    metadata.len() as i64,
-                    None,
-                )?;
-                let mut buf = vec![0; board_local::MAX_ATTACHMENT_BYTES];
-                loop {
-                    let n = src.read(&mut buf)?;
-                    if n == 0 {
-                        break;
-                    }
-                    upload = board.upload_part(&actor, &upload.key, upload.received, &buf[..n])?;
-                }
-                board.finish_upload(&actor, &upload.key)?.0
-            };
+            let uploaded = attachments::upload(&board, &actor, &channel, &file, &content_type)?;
             if js {
                 println!("{}", json!({"attachment":uploaded}));
             } else {
@@ -693,12 +705,29 @@ fn run(args: Args) -> Result<()> {
                 limit.is_none_or(|n| (1..=500).contains(&n)),
                 "--limit must be 1 to 500"
             );
-            let id = target.as_deref().and_then(message_id);
+            let id = match target.as_deref() {
+                Some(url)
+                    if url.split_once("://").is_some_and(|(scheme, _)| {
+                        scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http")
+                    }) =>
+                {
+                    Some(board.locate_link(url)?.message)
+                }
+                other => other.and_then(message_id),
+            };
             let filter = query.filter(target.filter(|_| id.is_none()), &actor)?;
             if let Some(id) = id {
                 ensure!(
                     before.is_none() && !flat,
                     "--before and --flat apply to lists, not whole threads"
+                );
+                ensure!(
+                    filter.by.is_none()
+                        && filter.text.is_none()
+                        && filter.mentions.is_none()
+                        && filter.from.is_none()
+                        && filter.re.is_none(),
+                    "a thread read accepts --after, --label and --limit; use a channel read to search for threads"
                 );
                 let thread = board.conversation_window(id, &filter, limit)?;
                 if js {
@@ -762,17 +791,35 @@ fn run(args: Args) -> Result<()> {
             target,
             query,
             last,
-        } => stream(&board, target, query, &actor, None, last, js)?,
+            all,
+        } => stream(
+            &board,
+            target,
+            query,
+            &actor,
+            Follow::Tail { last },
+            all,
+            js,
+        )?,
         Command::Wait {
             target,
             query,
             timeout,
+            all,
         } => {
             let dur = timeout
                 .parse::<u64>()
                 .map(Duration::from_secs)
                 .or_else(|_| humantime::parse_duration(&timeout))?;
-            stream(&board, target, query, &actor, Some(dur), None, js)?;
+            stream(
+                &board,
+                target,
+                query,
+                &actor,
+                Follow::Wait { timeout: dur },
+                all,
+                js,
+            )?;
         }
         Command::Schemas { cmd } => match cmd.unwrap_or(SchemaCommand::List) {
             SchemaCommand::List => {

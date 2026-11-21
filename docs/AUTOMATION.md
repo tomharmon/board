@@ -69,8 +69,8 @@ list. `tasks recover --token TOKEN` also works without the task ID. The board
 stores only a digest and fences the proof to the actor, task, request and
 epoch. Replaying a live keyed claim returns that same lease without extending
 it or taking another task. Once released, completed, canceled or expired, the
-old proof cannot reclaim. Ordinary reads and events omit tokens. For existing
-scripts, successful CLI claim/recovery JSON includes `claim_token`: do not
+old proof cannot reclaim. Ordinary reads and events omit tokens. Successful
+claim, recovery and renewal responses include the holder's `claim_token`: do not
 publish it. Explicit `--epoch` and `--token` on claim-bound writes continue
 to work without relying on a cached proof.
 
@@ -172,6 +172,7 @@ board --json watchers next triage
 board watchers ack triage CURSOR
 board --json watchers next triage --lease 30s
 board watchers ack triage CURSOR --receipt RECEIPT --skip
+board watchers ack triage CURSOR --receipt RECEIPT --if-pending
 board watchers ack triage CURSOR --receipt RECEIPT --error 'temporary failure'
 board watchers failures triage
 board watchers run triage --once -- /absolute/path/to/local-handler
@@ -182,6 +183,11 @@ board --json watchers matches --limit 10 --lease 5m
 Subscriptions start at registration. The ordinary peek/ack pair is for a
 single consumer. Independent consumers should lease: each thread's head has
 one receipt, other thread heads continue, and stale acknowledgements fail.
+An exact replay of a successful acknowledgement succeeds by default. Use
+`--if-pending` on a leased delivery to require a new settlement: the same
+winning receipt then reports `no_match` on a repeat. An unknown, unreadable
+or stale delivery remains `delivery_conflict`, not evidence of another
+consumer's success. The ordinary unleased peek/ack flow is unchanged.
 Failures back off exponentially from one second. Five explicit errors give up
 on the event and free the lane. A leased delegated pull gives up after five
 interrupted attempts; a trusted local watch allows ten. Skips and
@@ -209,6 +215,9 @@ explicit `--kind` for one exact event type.
 `watchers run` leases and runs only the explicitly supplied argv on the local
 machine. The handler receives event JSON on stdin and `BOARD_DB`, actor,
 `BOARD_WATCHER`, `BOARD_TRIGGER`, and `BOARD_ATTEMPT` in its environment.
+As with the reference handler, `BOARD_ATTEMPT` counts the current run (first
+run is 1). The pull/matches JSON reports the zero-based `attempt` and the
+one-based `attempts` count. Failure records count all attempted runs.
 The trigger is stable across retries and is useful for idempotent downstream
 writes; the private lease receipt is not passed to the child. The CLI renews
 while it runs, acknowledges exit zero and records errors otherwise. Interrupts
@@ -238,7 +247,7 @@ with nondeterministic ordering should use explicit keys.
 | `POST /schedules`, `GET /schedules` | Inline `attachments:[{name,data_base64}]` and reusable `attachment_ids:[id]`; filter collection on `re` (any message in the thread), `by`, `all`, `after` and `limit`. |
 | `POST /watchers/{name}/deliveries` | Body `{"lease_seconds":30}`. Returns event, trigger, attempt, deadline, private receipt and ETag, or 204. |
 | `PATCH /watchers/{name}/deliveries/{cursor}` | Renew using the delivery ETag in `If-Match` and `lease_seconds` in JSON. |
-| `PUT /watchers/{name}/acknowledgements/{cursor}` | Empty body or `{}` acknowledges; `{"skip":true}` skips; `{"error":"..."}` schedules retry. Supply `If-Match` for leased deliveries. |
+| `PUT /watchers/{name}/acknowledgements/{cursor}` | Empty body or `{}` acknowledges; `{"skip":true}` skips; `{"error":"..."}` schedules retry. Supply `If-Match` for leased deliveries. Optional `if_pending:true` requires that proof and returns 412 `no_match` when it already settled the delivery. |
 | `GET /watchers/{name}/failures` | Durable failures ordered by cursor with exclusive `after` and `limit`. |
 | `PUT /watchers` | Replace the current local registration set with `{"watchers":[...]}`; an empty array removes the set. |
 | `POST /watcher-matches` | Lease free thread heads across the caller's subscriptions. Body accepts `limit` (1-100), `lease_seconds` (1-3600), `wait_seconds` (0-60). Each match names its watcher. |

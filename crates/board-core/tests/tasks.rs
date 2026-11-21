@@ -28,7 +28,7 @@ fn make(
 }
 
 #[test]
-fn claim_secrets_never_leave_the_claim_response_and_fence_same_profile() -> Result<()> {
+fn claim_secrets_only_reach_the_authorized_lease_holder_and_fence_same_profile() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("held.db");
     let b = Board::open(&path)?;
@@ -41,6 +41,16 @@ fn claim_secrets_never_leave_the_claim_response_and_fence_same_profile() -> Resu
         &Default::default(),
     )?;
     let token = old.claim_token.as_deref().unwrap();
+    let renewed = change_task(
+        &b,
+        t.id,
+        "ann/agent",
+        Some(old.epoch),
+        Some(token),
+        TaskAction::Renew(90),
+    )?;
+    assert_eq!(renewed.claim_token.as_deref(), Some(token));
+    assert_eq!(renewed.epoch, old.epoch);
     assert!(get_task(&b, t.id)?.claim_token.is_none());
     assert!(b.get(t.id)?.task.unwrap().claim_token.is_none());
     let log = serde_json::to_string(&b.events(0, 200)?)?;
@@ -50,6 +60,7 @@ fn claim_secrets_never_leave_the_claim_response_and_fence_same_profile() -> Resu
         ("ann/agent", Some(old.epoch), None),
         ("ann/agent", Some(old.epoch), Some("wrong")),
     ] {
+        assert!(change_task(&b, t.id, actor, epoch, token, TaskAction::Renew(30)).is_err());
         assert!(change_task(&b, t.id, actor, epoch, token, TaskAction::Complete(None)).is_err());
     }
     // Advance the persisted deadline rather than sleeping for a full lease in CI.

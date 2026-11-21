@@ -6,6 +6,44 @@ use std::{
 };
 
 #[test]
+fn v12_join_upgrade_retires_unsent_roots_and_preserves_the_actual_join_boundary()
+-> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("early.db");
+    let b = Board::open(&path)?;
+    b.create_source("p", "desk", Provider::Local, "external", "work")?;
+    b.set_outbound("p", "desk", true)?;
+    let root = b.post("work", "p", "private history", &Default::default())?;
+    b.reply(root.id, "p", "older reply", &Default::default())?;
+    b.join_source_thread("p", "desk", "T", root.id)?;
+    let next = b.reply(root.id, "p", "later reply", &Default::default())?;
+    let head = b.cursor()?;
+    drop(b);
+    let c = rusqlite::Connection::open(&path)?;
+    c.execute_batch(
+        "DROP TRIGGER sync_outgoing; DROP TRIGGER sync_outgoing_reactions;
+        ALTER TABLE sync_explicit_joins DROP COLUMN joined_at; PRAGMA user_version=12;",
+    )?;
+    c.execute("INSERT INTO sync_queue(source,direction,thread,event_key,payload,raw,state,receipt)
+        VALUES('desk','out','T',?1,json_object('event','message.posted','message',?1,'cursor',?1,'text','private history','parent',null),'null','leased','old')",[root.id])?;
+    drop(c);
+    let b = Board::open(&path)?;
+    assert_eq!(b.cursor()?, head);
+    assert_eq!(b.backfill_source("p", "desk", "T")?, 0);
+    let jobs = b.inbox("p", "desk", Direction::Out, 0, 10)?;
+    assert_eq!(jobs.len(), 2);
+    let old = jobs
+        .iter()
+        .find(|j| j.payload["message"] == root.id)
+        .unwrap();
+    assert_eq!(old.state, "skipped");
+    assert!(b.start_sending("p", "desk", old.id, "old").is_err());
+    let eligible = b.lease_source("p", "desk", Direction::Out, 30)?.unwrap();
+    assert_eq!(eligible.job.payload["message"], next.id);
+    Ok(())
+}
+
+#[test]
 fn disabling_publishing_and_files_fences_leases_but_permits_an_explicit_unsent_backfill() {
     let b = Board::memory().unwrap();
     b.create_source("p", "s", Provider::Slack, "C1", "work")
@@ -111,6 +149,429 @@ fn input(key: &str, t: &str, id: &str, p: Option<&str>, text: &str) -> Envelope 
         },
         raw: json!({"fixture":key}),
     }
+}
+
+#[test]
+fn source_mentions_can_introduce_but_only_an_actors_own_writes_can_rename_them() {
+    let b = Board::memory().unwrap();
+    b.create_source("owner", "s", Provider::Local, "remote", "work")
+        .unwrap();
+    let mut root = input("root", "thread", "head", None, "Hello");
+    root.import.author = "known-without-profile".into();
+    b.import_source("owner", "s", &root).unwrap();
+    let mut first = input(
+        "intro",
+        "thread",
+        "mention",
+        Some("head"),
+        "@[source:s/new] and @[source:s/known-without-profile]",
+    );
+    first.import.mentioned.insert(
+        "new".into(),
+        AuthorInfo {
+            name: "Alex".into(),
+            avatar: None,
+        },
+    );
+    first.import.mentioned.insert(
+        "known-without-profile".into(),
+        AuthorInfo {
+            name: "Unexpected".into(),
+            avatar: None,
+        },
+    );
+    b.import_source("owner", "s", &first).unwrap();
+    let get = |actor| {
+        b.actor_directory(None)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == actor)
+            .unwrap()
+    };
+    assert_eq!(get("source:s/new").name, "Alex");
+    assert_ne!(get("source:s/known-without-profile").name, "Unexpected");
+    let mut own = input("own", "thread", "own", Some("head"), "Here now");
+    own.import.author = "new".into();
+    own.import.profile = Some(AuthorInfo {
+        name: "Alex Renamed".into(),
+        avatar: Some("https://images.invalid/alex".into()),
+    });
+    b.import_source("owner", "s", &own).unwrap();
+    let mut later = input(
+        "another",
+        "thread",
+        "another",
+        Some("head"),
+        "@[source:s/new]",
+    );
+    later.import.mentioned.insert(
+        "new".into(),
+        AuthorInfo {
+            name: "Not Alex".into(),
+            avatar: Some("https://images.invalid/wrong".into()),
+        },
+    );
+    let msg = b.import_source("owner", "s", &later).unwrap();
+    assert_eq!(get("source:s/new").name, "Alex Renamed");
+    assert_eq!(
+        get("source:s/new").avatar.as_deref(),
+        Some("https://images.invalid/alex")
+    );
+    let cursor = b.cursor().unwrap();
+    assert_eq!(b.import_source("owner", "s", &later).unwrap().id, msg.id);
+    assert_eq!(b.cursor().unwrap(), cursor);
+}
+
+#[test]
+fn private_lifecycle_reply_is_never_mirrored_or_backfilled_and_sparse_profiles_keep_their_avatar() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.db");
+    let b = Board::open(&path).unwrap();
+    for name in ["upstream", "mirror"] {
+        b.create_source("owner", name, Provider::Local, name, "ops")
+            .unwrap();
+    }
+    let mut root = input("root", "a", "r", None, "Ready for review");
+    root.import.profile = Some(AuthorInfo {
+        name: "Dana".into(),
+        avatar: Some("https://profile.invalid/dana.png".into()),
+    });
+    let id = b.import_source("owner", "upstream", &root).unwrap().id;
+    b.attach_source("owner", "mirror", "second", "r", id, None)
+        .unwrap();
+    b.set_outbound("owner", "mirror", true).unwrap();
+    b.set_source_renderer(
+        "owner",
+        "mirror",
+        Some("message.text + (message.labels.state ?? \"\")"),
+    )
+    .unwrap();
+    let mut evt = input("lifecycle", "a", "closed", Some("r"), "");
+    evt.import.profile = Some(AuthorInfo {
+        name: "Dana Updated".into(),
+        avatar: None,
+    });
+    evt.import.no_sync = true;
+    evt.import.change = Change::Signal {
+        conditions: Default::default(),
+        set: [("state".into(), "closed".into())].into(),
+        unset: vec![],
+        reply: Some("Confidential review summary".into()),
+    };
+    let note = b.import_source("owner", "upstream", &evt).unwrap();
+    assert!(note.no_sync);
+    assert_eq!(note.re, Some(id));
+    let card = b.get(note.id).unwrap().author.unwrap();
+    assert_eq!(card.name, "Dana Updated");
+    assert_eq!(
+        card.avatar.as_deref(),
+        Some("https://profile.invalid/dana.png")
+    );
+    let jobs = b.inbox("owner", "mirror", Direction::Out, 0, 50).unwrap();
+    assert!(
+        jobs.iter()
+            .any(|j| j.payload["message"] == id && j.payload["event"] == "message.edited")
+    );
+    assert!(!jobs.iter().any(|j| j.payload["message"] == note.id));
+    drop(b);
+    let b = Board::open(&path).unwrap();
+    assert_eq!(
+        b.import_source("owner", "upstream", &evt).unwrap().id,
+        note.id
+    );
+    b.backfill_source("owner", "mirror", "second").unwrap();
+    assert!(
+        !b.inbox("owner", "mirror", Direction::Out, 0, 50)
+            .unwrap()
+            .iter()
+            .any(|j| j.payload["message"] == note.id)
+    );
+}
+
+#[test]
+fn read_only_copy_projection_resolves_all_readable_entries_without_exposing_raw_jobs_or_hidden_links()
+ {
+    use board_local::{access::Rules, errors::classify};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("sync.db");
+    let owner = Board::open(&path).unwrap();
+    let build = |name, ch| {
+        owner
+            .create_source("operator", name, Provider::Local, name, ch)
+            .unwrap();
+        let root = owner
+            .post(ch, "operator", "Thread", &Default::default())
+            .unwrap();
+        owner
+            .attach_source(
+                "operator",
+                name,
+                "r",
+                "first",
+                root.id,
+                Some("https://local.invalid/shared"),
+            )
+            .unwrap();
+        owner.set_outbound("operator", name, true).unwrap();
+        root.id
+    };
+    let hidden = build("aaa", "private");
+    let open = build("zzz", "public");
+    let secret = owner
+        .reply(hidden, "operator", "Private note", &Default::default())
+        .unwrap();
+    let msg = owner
+        .reply(open, "operator", "Public note", &Default::default())
+        .unwrap();
+    owner
+        .attach_source(
+            "operator",
+            "aaa",
+            "r",
+            "note",
+            secret.id,
+            Some("https://local.invalid/private"),
+        )
+        .unwrap();
+    let receipt = owner
+        .take_source_delivery("operator", "zzz", Direction::Out, 60)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        owner.sync_targets(msg.id).unwrap().targets[0].state,
+        "sending"
+    );
+    owner
+        .finish_source(
+            "operator",
+            "zzz",
+            receipt.job.id,
+            &receipt.receipt,
+            Some(&DeliveryResult {
+                external: "note".into(),
+                url: Some("https://local.invalid/visible".into()),
+                thread: None,
+            }),
+        )
+        .unwrap();
+    let signed = owner
+        .reply(open, "operator", "Signed-looking link", &Default::default())
+        .unwrap();
+    owner
+        .attach_source(
+            "operator",
+            "zzz",
+            "r",
+            "signed",
+            signed.id,
+            Some("https://local.invalid/object?credential=DO_NOT_EXPOSE"),
+        )
+        .unwrap();
+    owner
+        .set_grant(
+            "operator",
+            None,
+            "reader",
+            &Rules::parse("public=read").unwrap(),
+        )
+        .unwrap();
+    let token = owner
+        .issue_credential("operator", "reader", None, None)
+        .unwrap();
+    let mut r = Board::open(&path).unwrap();
+    r.bind_token(&token.token).unwrap();
+    assert!(r.source("reader", "zzz").is_err());
+    let found = r.locate_link("https://local.invalid/visible").unwrap();
+    assert_eq!((found.message, found.root), (msg.id, open));
+    assert_eq!(
+        r.locate_link("https://local.invalid/shared").unwrap().root,
+        open
+    );
+    let target = r.sync_targets(msg.id).unwrap();
+    let line = &target.targets[0];
+    assert_eq!(
+        (target.root, target.message, target.cursor),
+        (open, msg.id, found.cursor)
+    );
+    assert_eq!(
+        (
+            &line.source[..],
+            line.external.as_deref(),
+            line.url.as_deref(),
+            &line.state[..]
+        ),
+        (
+            "zzz",
+            Some("note"),
+            Some("https://local.invalid/visible"),
+            "confirmed"
+        )
+    );
+    assert!(r.sync_targets(signed.id).unwrap().targets[0].url.is_none());
+    let private_note = owner
+        .reply(
+            open,
+            "operator",
+            "Only on this board",
+            &PostOptions {
+                no_sync: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let local = &r.sync_targets(private_note.id).unwrap().targets[0];
+    assert_eq!(local.state, "local_only");
+    assert_eq!(local.thread.as_deref(), Some("r"));
+    assert!(local.url.is_none() && local.external.is_none());
+    let payload = serde_json::to_string(&target).unwrap();
+    for secret in [
+        &*receipt.receipt,
+        "DO_NOT_EXPOSE",
+        "operator",
+        "Public note",
+        "aaa",
+        "attempts",
+    ] {
+        assert!(!payload.contains(secret));
+    }
+    let errors = [
+        "https://local.invalid/private",
+        "https://local.invalid/unknown",
+        "file:///tmp/unknown",
+    ]
+    .map(|url| r.locate_link(url).unwrap_err());
+    for e in &errors {
+        assert_eq!(classify(e).1, "message_not_found");
+        assert_eq!(e.to_string(), errors[0].to_string());
+    }
+    assert_eq!(
+        classify(&r.sync_targets(hidden).unwrap_err()).1,
+        "message_not_found"
+    );
+    assert_eq!(
+        classify(
+            &owner
+                .locate_link("https://local.invalid/shared")
+                .unwrap_err()
+        )
+        .1,
+        "ambiguous_link"
+    );
+}
+
+#[test]
+fn public_targets_do_not_confuse_queue_lane_names_with_remote_ids_or_remote_heads_with_local_replies()
+ {
+    let b = Board::memory().unwrap();
+    b.create_source("owner", "gh", Provider::Github, "owner/repo", "dev")
+        .unwrap();
+    b.set_outbound("owner", "gh", true).unwrap();
+    let (local, _) = b
+        .post_with_targets(
+            "dev",
+            "owner",
+            "Local note",
+            &Default::default(),
+            &["gh".into(), "gh:13".into()],
+        )
+        .unwrap();
+    let targets = b.sync_targets(local.id).unwrap().targets;
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().all(|t| t.external.is_none()));
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.thread.is_none() && t.state == "pending")
+    );
+    assert!(
+        targets
+            .iter()
+            .any(|t| t.thread.as_deref() == Some("13") && t.state == "not_sent")
+    );
+    let jobs = b.inbox("owner", "gh", Direction::Out, 0, 10).unwrap();
+    assert_eq!(jobs.len(), 1, "start queues the root; join never does");
+    assert_eq!(jobs[0].payload["event"], "thread.start");
+    let url = "https://github.com/owner/repo/issues/13";
+    assert_eq!(b.locate_link(url).unwrap().message, local.id);
+    let mut head = input("head", "13", "issue", None, "Original provider issue");
+    head.import.url = Some(url.into());
+    let remote = b.import_source("owner", "gh", &head).unwrap();
+    assert_eq!(remote.re, Some(local.id));
+    let located = b.locate_link(url).unwrap();
+    assert_eq!((located.message, located.root), (remote.id, local.id));
+}
+
+#[test]
+fn compatible_provider_permalinks_resolve_offline_only_when_their_location_matches() {
+    let b = Board::memory().unwrap();
+    b.create_source("owner", "gh", Provider::Github, "owner/repo", "dev")
+        .unwrap();
+    let root = b
+        .post("dev", "owner", "Review", &Default::default())
+        .unwrap();
+    let note = b
+        .reply(root.id, "owner", "Line 4", &Default::default())
+        .unwrap();
+    b.attach_source(
+        "owner",
+        "gh",
+        "12",
+        "issue",
+        root.id,
+        Some("https://github.com/owner/repo/pull/12"),
+    )
+    .unwrap();
+    b.attach_source(
+        "owner",
+        "gh",
+        "12",
+        "inline:300",
+        note.id,
+        Some("https://github.com/owner/repo/pull/12#discussion_r300"),
+    )
+    .unwrap();
+    assert_eq!(
+        b.locate_link("https://github.com/OWNER/REPO/pull/12/files#discussion_r300")
+            .unwrap()
+            .message,
+        note.id
+    );
+    assert!(
+        b.locate_link("https://github.com/owner/repo/pull/12/files#discussion_r999")
+            .is_err()
+    );
+    assert!(
+        b.locate_link("https://github.com/lost/repo/pull/12#discussion_r300")
+            .is_err()
+    );
+    b.create_source("owner", "chat", Provider::Slack, "C1", "dev")
+        .unwrap();
+    b.attach_source(
+        "owner",
+        "chat",
+        "1700000000.010000",
+        "1700000000.010000",
+        root.id,
+        Some("https://one.slack.com/archives/C1/p1700000000010000"),
+    )
+    .unwrap();
+    b.attach_source(
+        "owner",
+        "chat",
+        "1700000000.010000",
+        "1700000001.020000",
+        note.id,
+        None,
+    )
+    .unwrap();
+    let link =
+        "https://one.slack.com/archives/C1/p1700000001020000?thread_ts=1700000000.010000&cid=C1";
+    assert_eq!(b.locate_link(link).unwrap().message, note.id);
+    assert!(b.locate_link(&link.replace("one.", "wrong.")).is_err());
+    assert!(
+        b.locate_link(&link.replace("thread_ts=1700000000.010000", "thread_ts=1700000009.010000"))
+            .is_err()
+    );
 }
 #[test]
 fn independent_mirrors_forward_imports_not_echoes_and_never_export_private_threads() {
@@ -760,6 +1221,10 @@ fn an_older_import_cannot_replace_a_newer_external_quote_or_enqueue_its_files() 
     .unwrap();
     let url = "https://demo.slack.com/archives/C2/p1234567890000001";
     let mut e = input("first", "T", "r", None, url);
+    e.import.profile = Some(AuthorInfo {
+        name: "Current Name".into(),
+        avatar: None,
+    });
     e.import.updated_at = Some("2025-01-01T00:00:00Z".parse().unwrap());
     e.import.links = vec![Link {
         url: url.into(),
@@ -771,10 +1236,17 @@ fn an_older_import_cannot_replace_a_newer_external_quote_or_enqueue_its_files() 
     let m = b.import_source("p", "s", &e).unwrap();
     assert_eq!(m.links[0].text.as_deref(), Some("latest quote"));
     e.key = "stale".into();
+    e.import.profile = Some(AuthorInfo {
+        name: "Stale Name".into(),
+        avatar: Some("https://old.invalid/picture".into()),
+    });
     e.import.updated_at = Some("2024-01-01T00:00:00Z".parse().unwrap());
     e.import.links[0].text = Some("stale quote".into());
     e.raw = json!({"files":[{"id":"F1","name":"obsolete","size":12}]});
     b.import_source("p", "s", &e).unwrap();
+    let author = b.get(m.id).unwrap().author.unwrap();
+    assert_eq!(author.name, "Current Name");
+    assert!(author.avatar.is_none());
     assert_eq!(
         b.get(m.id).unwrap().links[0].text.as_deref(),
         Some("latest quote")

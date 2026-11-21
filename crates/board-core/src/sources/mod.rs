@@ -1,8 +1,11 @@
 //! Connector configuration and durable receipts. No network, secret or provider SDK lives here.
+mod lookup;
 mod mapping;
 mod media;
 mod queue;
 mod render;
+mod targets;
+pub use targets::{ThreadLink, validate_slack_timestamp};
 
 use crate::{Board, Message, PostOptions, errors::Kind};
 use anyhow::{Context, Result, ensure};
@@ -11,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
+pub use lookup::{LocatedLink, SyncTarget, SyncTargets};
 pub use mapping::Copy;
 pub(crate) use mapping::origin_on;
 pub(crate) use media::file_notices_on;
@@ -177,12 +181,17 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
       source TEXT NOT NULL REFERENCES sync_sources(name), thread TEXT NOT NULL,
       root INTEGER NOT NULL REFERENCES messages(id), PRIMARY KEY(source,thread));
     CREATE INDEX IF NOT EXISTS sync_threads_root ON sync_threads(root);
+    CREATE TABLE IF NOT EXISTS sync_explicit_joins(
+      source TEXT NOT NULL,thread TEXT NOT NULL,remote_root TEXT,joined_at INTEGER NOT NULL,PRIMARY KEY(source,thread),
+      FOREIGN KEY(source,thread) REFERENCES sync_threads(source,thread));
     CREATE TABLE IF NOT EXISTS sync_copies(
       source TEXT NOT NULL, thread TEXT NOT NULL, external TEXT NOT NULL,
       message INTEGER NOT NULL REFERENCES messages(id), origin INTEGER NOT NULL, url TEXT,
       modified INTEGER, managed_labels TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(source,thread,external), UNIQUE(source,thread,message),
       FOREIGN KEY(source,thread) REFERENCES sync_threads(source,thread));
     CREATE INDEX IF NOT EXISTS sync_copies_local ON sync_copies(message);
+    CREATE INDEX IF NOT EXISTS sync_copy_permalink ON sync_copies(url) WHERE url IS NOT NULL;
+    CREATE INDEX IF NOT EXISTS events_by_actor ON events(actor);
     CREATE TABLE IF NOT EXISTS sync_file_copies(
       source TEXT NOT NULL REFERENCES sync_sources(name),thread TEXT NOT NULL,external TEXT NOT NULL,
       message INTEGER NOT NULL REFERENCES messages(id),asset INTEGER NOT NULL REFERENCES file_assets(id),direction TEXT NOT NULL,
@@ -196,6 +205,7 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
       error TEXT, UNIQUE(source,direction,thread,event_key));
     CREATE INDEX IF NOT EXISTS sync_queue_lanes ON sync_queue(source,direction,thread,id,state);
     CREATE INDEX IF NOT EXISTS sync_queue_pending ON sync_queue(direction,state,available,id);
+    CREATE INDEX IF NOT EXISTS sync_queue_message ON sync_queue(source,thread,json_extract(payload,'$.message'),id) WHERE direction='out';
     CREATE TABLE IF NOT EXISTS sync_checkpoints(
       source TEXT NOT NULL REFERENCES sync_sources(name), stream TEXT NOT NULL, value TEXT NOT NULL,
       PRIMARY KEY(source,stream));
@@ -212,6 +222,9 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
     CREATE TABLE IF NOT EXISTS sync_file_metadata(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,file TEXT NOT NULL,message INTEGER NOT NULL,name TEXT NOT NULL,size INTEGER,PRIMARY KEY(source,thread,external,file));
     CREATE INDEX IF NOT EXISTS sync_file_metadata_message ON sync_file_metadata(message);
     CREATE TABLE IF NOT EXISTS message_links(message INTEGER NOT NULL REFERENCES messages(id),ordinal INTEGER NOT NULL,url TEXT NOT NULL,target INTEGER REFERENCES messages(id),author TEXT,text TEXT,reason TEXT,PRIMARY KEY(message,url));
+    ")?;
+    targets::migrate_joins(c)?;
+    c.execute_batch("
     DROP TRIGGER IF EXISTS sync_outgoing;
     DROP TRIGGER IF EXISTS sync_outgoing_reactions;
     CREATE TRIGGER sync_outgoing AFTER UPDATE OF message ON events
@@ -225,6 +238,7 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
           FROM sync_threads t JOIN sync_sources s ON s.name=t.source
           WHERE s.outbound=1 AND t.root=coalesce(json_extract(NEW.message,'$.re'),NEW.message_id)
           AND (NEW.kind!='message.posted' OR t.root!=NEW.message_id)
+          AND NOT EXISTS(SELECT 1 FROM sync_explicit_joins j WHERE j.source=t.source AND j.thread=t.thread AND NEW.message_id<=j.joined_at)
           AND NOT EXISTS(SELECT 1 FROM sync_import_context WHERE source=s.name);
       END;
     CREATE TRIGGER IF NOT EXISTS sync_outgoing_reactions AFTER UPDATE OF message ON events
@@ -238,6 +252,7 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
         FROM sync_threads t JOIN sync_sources s ON s.name=t.source
         WHERE s.outbound=1 AND t.root=coalesce(json_extract(NEW.message,'$.re'),NEW.message_id)
           AND (s.provider='slack' OR (s.provider='linear' AND NEW.kind='reaction.added' AND t.root!=NEW.message_id))
+          AND NOT EXISTS(SELECT 1 FROM sync_explicit_joins j WHERE j.source=t.source AND j.thread=t.thread AND NEW.message_id<=j.joined_at)
           AND NOT EXISTS(SELECT 1 FROM sync_import_context WHERE source=s.name)
           AND (SELECT count(*) FROM reactions WHERE message_id=NEW.message_id AND emoji=json_extract(NEW.payload,'$.emoji')
                AND instr(actor,'source:'||s.name||'/')!=1)=CASE NEW.kind WHEN 'reaction.added' THEN 1 ELSE 0 END

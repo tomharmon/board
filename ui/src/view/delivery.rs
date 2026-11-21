@@ -73,18 +73,21 @@ pub(super) fn view(s: &State, inset: f32) -> El {
             &d.labels,
             true,
             |s| &mut s.delivery.labels,
-        ))
-        .child(
-            Checkbox::new(d.later)
-                .label("Schedule delivery")
-                .on_toggle(|s: &mut State| {
-                    s.delivery.later = !s.delivery.later;
-                    s.draft_changed();
-                })
-                .build(&Kit::neutral(dark()))
-                .disabled(d.after.is_some())
-                .key("compose-later"),
-        );
+        ));
+    if let Some(choices) = suggestions::labels(s, suggestions::Field::Delivery) {
+        form = form.child(choices);
+    }
+    form = form.child(
+        Checkbox::new(d.later)
+            .label("Schedule delivery")
+            .on_toggle(|s: &mut State| {
+                s.delivery.later = !s.delivery.later;
+                s.draft_changed();
+            })
+            .build(&Kit::neutral(dark()))
+            .disabled(d.after.is_some())
+            .key("compose-later"),
+    );
     if let Some(id) = d.after {
         form = form.child(guard(id));
     }

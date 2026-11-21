@@ -644,22 +644,8 @@ impl Board {
         } else {
             (Session::Owner, owner.into())
         };
-        if let Some(raw) = profile {
-            let (name, avatar) = raw
-                .split_once(';')
-                .map_or((raw, None), |(n, a)| (n, Some(a.trim())));
-            let name = name.trim().to_ascii_lowercase();
-            ensure!(
-                name.len() <= 64
-                    && name
-                        .as_bytes()
-                        .first()
-                        .is_some_and(u8::is_ascii_alphanumeric)
-                    && name.bytes().all(|b| b.is_ascii_lowercase()
-                        || b.is_ascii_digit()
-                        || matches!(b, b'_' | b'.' | b'-')),
-                Invalid.error("invalid_profile", "invalid profile name")
-            );
+        if let Some(raw) = profile.filter(|s| !s.trim().is_empty()) {
+            let (name, avatar) = crate::local::profile_item(raw)?;
             let principal = actor.split('/').next().unwrap_or(&actor);
             let selected = format!("{principal}/{name}");
             ensure!(
@@ -667,18 +653,6 @@ impl Board {
                 Forbidden.error("actor_mismatch", "credential is fixed to its issued actor")
             );
             crate::validate_actor(&selected)?;
-            let avatar = avatar
-                .map(|a| {
-                    let v = a
-                        .strip_prefix("avatar=\"")
-                        .and_then(|v| v.strip_suffix('"'))
-                        .context(
-                            Invalid.error("invalid_profile", "expected avatar=\"https://...\""),
-                        )?;
-                    crate::actors::valid_avatar(v)?;
-                    Ok::<String, anyhow::Error>(v.to_owned())
-                })
-                .transpose()?;
             if let Session::NarrowedOwner { actor, .. } = &mut session {
                 actor.clone_from(&selected);
             }

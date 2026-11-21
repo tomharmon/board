@@ -2,6 +2,92 @@ use anyhow::Result;
 use board_local::{Board, ComposerSettings, Draft, PostOptions};
 
 #[test]
+fn channel_composer_is_leased_to_its_actor_slot_and_destination_until_an_atomic_send() -> Result<()>
+{
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("drafts.db");
+    let owner = Board::open(&path)?;
+    let grant = owner.set_grant(
+        "owner",
+        None,
+        "agent",
+        &board_local::access::Rules::parse("*=read,post")?,
+    )?;
+    let token = owner.issue_credential("owner", "agent", None, None)?.token;
+    let mut first = Board::open(&path)?;
+    first.bind_token(&token)?;
+    let mut second = Board::open(&path)?;
+    second.bind_token(&token)?;
+    let make = |channel: &str, body: &str| Draft {
+        channel: channel.into(),
+        body: body.into(),
+        reply_to: None,
+    };
+    let left = make("work/a", "first");
+    let right = make("work/b", "second");
+    let opts = ComposerSettings::default();
+    let slot = "channel:work/a";
+    assert!(
+        first
+            .save_composer("agent", slot, None, Some((&right, &opts)), None)
+            .is_err()
+    );
+    let stamp = first
+        .save_composer("agent", slot, None, Some((&left, &opts)), None)?
+        .unwrap();
+    assert!(
+        owner.load_composer("agent", slot)?.is_none(),
+        "OS owner actor and delegated private storage are separate"
+    );
+    assert!(second.load_composer("owner", slot).is_err());
+    second.save_composer("agent", "channel:work/b", None, Some((&right, &opts)), None)?;
+    let new = make("work/a", "replacement");
+    let rev = second
+        .save_composer("agent", slot, Some(&stamp), Some((&new, &opts)), None)?
+        .unwrap();
+    let head = owner.cursor()?;
+    for (ch, scope, s) in [
+        ("work/a", slot, &stamp),
+        ("work/b", slot, &rev),
+        ("work/a", "tasks", &rev),
+    ] {
+        assert!(
+            first
+                .post_scoped_composer(ch, "agent", &new.body, &PostOptions::default(), (scope, s))
+                .is_err()
+        );
+    }
+    assert_eq!(owner.cursor()?, head);
+    let post = first.post_scoped_composer(
+        "work/a",
+        "agent",
+        &new.body,
+        &Default::default(),
+        (slot, &rev),
+    )?;
+    assert_eq!(
+        (post.channel.as_str(), post.text.as_str()),
+        ("work/a", "replacement")
+    );
+    assert!(second.load_composer("agent", slot)?.is_none());
+    assert_eq!(
+        second
+            .load_composer("agent", "channel:work/b")?
+            .unwrap()
+            .draft,
+        right
+    );
+    owner.set_grant(
+        "owner",
+        Some(grant.id),
+        "agent",
+        &board_local::access::Rules::parse("work/a=read")?,
+    )?;
+    assert!(second.load_composer("agent", "channel:work/b").is_err());
+    Ok(())
+}
+
+#[test]
 fn saved_newest_guard_cannot_be_removed_rebased_or_moved_outside_its_thread() -> Result<()> {
     let db = Board::open(":memory:")?;
     let root = db.post("work", "reader", "Thread", &Default::default())?.id;

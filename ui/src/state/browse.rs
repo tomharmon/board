@@ -123,6 +123,10 @@ impl Browse {
     }
 }
 impl State {
+    pub fn reset_feed(&mut self) {
+        self.starts.clear();
+        self.feed_size = 50;
+    }
     pub fn add_channel(&mut self) {
         let name = self
             .browse
@@ -201,7 +205,7 @@ impl State {
                 b.filter.label_terms = labels;
                 self.query = TextEdit::new(b.words.text.trim());
                 b.filter_open = false;
-                self.starts.clear();
+                self.reset_feed();
                 self.desk.first_page();
                 self.error = None;
                 self.refresh();
@@ -215,7 +219,7 @@ impl State {
         self.browse.filter_open = false;
         self.query.clear();
         self.tasks_only = false;
-        self.starts.clear();
+        self.reset_feed();
         self.desk.first_page();
         self.error = None;
         self.refresh();

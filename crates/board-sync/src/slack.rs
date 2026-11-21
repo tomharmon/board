@@ -47,18 +47,7 @@ pub(super) fn with_forward(body: &str, v: &Value, hints: &[Link]) -> String {
     body.into()
 }
 pub(super) fn ts(s: &str) -> Result<()> {
-    let (a, b) = s
-        .split_once('.')
-        .context("expected a Slack message timestamp")?;
-    ensure!(
-        !a.is_empty()
-            && a.len() <= 16
-            && !b.is_empty()
-            && b.len() <= 9
-            && a.bytes().chain(b.bytes()).all(|c| c.is_ascii_digit()),
-        "invalid Slack timestamp"
-    );
-    Ok(())
+    board_local::sources::validate_slack_timestamp(s)
 }
 pub(super) fn date(t: &str) -> Result<DateTime<Utc>> {
     ts(t)?;

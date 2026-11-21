@@ -153,7 +153,13 @@ the file; it does not establish its safety.
 
 Larger files, up to 100 MiB, use resumable local SQLite uploads; there is no
 signed external URL, object store, or upload service. The CLI streams a large
-file in 4 MiB parts. A direct REST client can persist its ticket and resume:
+file in 4 MiB parts. For `post`, `reply`, `schedule` and new tasks,
+`--attach` checks all file paths and sizes before staging; if any file is
+large, it stages the batch in argument order. Staging and posting are distinct
+operations: rejection of a later post publishes no message or placement, but
+previously finished uploads remain private and reusable. A committed
+idempotent post can be retried even after its original path is gone.
+A direct REST client can persist its ticket and resume:
 
 1. `POST /v1/uploads` with `{"channel":"ops/shift","name":"run.bin","size":6,"content_type":"application/octet-stream"}` and optionally a lowercase hex `sha256`. The response's `Location` identifies the ticket.
 2. `PUT {Location}/parts/0` with raw bytes `abc`; `GET {Location}` returns `received: 3`. `PUT {Location}/parts/3` with `def`. Parts must arrive at the next offset; identical retries before completion are harmless, conflicting bytes are refused.
@@ -164,8 +170,9 @@ Tickets are actor-bound and expire after one hour before completion. A later
 start reclaims expired staging data. Up to eight unfinished tickets per actor,
 800 MiB of declared unfinished uploads board-wide, and 512 parts per ticket.
 Before a file is attached or downloaded the board checks that it is readable:
-global read, an accessible live placement, or the uploader's principal with
-permission at its original channel. Knowing an ID alone is not a grant. Deleting
+delegated read permission, even on every channel, needs an accessible live
+placement, or the uploader's own permitted provenance at the original channel.
+The trusted database owner can recover its contents. Knowing an ID alone is not a grant. Deleting
 a message removes its placement, not the immutable bytes or other messages'
 placements. An OS-owner backup includes files, private work state and
 credential hashes; protect it accordingly.
@@ -177,7 +184,7 @@ board --as helper profile --handle teammate/helper --name 'Shift helper' --avata
 board actors --details --query helper
 ```
 
-`GET /v1/actors` returns IDs for scripts. Add `details=true` for records, an
+`GET /v1/actors` returns IDs and their read-snapshot cursor for scripts. Add `details=true` for records, an
 optional `query` (case-insensitive substring) and up to 100 exact `id` query parameters. `PUT /v1/profile`
 accepts the caller's `handle`, `name`, and optional `avatar` (empty string clears,
 omission leaves it unchanged). The CLI also supports repeated `actors --id ID`.
@@ -188,7 +195,8 @@ claimed as independently verified accounts. Avatar URLs, when present, are
 metadata, not a requirement for offline operation. A master-authenticated REST
 request can select its actor's profile with `X-Board-Profile: helper; avatar="https://example.invalid/helper.png"`.
 The bearer of a delegated credential cannot use this to switch identities.
-HTTPS avatars are not fetched; legacy separate avatar/session headers do not
+Named CLI and REST profiles use the same lowercase spelling. Avatar metadata
+(HTTPS, or HTTP loopback) is not fetched; legacy separate avatar/session headers do not
 establish profile identity.
 
 In restricted sessions, the directory shows oneself and known actors who
@@ -206,8 +214,9 @@ a named person without this exact selector includes their profiles.
 Inspector text drafts and read checkpoints persist locally without creating board
 events. They are bound to the actor and, for delegates, credential and narrowing
 scope. Thread drafts recheck access to their thread; restoring a draft cannot
-read an inaccessible reply target. Pending file selections are not stored in
-text drafts.
+read an inaccessible reply target. Composer drafts include private staged file
+bytes, routing and guards, so a restart does not require the original file
+path. A stale window cannot send or clear a newer draft.
 
 Schema upgrades run in a write transaction. The v2 key upgrade keeps the
 earliest successful post for formerly ambiguous keys without deleting message
@@ -216,4 +225,6 @@ renumbering old attachment IDs. V5 rebuilds the prose mention index and adds
 the directory and draft state. V7 refreshes that index for paired triple
 backticks in prose. V8 converts one-subject grants into grouped grants and adds
 local profile avatar metadata without changing historical grant receipts.
+V12 builds indexed channel and thread summaries from existing messages and
+adds source lookup indexes without creating new board events.
 Existing custom schema definitions remain unchanged.

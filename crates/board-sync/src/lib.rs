@@ -533,10 +533,35 @@ impl Connector {
         let Some(l) = b.lease_source(who, name, Direction::Out, 120)? else {
             return Ok(None);
         };
+        let destination = |copy: Option<&Copy>| -> Result<String> {
+            if self.provider != Provider::Linear || l.job.payload["event"] == "thread.start" {
+                return Ok(l.job.thread.clone());
+            }
+            let comment = copy.and_then(|c| c.external.strip_prefix("comment:"));
+            match self.linear_destination(&src, &l.job.thread, comment) {
+                Ok(id) => Ok(id),
+                Err(e) => {
+                    // A read failure before sending can safely retry; no external mutation was attempted.
+                    b.fail_source(
+                        who,
+                        name,
+                        l.job.id,
+                        &l.receipt,
+                        FailureReport {
+                            reason: &e.to_string().chars().take(450).collect::<String>(),
+                            uncertain: false,
+                            retry_after: e.downcast_ref::<HttpStatus>().and_then(|s| s.1),
+                        },
+                    )?;
+                    Err(e.context("Linear destination not verified; nothing sent"))
+                }
+            }
+        };
         if l.job.payload["event"] == "source.response" {
             let text = s(&l.job.payload, "text")?;
+            let target = destination(None)?;
             b.start_sending(who, name, l.job.id, &l.receipt)?;
-            return self.confirm(b, who, name, &l, self.respond(&src, &l.job.thread, text));
+            return self.confirm(b, who, name, &l, self.respond(&src, &target, text));
         }
         let mut d: Delivery = serde_json::from_value(l.job.payload.clone())?;
         let find = |id| -> Result<Option<Copy>> {
@@ -578,7 +603,12 @@ impl Connector {
                 }
             }
         }
-        // The database records this intent before the HTTP request, including across process death.
+        let target = destination(if d.event == "message.posted" {
+            parent.as_ref()
+        } else {
+            copy.as_ref()
+        })?;
+        // The database records this intent before the mutating request, including across process death.
         b.start_sending(who, name, l.job.id, &l.receipt)?;
         let result = match self.provider {
             Provider::Slack if d.asset.is_some() => {
@@ -588,9 +618,7 @@ impl Connector {
                 self.github_send(&src, &l.job.thread, &d, copy.as_ref(), parent.as_ref())
             }
             Provider::Slack => self.slack_send(&src, &l.job.thread, &d, copy.as_ref()),
-            Provider::Linear => {
-                self.linear_send(&src, &l.job.thread, &d, copy.as_ref(), parent.as_ref())
-            }
+            Provider::Linear => self.linear_send(&src, &target, &d, copy.as_ref(), parent.as_ref()),
             Provider::Local => bail!("not a network source"),
         };
         self.confirm(b, who, name, &l, result)

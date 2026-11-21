@@ -22,6 +22,8 @@ const orig=()=>{
     edit:(id,t,r)=>b.edit(id,t,{revision:r}),del:(id,r)=>b.delete(id,{revision:r}),
     react:id=>b.react(id,'eyes'),label:(id,v,expected)=>b.label(id,{set:{phase:v},if:{phase:expected}}),
     wait:async id=>(await b.wait({re:id,after:id},{timeout:'2s'})).message.id,
+    nextType:async(id,after,all)=>(await b.wait({re:id,after,all},{timeout:'2s'}))?.type,
+    repliesAfter:async(id,after)=>(await b.thread(id,{after})).replies.map(m=>m.text),
     search:async ch=>(await b.threads({channel:ch,text:'needle'})).threads.map(v=>v.message.text),
     schema:async schema=>(await b.createSchema({name:'auditrecord',version:1,description:'audit',schema})).created,
     file:async()=>{const f=await b.upload({data:bytes,name:'payload.bin'});const p=await b.post('audit/files',{text:'file',attachments:[f]});return Buffer.from(await(await b.download(p.attachments[0].id)).arrayBuffer()).toString('hex');},
@@ -34,7 +36,7 @@ const orig=()=>{
     ack:l=>b.inboxAck('desk',l.id,{lease:l.lease}),
     task:async(t,needs)=>(await b.tasks.create('audit/jobs',{text:t,needs})).task.id,
     needs:(id,other)=>b.tasks.needs(id,[other]),claim:id=>b.tasks.claim(id),
-    complete:claim=>claim.complete('result'),taskState:async id=>(await b.thread(id)).message.task,
+    renew:claim=>claim.renew(300),complete:claim=>claim.complete('result'),taskState:async id=>(await b.thread(id)).message.task,
     close:()=>db.close()
   };
 };
@@ -49,6 +51,8 @@ const rust=()=>({
   del:(id,r)=>cli('delete',id,'--if-revision',r),react:id=>cli('react',id,'eyes'),
   label:(id,v,expected)=>cli('label',id,'phase='+v,...expected===null?['--if-unset','phase']:['--if','phase='+expected]),
   wait:id=>cli('wait',id,'--timeout','2s').event.message.id,
+  nextType:(id,after,all)=>cli('wait',id,'--after',after,'--timeout','2s',...all?['--all']:[]).event.type,
+  repliesAfter:(id,after)=>cli('read',id,'--after',after).replies.map(m=>m.text),
   search:ch=>cli('read',ch,'--text','needle').threads.map(v=>v.message.text),
   schema:schema=>cli('schemas','create','auditrecord@1','--description','audit','--data',JSON.stringify(schema)).created,
   file:()=>{const src=join(dir,'payload.bin'),dest=join(dir,'downloaded.bin');writeFileSync(src,bytes);const f=cli('upload','audit/files',src).attachment;
@@ -61,6 +65,7 @@ const rust=()=>({
   next:()=>{let q=cli('inbox','next','desk');return q?{...q,raw:q.job.raw}:null;},ack:l=>cli('inbox','ack','desk',l.job.id,'--receipt',l.receipt),
   task:(t,needs)=>cli('tasks','create','audit/jobs',t,...needs.flatMap(n=>['--needs',n])).id,
   needs:(id,other)=>cli('tasks','needs',id,other),claim:id=>cli('tasks','claim',id),
+  renew:c=>cli('tasks','renew',c.id,'--lease','300s','--epoch',c.epoch,'--token',c.claim_token),
   complete:c=>cli('tasks','complete',c.id,'result','--epoch',c.epoch,'--token',c.claim_token),
   taskState:id=>cli('read',id).message.task,close:()=>{}
 });
@@ -80,6 +85,8 @@ async function transcript(open){
     await b.react(id);await b.label(id,'open',null);
     trace.labelGuard=await denied(()=>b.label(id,'closed','wrong'));
     let after=(await b.read(id)).message;
+    trace.afterIndividualReply=await b.repliesAfter(nested.id,r.id);
+    trace.afterLastReply=await b.repliesAfter(id,nested.id);
     trace.nonTextRevision=after.revision===before.revision&&after.version>before.version;
     trace.reacted=after.reactions.eyes.length===1;trace.phase=after.labels.phase;
     await b.edit(id,'updated needle',before.revision);
@@ -92,7 +99,11 @@ async function transcript(open){
     trace.dependencyWait=(await b.taskState(two)).state;
     trace.cycle=await denied(()=>b.needs(one,two));
     let claim=await b.claim(one);trace.competingClaim=await denied(()=>b.claim(one));
-    await b.complete(claim);trace.fenced=await denied(()=>b.complete(claim));
+    const beforeRenew=(await b.read(one)).cursor;
+    await b.renew(claim);await b.complete(claim);
+    trace.normalFeedAfterRenewal=await b.nextType(one,beforeRenew,false);
+    trace.fullFeedAfterRenewal=await b.nextType(one,beforeRenew,true);
+    trace.fenced=await denied(()=>b.complete(claim));
     trace.done=(await b.taskState(one)).state;trace.dependencyReleased=(await b.taskState(two)).state;
     trace.schemaNew=await b.schema(def);trace.schemaReplay=await b.schema(def);trace.schemaImmutable=await denied(()=>b.schema({type:'object'}));
     trace.fileBytes=await b.file();
@@ -112,6 +123,9 @@ try{
   assert.deepEqual(got,expected);
   for(const check of ['replay','recovery','localOnly','exactParent','newestGuard','waitAfterReply','labelGuard','nonTextRevision','reacted','staleEdit','deletedCountsForNewest','tombstone','cycle','competingClaim','fenced','schemaNew','schemaImmutable','sourceLookup','sourceReplay','mentionedProfile','secondRoot','overlongDeliveryDenied','inboxFenced','inboxDrained'])assert.equal(got[check],true,check);
   assert.equal(got.fileBytes,'000280ff');
+  assert.deepEqual(got.afterIndividualReply,['nested needle']);
+  assert.deepEqual(got.afterLastReply,[]);
+  assert.deepEqual([got.normalFeedAfterRenewal,got.fullFeedAfterRenewal],['task.completed','task.renewed']);
   assert.deepEqual(got.restart,['updated needle',2,true,'result']);
   console.log('Original SQLite backend and Rust agree on '+Object.keys(got).length+' outcomes:\n'+JSON.stringify(got,null,2));
 }finally{rmSync(dir,{recursive:true,force:true});}
