@@ -30,6 +30,27 @@ fn cli(path: &Path, args: &[&str], token: Option<&str>) -> Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 struct Server(Child);
+fn launch(db: &Path, master: &str) -> (Server, String) {
+    let mut server = Server(
+        board(db)
+            .env("BOARD_API_TOKEN", master)
+            .args(["serve", "--port", "0"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let line = BufReader::new(server.0.stderr.take().unwrap())
+        .lines()
+        .next()
+        .unwrap()
+        .unwrap();
+    let addr = line
+        .strip_prefix("Board API: http://")
+        .and_then(|s| s.strip_suffix("/v1"))
+        .expect("announce loopback listener")
+        .to_owned();
+    (server, addr)
+}
 impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
@@ -56,16 +77,26 @@ fn http_with_key(
     key: Option<&str>,
     data: Value,
 ) -> (u16, Value, Option<String>) {
-    let mut sock = TcpStream::connect(addr).unwrap();
-    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let body = data.to_string();
     let scope = scope
         .map(|s| format!("X-Board-Can: {s}\r\n"))
         .unwrap_or_default();
     let key = key
         .map(|k| format!("Idempotency-Key: {k}\r\n"))
         .unwrap_or_default();
-    write!(sock,"{method} /v1/{path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n{scope}{key}Content-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
+    http_headers(addr, method, path, token, &format!("{scope}{key}"), data)
+}
+fn http_headers(
+    addr: &str,
+    method: &str,
+    path: &str,
+    token: &str,
+    extra: &str,
+    data: Value,
+) -> (u16, Value, Option<String>) {
+    let mut sock = TcpStream::connect(addr).unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let body = data.to_string();
+    write!(sock,"{method} /v1/{path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n{extra}Content-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",body.len()).unwrap();
     let mut raw = String::new();
     sock.read_to_string(&mut raw).unwrap();
     let (head, body) = raw.split_once("\r\n\r\n").unwrap();
@@ -86,6 +117,131 @@ fn http_with_key(
     )
 }
 
+#[test]
+fn real_rest_installs_a_rule_cli_obeys_and_restart_keeps_source_privacy() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = temp.path().join("board");
+    let master = "local-only-contract-master";
+    let (server, addr) = launch(&db, master);
+    let rule = json!({"script":r#"if write.channel == "review" && write.operation == "post" { #{text:write.text+" (review)",labels:#{phase:"review"}} }"#});
+    let (status, _, loc) = http_with_key(
+        &addr,
+        "PUT",
+        "rules/review",
+        master,
+        None,
+        None,
+        rule.clone(),
+    );
+    assert_eq!(status, 201);
+    assert_eq!(loc.as_deref(), Some("/v1/rules/review"));
+    assert_eq!(
+        http(
+            &addr,
+            "PUT",
+            "rules/review",
+            master,
+            Some("review=read,post"),
+            rule
+        )
+        .0,
+        403
+    );
+    cli(
+        &db,
+        &["sources", "add", "mirror", "local", "other", "review"],
+        None,
+    );
+    let (status, source) = http(
+        &addr,
+        "PATCH",
+        "sources/mirror",
+        master,
+        None,
+        json!({"outbound":true,"mirror_roots":true}),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(source["settings"]["mirror_roots"], true);
+    assert_eq!(
+        http(
+            &addr,
+            "PATCH",
+            "sources/mirror",
+            master,
+            None,
+            json!({"outbound":false,"mirror_files":true})
+        )
+        .0,
+        422
+    );
+    assert_eq!(
+        cli(&db, &["sources", "show", "mirror"], None)["outbound"],
+        true
+    );
+    let private = cli(
+        &db,
+        &["post", "review", "private", "--no-sync", "--id", "once"],
+        None,
+    )["message"]
+        .clone();
+    assert_eq!(private["text"], "private (review)");
+    assert_eq!(private["labels"]["phase"], "review");
+    assert_eq!(private["no_sync"], true);
+    assert!(
+        cli(&db, &["inbox", "list", "mirror", "--outgoing"], None)
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let (_s, m) = http(
+        &addr,
+        "POST",
+        "messages",
+        master,
+        None,
+        json!({"channel":"review","text":"public"}),
+    );
+    let notices = http(
+        &addr,
+        "GET",
+        &format!("messages/{}/deliveries", m["id"]),
+        master,
+        None,
+        Value::Null,
+    )
+    .1;
+    assert_eq!(notices["deliveries"][0]["event"], "thread.start");
+    assert!(notices["deliveries"][0].get("payload").is_none());
+    drop(server);
+    let (_next, addr) = launch(&db, master);
+    assert_eq!(
+        http(
+            &addr,
+            "GET",
+            &format!("messages/{}", private["id"]),
+            master,
+            None,
+            Value::Null
+        )
+        .1["text"],
+        private["text"]
+    );
+    assert_eq!(
+        cli(
+            &db,
+            &["post", "review", "private", "--no-sync", "--id", "once"],
+            None
+        )["message"]["id"],
+        private["id"]
+    );
+    assert_eq!(
+        http(&addr, "GET", "rules", master, None, Value::Null).1["rules"][0]["name"],
+        "review"
+    );
+    let isolated = temp.path().join("must-not-exist");
+    assert_eq!(cli(&isolated, &["conformance"], None)["ok"], true);
+    assert!(!isolated.exists());
+}
 #[test]
 fn scoped_cli_and_actual_loopback_requests_enforce_the_same_live_grant() {
     let tmp = tempfile::tempdir().unwrap();
@@ -157,6 +313,212 @@ fn scoped_cli_and_actual_loopback_requests_enforce_the_same_live_grant() {
         .strip_prefix("Board API: http://")
         .and_then(|s| s.strip_suffix("/v1"))
         .unwrap_or_else(|| panic!("local server did not start: {started}"));
+    let (s, msg, _) = http_headers(
+        addr,
+        "POST",
+        "messages",
+        master,
+        "X-Board-Profile: Audit; avatar=\"https://example.invalid/a.png\"\r\nX-Board-Session: ignored\r\n",
+        json!({"channel":"headers","text":"by a local profile"}),
+    );
+    assert_eq!(s, 201, "{msg}");
+    assert_eq!(msg["actor"], "owner/audit");
+    assert_eq!(msg["author"]["name"], "audit");
+    assert_eq!(msg["author"]["avatar"], "https://example.invalid/a.png");
+    assert!(msg.get("session").is_none());
+    assert_eq!(
+        cli(&db, &["read", &msg["id"].to_string()], None)["message"]["author"],
+        msg["author"]
+    );
+    assert_eq!(
+        http_headers(
+            addr,
+            "GET",
+            "me",
+            token,
+            "X-Board-Profile: someone\r\n",
+            Value::Null
+        )
+        .0,
+        403
+    );
+    let (s, bare, _) = http_headers(
+        addr,
+        "POST",
+        "messages",
+        master,
+        "X-Board-Profile: separate\r\nX-Board-Avatar: https://example.invalid/ignored.png\r\n",
+        json!({"channel":"headers","text":"@owner/audit"}),
+    );
+    assert_eq!(s, 201);
+    assert!(bare["author"]["avatar"].is_null());
+    assert_eq!(bare["text"], "@[owner/audit]");
+    assert_eq!(bare["mentions"][0]["actor"]["id"], "owner/audit");
+    let (s, pair) = http(
+        addr,
+        "GET",
+        "actors?id=owner%2Faudit&id=owner%2Fseparate&id=missing&details=true",
+        master,
+        None,
+        Value::Null,
+    );
+    assert_eq!(s, 200);
+    assert_eq!(pair["actors"].as_array().unwrap().len(), 2);
+    let (_, hidden) = http(
+        addr,
+        "GET",
+        "actors?id=owner%2Faudit&id=teammate%2Fhelper",
+        token,
+        None,
+        Value::Null,
+    );
+    assert_eq!(hidden["actors"], json!(["teammate/helper"]));
+    let many = (0..101).map(|_| "id=one").collect::<Vec<_>>().join("&");
+    assert_eq!(
+        http(
+            addr,
+            "GET",
+            &format!("actors?{many}"),
+            master,
+            None,
+            Value::Null
+        )
+        .0,
+        400
+    );
+    assert_eq!(
+        http(addr, "GET", "channels?prefix=pub", token, None, Value::Null).1["channels"][0]["name"],
+        "public/log"
+    );
+    let (_, me) = http(addr, "GET", "me", master, Some("headers=read"), Value::Null);
+    assert_eq!(http(addr,"PUT","profile",token,None,json!({"handle":"maintainer","name":"Maintainer","avatar":"https://example.invalid/local.png"})).0,204);
+    let card = cli(
+        &db,
+        &[
+            "actors",
+            "--details",
+            "--id",
+            "teammate/helper",
+            "--id",
+            "unknown",
+        ],
+        Some(token),
+    );
+    assert_eq!(card["actors"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        card["actors"][0]["avatar"],
+        "https://example.invalid/local.png"
+    );
+    assert_eq!(
+        http(
+            addr,
+            "PUT",
+            "profile",
+            token,
+            None,
+            json!({"handle":"maintainer","name":"Maintainer","avatar":"file:///tmp/private"})
+        )
+        .0,
+        422
+    );
+    cli(
+        &db,
+        &[
+            "profile",
+            "--handle",
+            "maintainer",
+            "--name",
+            "Maintainer",
+            "--avatar",
+            "",
+        ],
+        Some(token),
+    );
+    assert!(http(addr, "GET", "me", token, None, Value::Null).1["avatar"].is_null());
+    assert_eq!(me["can"], json!({"headers":["read"]}));
+    assert_eq!(me["principal"], "owner");
+    assert!(me.get("session").is_none());
+    let (s, replay) = http(
+        addr,
+        "GET",
+        "events?after=0&channel=headers&kind=message.posted",
+        master,
+        None,
+        Value::Null,
+    );
+    assert_eq!(s, 200, "{replay}");
+    let event = &replay["events"][0];
+    assert_eq!(event["actor"], "owner/audit");
+    for obj in [event, &event["payload"], &event["message"]] {
+        assert!(obj.get("session").is_none());
+    }
+    cli(
+        &db,
+        &["grants", "create", "lead", "--can", "ops/=manage"],
+        None,
+    );
+    let mgr = cli(&db, &["credentials", "issue", "lead"], None)["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, group) = http(
+        addr,
+        "POST",
+        "grants",
+        &mgr,
+        None,
+        json!({"subjects":["reviewer","spare"],"can":{"ops/review/":["read"]}}),
+    );
+    assert_eq!(s, 201, "{group}");
+    let gpath = format!("grants/{}", group["grant"]["id"]);
+    assert_eq!(http(addr, "GET", &gpath, &mgr, None, Value::Null).0, 200);
+    let (s, g) = http(
+        addr,
+        "PATCH",
+        &gpath,
+        &mgr,
+        None,
+        json!({"add":["next"],"remove":["spare"]}),
+    );
+    assert_eq!(s, 200);
+    assert_eq!(g["grant"]["subjects"], json!(["reviewer", "next"]));
+    assert_eq!(http(addr, "GET", "grants", &mgr, None, Value::Null).0, 403);
+    assert_eq!(
+        http(
+            addr,
+            "POST",
+            "credentials",
+            &mgr,
+            None,
+            json!({"actor":"new"})
+        )
+        .0,
+        403
+    );
+    assert_eq!(
+        http(
+            addr,
+            "POST",
+            "grants",
+            &mgr,
+            Some("ops/review/=manage;ops/review/closed/=none"),
+            json!({"subject":"new","can":{"ops/review/":"read"}})
+        )
+        .0,
+        422
+    );
+    assert_eq!(
+        http(
+            addr,
+            "POST",
+            "grants",
+            &mgr,
+            Some("ops/review/=manage;ops/review/closed/=none"),
+            json!({"subject":"new","can":{"ops/review/":["read"]}})
+        )
+        .0,
+        403
+    );
     assert_eq!(
         http(
             addr,

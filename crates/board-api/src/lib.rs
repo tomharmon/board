@@ -3,6 +3,8 @@ mod access_api;
 mod catalog;
 mod files_api;
 mod messages;
+mod openapi;
+mod policy_api;
 pub use catalog::document as discovery_document;
 mod sources;
 mod sse;
@@ -39,6 +41,7 @@ struct App {
 struct RequestIdentity {
     delegated: Option<String>,
     scope: Option<String>,
+    profile: Option<String>,
 }
 tokio::task_local! {static IDENTITY:RequestIdentity;}
 
@@ -131,10 +134,11 @@ impl App {
             let mut db = app.db.lock().map_err(|_| {
                 ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "database unavailable")
             })?;
-            Ok::<T, ApiError>(db.with_request(
+            Ok::<T, ApiError>(db.with_profile_request(
                 identity.delegated.as_deref(),
                 &app.actor,
                 identity.scope.as_deref(),
+                identity.profile.as_deref(),
                 f,
             )?)
         })
@@ -157,15 +161,18 @@ async fn authorize(State(app): State<App>, req: Request, next: Next) -> Response
         r
     } else if req.headers().contains_key(header::ORIGIN) {
         ApiError::new(StatusCode::FORBIDDEN, "browser origins are not accepted").into_response()
-    } else if req.headers().get_all("x-board-can").iter().count() > 1
-        || req
-            .headers()
-            .get("x-board-can")
-            .is_some_and(|v| v.to_str().is_err())
-    {
-        ApiError::new(StatusCode::BAD_REQUEST, "invalid x-board-can header").into_response()
+    } else if ["x-board-can", "x-board-profile"].into_iter().any(|k| {
+        req.headers().get_all(k).iter().count() > 1
+            || req.headers().get(k).is_some_and(|v| v.to_str().is_err())
+    }) {
+        ApiError::new(StatusCode::BAD_REQUEST, "invalid identity header").into_response()
     } else {
         let identity = RequestIdentity {
+            profile: req
+                .headers()
+                .get("x-board-profile")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
             delegated: provided
                 .filter(|v| *v != app.token.as_ref())
                 .map(str::to_owned),
@@ -243,6 +250,7 @@ fn routes(app: App) -> Router {
         )
         .merge(access_api::routes())
         .merge(catalog::routes())
+        .merge(policy_api::routes())
         .merge(files_api::routes())
         .merge(sources::routes())
         .merge(work::routes());

@@ -15,6 +15,10 @@ application from a disposable local database.
 - SQLite, rusqlite, Axum, Tokio, Clap, and other dependencies come from the
   sources and versions in [Cargo.lock](Cargo.lock). Their original licenses
   apply independently. The source checkout does not vendor dependency code.
+- [Rhai](https://github.com/rhaiscript/rhai) is the embedded, operation-limited
+  rules interpreter (MIT or Apache-2.0). [FFmpeg](https://ffmpeg.org/legal.html)
+  is optional for silent local H.264 previews. Board does not bundle FFmpeg
+  or a codec library; the user's installed executable retains its own license.
 
 For packaging, use `cargo metadata --offline --locked --format-version 1`
 after fetching the locked dependencies. Its package entries identify source

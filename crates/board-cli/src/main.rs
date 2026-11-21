@@ -1,6 +1,7 @@
 mod access_cli;
 mod automation_cli;
 mod cli;
+mod conformance;
 mod sync_cli;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -104,8 +105,9 @@ impl WriteOptions {
         Ok((
             self.body.read()?,
             PostOptions {
+                no_sync: self.no_sync,
                 labels: pairs(&self.label, false)?,
-                key: self.key,
+                key: automation_cli::output_key(board, actor, self.key.as_deref())?,
                 after: self.after,
                 files,
                 attachment_ids: self
@@ -124,25 +126,19 @@ impl Query {
             self.after.is_none_or(|a| a >= 0),
             "cursor must be nonnegative"
         );
-        let mentions = self.mentions.map(|m| {
-            if m.is_empty() || m == "me" {
-                actor.to_owned()
-            } else {
-                m.trim_start_matches('@').to_owned()
-            }
-        });
-        Ok(Filter {
+        let mut f = Filter {
             channel,
-            by: self
-                .by
-                .map(|by| if by == "me" { actor.to_owned() } else { by }),
+            from: self.from,
+            by: self.by,
             text: self.text,
             re: self.re,
             after: self.after,
-            mentions,
+            mentions: self.mentions,
             labels: Default::default(),
             label_terms: board_local::LabelTerm::parse(&self.label)?,
-        })
+        };
+        f.bind_actor(actor);
+        Ok(f)
     }
 }
 
@@ -197,12 +193,29 @@ fn show_message(m: &Message) {
     for (name, actors) in &m.reactions {
         println!("    :{}: {}", safe(name), safe(&actors.join(", ")));
     }
+    for link in &m.links {
+        if let Some(quoted) = &link.text {
+            println!(
+                "    > {}: {}\n      {}",
+                safe(link.author.as_deref().unwrap_or("Source")),
+                safe(quoted).replace('\n', "\n    > "),
+                safe(&link.url)
+            );
+        }
+    }
     for file in &m.attachments {
         println!(
             "    file #{}  {} ({} bytes)",
             file.id,
             safe(&file.name),
             file.size
+        );
+    }
+    for file in &m.file_notices {
+        println!(
+            "    file not downloaded: {} ({})",
+            safe(&file.name),
+            safe(&file.reason)
         );
     }
     if let Some(t) = &m.task {
@@ -303,6 +316,9 @@ fn inspector(db: PathBuf, profile: Option<String>, thread: Option<i64>) -> Resul
 }
 
 fn run(args: Args) -> Result<()> {
+    if matches!(args.cmd, Command::Conformance) {
+        return conformance::run(args.json);
+    }
     if matches!(args.cmd, Command::Commands) {
         use clap::CommandFactory;
         fn describe(c: &clap::Command) -> Value {
@@ -356,7 +372,50 @@ fn run(args: Args) -> Result<()> {
             "{}",
             serde_json::to_string_pretty(&board_api::discovery_document())?
         ),
-        Command::Commands => unreachable!(),
+        Command::Commands | Command::Conformance => unreachable!(),
+        Command::Rules { command } => {
+            use cli::RuleCommand::*;
+            board.require_owner()?;
+            match command.unwrap_or(List) {
+                List => {
+                    let rules = board.write_rules()?;
+                    if js {
+                        println!("{}", json!({"rules":rules}));
+                    } else {
+                        for r in rules {
+                            println!("{}  {}", r.priority, safe(&r.name));
+                        }
+                    }
+                }
+                Set {
+                    name,
+                    file,
+                    priority,
+                } => {
+                    let created = board.set_write_rule(
+                        &actor,
+                        &board_local::policy::Rule {
+                            name: name.clone(),
+                            priority,
+                            script: load_text(&file)?,
+                        },
+                    )?;
+                    if js {
+                        println!("{}", json!({"name":name,"created":created}));
+                    } else {
+                        println!("{}", safe(&name));
+                    }
+                }
+                Remove { name } => {
+                    board.remove_write_rule(&actor, &name)?;
+                    if js {
+                        println!("{}", json!({"removed":name}));
+                    } else {
+                        println!("removed {}", safe(&name));
+                    }
+                }
+            }
+        }
         Command::Typing {
             id,
             status,
@@ -397,16 +456,31 @@ fn run(args: Args) -> Result<()> {
                 println!("{}", safe(&destination.display().to_string()));
             }
         }
-        Command::Profile { handle, name } => {
-            board.set_actor_profile(&actor, &handle, &name)?;
+        Command::Profile {
+            handle,
+            name,
+            avatar,
+        } => {
+            board.set_actor_profile_with_avatar(&actor, &handle, &name, avatar.as_deref())?;
             if js {
                 println!("{}", json!({"actor":actor,"handle":handle,"name":name}));
             } else {
                 println!("{}  {}", safe(&handle), safe(&name));
             }
         }
-        Command::Actors { details, query } => {
-            let rows = board.actor_directory(query.as_deref())?;
+        Command::Actors {
+            details,
+            query,
+            ids,
+        } => {
+            ensure!(ids.len() <= 100, "at most 100 actor IDs");
+            for id in &ids {
+                board_local::validate_actor(id)?;
+            }
+            let mut rows = board.actor_directory(query.as_deref())?;
+            if !ids.is_empty() {
+                rows.retain(|entry| ids.contains(&entry.id));
+            }
             if details {
                 if js {
                     println!("{}", json!({"actors":rows}));
@@ -435,15 +509,30 @@ fn run(args: Args) -> Result<()> {
         Command::Inspect { .. } => unreachable!(),
         Command::Whoami => {
             if js {
-                println!("{}", json!({"actor":actor,"database":path}));
+                let mut me = json!(board.viewer(&actor)?);
+                me["database"] = json!(path);
+                println!("{me}");
             } else {
                 println!("{}  {}", safe(&actor), safe(&path.display().to_string()));
             }
         }
-        Command::Channels => {
-            let channels = board.channels()?;
+        Command::Channels {
+            prefix,
+            scope,
+            after,
+            limit,
+        } => {
+            let (cursor, channels, next) = board.channels_window(
+                after.as_deref().unwrap_or(""),
+                scope.as_deref(),
+                prefix.as_deref(),
+                limit,
+            )?;
             if js {
-                println!("{}", json!({"channels":channels}));
+                println!(
+                    "{}",
+                    json!({"channels":channels,"cursor":cursor,"next_after":next})
+                );
             } else {
                 for c in channels {
                     println!(
@@ -698,11 +787,7 @@ fn run(args: Args) -> Result<()> {
             }
             SchemaCommand::Inspect { schema } => {
                 let (n, v) = schema_id(&schema)?;
-                let s = board
-                    .schemas()?
-                    .into_iter()
-                    .find(|s| s.name == n && s.version == v)
-                    .with_context(|| Kind::Missing.error("schema_not_found", "schema not found"))?;
+                let s = board.schema(n, v)?;
                 println!("{}", serde_json::to_string_pretty(&s)?);
             }
             SchemaCommand::Create {

@@ -9,6 +9,13 @@ paging, 2 search, 2 schedules, 24 tasks, 14 grants, 5 schemas, 3 attachments,
 Resource URLs and JSON shapes differ; an upstream client is not supported.
 See [the verification checklist](../PARITY.md) for tests that actually run.
 
+**Case-by-case audit:** [54 core, paging, search, grants, schema and file cases](CORE-COVERAGE.md);
+[29 task, timer and watcher cases](WORK-COVERAGE.md); [7 sync cases](SOURCE-COVERAGE.md).
+The [native inspector audit](INSPECTOR-COVERAGE.md) covers interactive workflows separately.
+[Reproduce the direct comparisons](REFERENCE-CHECKS.md) to run both implementations,
+not just the Rust tests. One original case calls for waking a deployed app: it
+is mapped to a local handler, not counted as a successful deployment test.
+
 | Reference family | Rust coverage | Verification / qualification |
 | --- | --- | --- |
 | discovery, me, channels, createChannel, actors | Discovery/OpenAPI inventory, identity, named boards, hierarchical scopes, paged channel summaries, directory of people, profiles and external authors. | [REST](../crates/board-api/src/tests.rs), [local access](../crates/board-core/tests/access.rs). Local profile verification is not provider account verification. |
@@ -20,29 +27,32 @@ See [the verification checklist](../PARITY.md) for tests that actually run.
 | tasks, createTask(s), createdTasks, claim(Ready)Task, renew/release/complete/fail/block/unblock/reopen/assign/setNeeds/cancel | Thread-backed ownership and dependencies, atomic adopt/create-and-claim, recoverable fenced leases, supervised argv, atomic small DAG plans, larger checkpointed plans, cycles refused. | [Storage](../crates/board-core/tests/work_recovery.rs), [two workers including a real clock expiry](../crates/board-cli/tests/processes.rs), [CLI runner](../crates/board-cli/tests/task_runner.rs). |
 | schedule, schedules, cancelSchedule | Durable one-shot/repeat, individual reply targets, files, bounded catch-up, owner/credential recheck and cancellation. | [Schedule crash/injected transaction failure](../crates/board-core/tests/automation_delivery.rs), [blind creation and revocation](../crates/board-core/tests/work_recovery.rs). |
 | watchers, register, matches, ack | Local subscriptions per actor, precise filters, acknowledgments, independent thread heads, expiring receipts, failures, stable callback trigger and explicit local handler. | [Watcher delivery](../crates/board-core/tests/automation_delivery.rs), [actual handler subprocess](../crates/board-cli/tests/task_runner.rs). Not remotely hosted callbacks. |
-| grants, createGrant(s), updateGrant, explain, revokeGrant | Local actor/channel rules, longest match, atomic grant batches with recovery receipts, effective explanation, expiry, revocation, narrowing and owner-managed credentials. | [Core](../crates/board-core/tests/access.rs), [CLI and authenticated server](../crates/board-cli/tests/delegation.rs). Single local owner is the authority, no verified organization roles or installation principals. |
+| grants, createGrant(s), updateGrant, explain, revokeGrant | Subject sets, exact/family/wildcard precedence, scoped management without escalation, atomic batches with recovery receipts, effective explanation, expiry, revocation and narrowing. | [Policy](../crates/board-core/tests/grant_policy.rs), [CLI and authenticated server](../crates/board-cli/tests/delegation.rs). The local owner is the root authority; no verified organization roles or installation principals. |
 | syncImport, syncReceipt, syncThread, syncFind, syncCopies, inboxPush/Next/Ack, inbox, readSource, joinSource, synced, linked | Source identity and receipts; immutable copies, local/remote lookup, idempotent inbox, checkpointed pull, per-thread outbox, manual link/start/backfill, external preview and explicitly confirmed public Slack join. | [SQLite](../crates/board-core/tests/sync.rs), [real HTTP against fixtures](../crates/board-sync/src/tests.rs), [provider verification](SYNC.md#verification-and-limits). Offline local intake replaces a publicly reachable webhook. |
-| typing and inspector | Expiring status, drafts and unread tracking, chronological activity, rich thread/task and administration views, deep links, keyboard navigation, continuous cross-process reads. | [Scripted native rendering](../ui/tests/inspector.rs), [CLI/HTTP/live Rune/restart](../scripts/roundtrip.py). No web front end. |
+| write middleware and outgoing renderers | Owner-installed bounded Rhai programs: reject or rewrite before commit, emit additional messages atomically, optionally answer a dropped import, render source copies using current labels. | [Rules](../crates/board-core/tests/write_rules.rs), [rendered copy changes](../crates/board-core/tests/sync.rs), [protocol tests](../crates/board-sync/src/tests/coverage.rs). No arbitrary server-side JavaScript. |
+| typing and inspector | Expiring status, guarded private/scheduled drafts with bytes, unread tracking, chronological activity, media and stored link previews, deep links, real keyboard navigation and cross-process reads. | [Scripted native rendering](../ui/tests/inspector.rs), [CLI/HTTP/live Rune/restart](../scripts/roundtrip.py). No web front end. |
 
 ## What does not transfer one-for-one
 
 - **Runtime and transport:** no shared deployment, public webhooks, managed
   wake service, cross-team identity lookup, public avatar proxy, browser
-  inspector, hosted function/model execution, or upstream TypeScript
-  middleware. Their useful local counterparts are explicit worker/handler
-  processes, fixed-actor credentials, stored profile metadata, native Rune
-  views, and a Rust embedding API. There is no requirement for a separate
+  inspector, or hosted function/model execution. Their local counterparts
+  are explicit workers and handler processes, scoped credentials, locally
+  stored profile metadata, native Rune, a Rust embedding API and bounded
+  write rules. A rule is ported, not executed as TypeScript. There is no requirement for a separate
   database, broker, container engine or Git host.
 - **Provider fidelity:** the connectors import and publish conversations, not
-  every provider-specific feature. In particular, importing all private file
-  bytes automatically (Slack copies are explicit), rich marks/identity impersonation, provider-wide avatar lookup,
+  every provider-specific feature. Slack files are opt-in, bounded and
+  independently receipted; plain-text attribution does not impersonate users.
+  Round-tripping every rich-text mark, provider-wide avatar lookup,
   and reconstructing events the remote API no longer returns are not
   implied by a successful conversation pull. Comparisons of all provider
   webhook shapes, callback orders or account-specific permissions have not
   been run. Ordinary Board attachments and local reactions work offline.
-- **Guards against accidental sharing:** local root posts are not
-  automatically announced to a provider. Explicitly enable publishing and
-  link/start the intended conversations. An ambiguous write is not
+- **Guards against accidental sharing:** nothing publishes by default. To
+  mirror new roots, explicitly enable both publishing and root mirroring at
+  a suitable source; GitHub issues can only be started deliberately. Local-only
+  roots and their replies never enter the outbound queue. An ambiguous write is not
   automatically retried. OS file access is a trusted boundary, not a
   security sandbox. Native tests and release smoke checks were run on
   Linux, not on macOS or Windows.

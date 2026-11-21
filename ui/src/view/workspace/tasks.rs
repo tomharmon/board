@@ -69,6 +69,74 @@ pub(super) fn view(s: &State) -> El {
             );
     }
     if s.page == Page::Tasks {
+        if d.editing {
+            let f = &d.form;
+            return col()
+                .w_full()
+                .gap(12.0)
+                .child(heading(
+                    "Task filters",
+                    Some(
+                        tool("close-task-filters", "Close filters", &glyphs::CLOSE)
+                            .on_press(|s: &mut State| s.desk.editing = false),
+                    ),
+                ))
+                .child(field(
+                    "criteria-channel",
+                    "Channel or scope",
+                    &f.channel,
+                    |s| &mut s.desk.form.channel,
+                    false,
+                ))
+                .child(field(
+                    "criteria-owner",
+                    "Owner",
+                    &f.name,
+                    |s| &mut s.desk.form.name,
+                    false,
+                ))
+                .child(field(
+                    "criteria-assignee",
+                    "Assignee",
+                    &f.value,
+                    |s| &mut s.desk.form.value,
+                    false,
+                ))
+                .child(field(
+                    "criteria-needs",
+                    "Needs task ID",
+                    &f.extra,
+                    |s| &mut s.desk.form.extra,
+                    false,
+                ))
+                .child(field(
+                    "criteria-labels",
+                    "Labels (one per line)",
+                    &f.body,
+                    |s| &mut s.desk.form.body,
+                    true,
+                ))
+                .child(
+                    row()
+                        .w_full()
+                        .gap(6.0)
+                        .child(
+                            action("clear-task-filters", "Clear filters", false).on_press(
+                                |s: &mut State| {
+                                    s.desk.criteria = Default::default();
+                                    s.desk.editing = false;
+                                    s.desk.first_page();
+                                    s.refresh();
+                                },
+                            ),
+                        )
+                        .child(el().grow(1.0))
+                        .child(
+                            action("apply-task-filters", "Apply", true)
+                                .on_press(State::save_task_filters),
+                        ),
+                );
+        }
         let mut panel = col()
             .key("task-board")
             .w_full()
@@ -82,17 +150,51 @@ pub(super) fn view(s: &State) -> El {
                     }),
                 ),
             ))
-            .child(seg(
-                &["Open", "Ready", "Claimed", "All"],
-                d.task_filter,
-                "Task state",
-                "task-filter",
-                |s, i| {
-                    s.desk.task_filter = i;
-                    s.desk.first_page();
-                    s.refresh();
-                },
+            .child(
+                row()
+                    .w_full()
+                    .center_y()
+                    .gap(6.0)
+                    .child(seg(
+                        &["Open", "Ready", "Claimed", "All"],
+                        d.task_filter,
+                        "Task state",
+                        "task-filter",
+                        |s, i| {
+                            s.desk.task_filter = i;
+                            s.desk.first_page();
+                            s.refresh();
+                        },
+                    ))
+                    .child(el().grow(1.0))
+                    .child(
+                        action("task-criteria", "Filters", false)
+                            .on_press(State::edit_task_filters),
+                    ),
+            );
+        let c = &d.criteria;
+        let mut terms = Vec::new();
+        if let Some(ch) = &c.channel {
+            terms.push(format!("#{ch}"));
+        }
+        if let Some(o) = &c.owner {
+            terms.push(format!("Owner {o}"));
+        }
+        if let Some(a) = &c.assignee {
+            terms.push(format!("Assignee {a}"));
+        }
+        if let Some(n) = c.needs {
+            terms.push(format!("Needs #{n}"));
+        }
+        for t in &c.label_terms {
+            terms.push(t.values.as_ref().map_or_else(
+                || format!("Has {}", t.key),
+                |v| format!("{}={}", t.key, v.join("|")),
             ));
+        }
+        if !terms.is_empty() {
+            panel = panel.child(mono(terms.join("   "), MUTED).w_full().wrap_anywhere());
+        }
         if d.tasks.is_empty() {
             panel = panel.child(empty("No matching tasks"));
         }

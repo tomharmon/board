@@ -14,6 +14,7 @@ board --as reviewer tasks claim "$job" --lease 5m
 board --as reviewer tasks renew "$job" --lease 5m
 board --as reviewer tasks complete "$job" 'All checks passed'
 board tasks work/ --state completed --limit 25 --after 0
+board tasks work/ --latest --limit 10
 ```
 
 Use `tasks create CHANNEL TEXT --claim` to create and claim in one SQLite
@@ -27,6 +28,27 @@ requires `--from PERSON`; a direct ID is an explicit choice. Queue labels are
 exact; list filters also support presence and alternatives. Lists accept
 `--state`, `--needs`, `--by` (root author), `--owner`, `--for`,
 `--label`, `--limit` and `--after`.
+`--latest` selects the most recently active tasks before limiting, and displays
+the window oldest to newest. It cannot be combined with `--after`. List JSON
+includes the undeleted reply count and most recent live reply. The task's
+`owner` is its person; `by` is the exact profile that created or adopted it.
+The list filter `--by` still names the original root author. `--by me`
+matches only the exact active actor, not its other profiles. An owner who
+can read and post may change its task even without label permission. Taking
+a claim requires label permission; a sibling profile is not its owner.
+
+A task waits for at most 20 distinct prerequisites. Repeated IDs count once.
+Changing the set checks only newly added edges, stopping after 500 nodes.
+Completed, readable prerequisites can be pruned; hidden ones still count,
+so rejection does not disclose whether hidden work is finished. Removing
+edges does not retraverse unchanged history.
+
+An intake credential may create task roots and plans without read access.
+It gets its own immutable creation response on a keyed retry, not later
+claims, results, edits, or discussion. Plan-internal named edges are allowed;
+ordinary prerequisite IDs must name readable tasks. Creating and claiming
+in one request needs read and label as well as post. Use `--no-sync` to keep
+a new task or scheduled send from entering any outbound queue.
 
 The CLI persists a random proof **before** claiming and stores the task ID
 after the write commits. `tasks recover ID` checks live proofs, including
@@ -84,7 +106,7 @@ board --json tasks create work --idempotency-key release42 --file - <<'JSON'
 JSON
 ```
 
-A plan item accepts `text`, optional `key`, `labels`, `for`,
+A plan item accepts `text`, optional `key`, `labels`, `for`, `no_sync`,
 `attachment_ids`, and `needs` (existing numeric IDs or `{"key":"..."}`
 within the file). Up to 100 items commit as one transaction, including
 forward references. Larger plans commit dependency-ordered chunks of at most
@@ -131,6 +153,17 @@ seconds, at least a minute for repeats. A new first send more than 60 seconds
 in the past is rejected. That check is never applied to an already-persisted
 deadline on recovery.
 
+Mentions settle at registration, never again when dispatching the saved text.
+An unresolved handle stays plain even if somebody appears under it later.
+The creation response reports ambiguous or unresolved mentions. Schedules
+report `first`, `next`, the last posted message ID, and cancellation details.
+An older schedule without a surviving creation record may have no `first`.
+A local write rule that drops a due send changes its state to `dropped`
+without posting or blocking other schedules.
+Scheduling a saved desktop draft commits its removal in the same transaction
+as the schedule. A stale window cannot retire a changed draft; a failed
+schedule write leaves the saved draft available when the board reopens.
+
 ## Watchers
 
 ```sh
@@ -142,13 +175,16 @@ board watchers ack triage CURSOR --receipt RECEIPT --skip
 board watchers ack triage CURSOR --receipt RECEIPT --error 'temporary failure'
 board watchers failures triage
 board watchers run triage --once -- /absolute/path/to/local-handler
+board watchers replace subscriptions.json
+board --json watchers matches --limit 10 --lease 5m
 ```
 
 Subscriptions start at registration. The ordinary peek/ack pair is for a
 single consumer. Independent consumers should lease: each thread's head has
 one receipt, other thread heads continue, and stale acknowledgements fail.
-Failures back off exponentially from one second. Five explicit errors or ten
-interrupted attempts give up on the event and free the lane. Skips and
+Failures back off exponentially from one second. Five explicit errors give up
+on the event and free the lane. A leased delegated pull gives up after five
+interrupted attempts; a trusted local watch allows ten. Skips and
 successful acknowledgements advance it immediately. Failed heads remain
 inspectable. No worker is needed to accumulate, pull, renew, or acknowledge;
 state survives process restart and receipts stay valid until expiry.
@@ -157,9 +193,18 @@ Delegated registrations are namespaced by their fixed actor. Someone else can
 have the same watcher name without seeing or consuming yours. A saved match
 must still be visible under both the registering credential's current grants
 and the puller's credentials when delivered, renewed, or acknowledged. A
-temporary request cap cannot register or remove a durable watcher. A revoked
+temporary request cap cannot register, remove, consume, renew, or acknowledge
+a durable watcher. A revoked
 registration credential cannot deliver again; the same actor can remove and
 re-register it. Existing trusted/local subscriptions keep their own namespace.
+The replace file is a JSON array, for example
+`[{"name":"triage","filter":{"channel":"work/"},"kind":"message.posted"}]`.
+Omitted names are removed in the same transaction. Replacing an unchanged
+definition preserves cursors, leases, and pending matches. Changed definitions
+match old events under the old filter and new events under the new filter.
+Default subscriptions watch message and thread changes, not administrative
+events or lease-renewal chatter. Use `--all` to include renewals or an
+explicit `--kind` for one exact event type.
 
 `watchers run` leases and runs only the explicitly supplied argv on the local
 machine. The handler receives event JSON on stdin and `BOARD_DB`, actor,
@@ -173,6 +218,14 @@ available event; omit it to keep polling. Writes as the registration's
 server never spawns handlers. Neither CLI runner is a sandbox for
 untrustworthy executables.
 
+Inside a handler, ordinary CLI posts, replies, new tasks and plans automatically
+get deterministic output keys. If the process crashes after posting but before
+its acknowledgement, repeating the same operations in the same order reuses
+the same IDs. Explicit keys have their own namespace per handler actor and
+don't consume an automatic position. The runner issues a separate capability
+for the current lease; a stale child cannot allocate more keys. Parallel writes
+with nondeterministic ordering should use explicit keys.
+
 ## REST additions
 
 | Resource | Contract |
@@ -181,13 +234,17 @@ untrustworthy executables.
 | `POST /tasks/{id}/claim`, `POST /task-claims` | Optional caller `token`, 30-3600 second lease. Queue also takes `channel`, `labels`, `owners`, and `wait_seconds` (0-300). No match returns 204. |
 | `POST /task-claims/recover` | Body `{"token":"..."}`. Returns the live task with its proof only to its actor. |
 | `POST /task-batches` | Body `{"channel":"work","tasks":[...]}`, optional `Idempotency-Key`. Follow the supplied `Location` for current, input-ordered tasks, including committed partial progress. |
-| `GET /tasks` | `state`, `channel`, `by`, `owner`, `for` (full actor), `label`, `needs`, exclusive `after`, `limit`. |
+| `GET /tasks` | `state`, `channel`, `by`, `owner`, `for` (full actor), `label`, `needs`, exclusive `after`, `limit`, or `latest=true` without `after`. |
 | `POST /schedules`, `GET /schedules` | Inline `attachments:[{name,data_base64}]` and reusable `attachment_ids:[id]`; filter collection on `re` (any message in the thread), `by`, `all`, `after` and `limit`. |
 | `POST /watchers/{name}/deliveries` | Body `{"lease_seconds":30}`. Returns event, trigger, attempt, deadline, private receipt and ETag, or 204. |
 | `PATCH /watchers/{name}/deliveries/{cursor}` | Renew using the delivery ETag in `If-Match` and `lease_seconds` in JSON. |
 | `PUT /watchers/{name}/acknowledgements/{cursor}` | Empty body or `{}` acknowledges; `{"skip":true}` skips; `{"error":"..."}` schedules retry. Supply `If-Match` for leased deliveries. |
 | `GET /watchers/{name}/failures` | Durable failures ordered by cursor with exclusive `after` and `limit`. |
+| `PUT /watchers` | Replace the current local registration set with `{"watchers":[...]}`; an empty array removes the set. |
+| `POST /watcher-matches` | Lease free thread heads across the caller's subscriptions. Body accepts `limit` (1-100), `lease_seconds` (1-3600), `wait_seconds` (0-60). Each match names its watcher. |
 
 Focused verification: `cargo test --offline --locked -p board-local --test
 work_recovery`, `cargo test --offline --locked -p board-cli --test
 task_runner`, and `cargo test --offline --locked -p board-api work::tests`.
+See [work conformance coverage](WORK-COVERAGE.md) for the case matrix and
+remaining differences from the reference.

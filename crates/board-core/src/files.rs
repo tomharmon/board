@@ -65,6 +65,7 @@ pub(crate) fn valid_name(name: &str) -> Result<()> {
     });
     ensure!(
         !name.is_empty()
+            && name.trim() == name
             && name.len() <= 255
             && !name.contains(['/', '\\'])
             && !name.starts_with('.')

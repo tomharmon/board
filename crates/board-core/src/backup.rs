@@ -13,12 +13,14 @@ impl Board {
         let file = tempfile::NamedTempFile::new_in(parent)?;
         self.conn.backup(rusqlite::MAIN_DB, file.path(), None)?;
         file.as_file().sync_all()?;
-        file.persist_noclobber(destination).with_context(|| {
-            format!(
-                "publish backup {} (will not overwrite)",
-                destination.display()
-            )
-        })?;
+        file.into_temp_path()
+            .persist_noclobber(destination)
+            .with_context(|| {
+                format!(
+                    "publish backup {} (will not overwrite)",
+                    destination.display()
+                )
+            })?;
         Ok(())
     }
 }

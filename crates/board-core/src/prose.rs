@@ -196,8 +196,24 @@ pub(crate) fn query(value: &str) -> String {
             .unwrap_or(v),
     )
 }
+pub(crate) fn exact_selector(value: &str) -> Option<&str> {
+    value.strip_prefix("@[")?.strip_suffix(']')
+}
+pub(crate) fn family_separator(value: &str) -> char {
+    if value.contains(':') && !value.starts_with("source:") {
+        '+'
+    } else {
+        '/'
+    }
+}
 pub(crate) fn matches(term: &str, query: &str) -> bool {
-    term == query || term.split_once('/').is_some_and(|(p, _)| p == query)
+    let exact = exact_selector(query).is_some();
+    let query = self::query(query);
+    term == query
+        || (!exact
+            && term
+                .strip_prefix(&query)
+                .is_some_and(|rest| rest.starts_with(family_separator(&query))))
 }
 
 pub(crate) fn redact_exact(text: &str, actor: &str) -> String {

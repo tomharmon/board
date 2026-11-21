@@ -79,6 +79,9 @@ fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
         digests,
     })
 }
+pub(super) fn validate(channel: &str, items: &[PlanItem]) -> Result<()> {
+    graph(channel, items).map(|_| ())
+}
 
 pub(super) fn create(
     board: &Board,
@@ -97,7 +100,7 @@ pub(super) fn create(
         let tx = write(&board.conn)?;
         let a = board.access_on(&tx)?;
         a.actor(actor)?;
-        a.require(Action::Read, channel)?;
+        crate::automation::authorize_callback_key(&tx, actor, key)?;
         a.require(Action::Post, channel)?;
         if items.iter().any(|i| !i.labels.is_empty()) {
             a.require(Action::Label, channel)?;
@@ -107,7 +110,7 @@ pub(super) fn create(
             if r.fingerprint == full {
                 let tasks = batch_tasks(&tx, &r)?
                     .into_iter()
-                    .map(|t| visible(&a, &tx, t))
+                    .map(|t| creation_view(&tx, &a, actor, t))
                     .collect::<Result<Vec<_>>>()?;
                 tx.commit()?;
                 return Ok((tasks, made));
@@ -147,19 +150,20 @@ pub(super) fn create(
                     .iter()
                     .map(|e| match e {
                         Edge::Existing(id) => Prerequisite::Number(*id),
-                        Edge::Item(j) => known.get(j).copied().map_or_else(
-                            || Prerequisite::Key { key: j.to_string() },
-                            Prerequisite::Number,
-                        ),
+                        Edge::Item(j) => Prerequisite::Key { key: j.to_string() },
                     })
                     .collect();
                 item
             })
             .collect::<Vec<_>>();
-        for (i, t) in indices
-            .into_iter()
-            .zip(plan_chunk(&tx, &a, actor, channel, &chunk)?)
-        {
+        for (i, t) in indices.into_iter().zip(plan_chunk(
+            &tx,
+            &a,
+            actor,
+            channel,
+            &chunk,
+            known.iter().map(|(i, id)| (i.to_string(), *id)).collect(),
+        )?) {
             tx.execute(
                 "INSERT INTO plan_progress VALUES(?,?,?,?)",
                 params![key, i as i64, g.digests[i], t.id],
@@ -183,7 +187,7 @@ pub(super) fn create(
             tx.execute("DELETE FROM plan_progress WHERE key=?", [key])?;
             let out = ids
                 .into_iter()
-                .map(|id| visible(&a, &tx, task(&tx, id)?))
+                .map(|id| creation_view(&tx, &a, actor, task(&tx, id)?))
                 .collect::<Result<Vec<_>>>()?;
             tx.commit()?;
             return Ok((out, made));

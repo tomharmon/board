@@ -38,6 +38,9 @@ pub struct Body {
 
 #[derive(Group)]
 pub struct WriteOptions {
+    /// Keep this message local, even in a mirrored channel
+    #[arg(long)]
+    pub no_sync: bool,
     #[command(flatten)]
     pub body: Body,
     #[arg(long, value_name = "KEY=VALUE")]
@@ -57,6 +60,8 @@ pub struct WriteOptions {
 
 #[derive(Group)]
 pub struct Query {
+    #[arg(long, visible_alias = "source")]
+    pub from: Option<String>,
     #[arg(long)]
     pub by: Option<String>,
     #[arg(long)]
@@ -94,8 +99,15 @@ pub enum Command {
     Whoami,
     /// Describe this release's local API and capabilities without a running server
     Discovery,
+    /// Exercise the installed local engine on a disposable database, never the selected board.
+    Conformance,
     /// Inspect the machine-readable CLI command tree without opening the database
     Commands,
+    /// Manage bounded, local post/edit middleware (owner only)
+    Rules {
+        #[command(subcommand)]
+        command: Option<RuleCommand>,
+    },
     /// Set a short-lived typing status in a local thread without recording a board event
     Typing {
         #[arg(value_parser=crate::parse_id)]
@@ -122,13 +134,25 @@ pub enum Command {
         command: crate::sync_cli::Inbox,
     },
     /// List channels
-    Channels,
+    Channels {
+        #[arg(long, conflicts_with = "scope")]
+        prefix: Option<String>,
+        #[arg(long)]
+        scope: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// List person and agent handles that have written to the board
     Actors {
         #[arg(long)]
         details: bool,
         #[arg(long)]
         query: Option<String>,
+        /// Exact actor IDs; repeat to request multiple cards.
+        #[arg(long = "id")]
+        ids: Vec<String>,
     },
     /// Set the current actor's display name and mention handle
     Profile {
@@ -136,6 +160,9 @@ pub enum Command {
         handle: String,
         #[arg(long)]
         name: String,
+        /// HTTPS metadata only; use an empty string to remove an existing avatar.
+        #[arg(long)]
+        avatar: Option<String>,
     },
     /// Create an empty channel (posting also creates one)
     Channel { name: String },
@@ -188,6 +215,7 @@ pub enum Command {
     React {
         #[arg(value_parser=crate::parse_id)]
         id: i64,
+        #[arg(allow_negative_numbers = true)]
         emoji: String,
         #[arg(long)]
         remove: bool,
@@ -243,6 +271,20 @@ pub enum Command {
     },
     #[command(flatten)]
     Automation(crate::automation_cli::Commands),
+}
+#[derive(clap::Subcommand)]
+pub enum RuleCommand {
+    List,
+    /// Install or update an explicitly named rule; FILE is Rhai source or '-' for stdin
+    Set {
+        name: String,
+        file: PathBuf,
+        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
+        priority: i64,
+    },
+    Remove {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]

@@ -58,6 +58,7 @@ pub struct Desk {
     pub through: i64,
     pub tasks: Vec<Task>,
     pub task_filter: usize,
+    pub criteria: automation::TaskFilter,
     pub schedules: Vec<Schedule>,
     pub watchers: Vec<Watcher>,
     pub schemas: Vec<Schema>,
@@ -65,7 +66,7 @@ pub struct Desk {
     pub credentials: Vec<board_local::access::Credential>,
     pub source: super::sources::Review,
     pub profiles: Vec<String>,
-    pub schema_open: Option<(String, u32)>,
+    pub schema_open: Option<super::templates::SchemaPage>,
     pub confirm: Option<String>,
     pub editing: bool,
     pub form: Form,
@@ -113,7 +114,14 @@ impl Desk {
         }
     }
 
-    pub fn load(&mut self, db: &Board, actor: &str, page: Page, delegated: bool) -> Result<()> {
+    pub fn load(
+        &mut self,
+        db: &Board,
+        actor: &str,
+        page: Page,
+        delegated: bool,
+        filter: &Filter,
+    ) -> Result<()> {
         self.head = db.cursor()?;
         self.seen = db.activity_seen(actor)?;
         self.unread = db.activity_unread(actor)?;
@@ -123,8 +131,7 @@ impl Desk {
         match page {
             Page::Activity => match self.mode {
                 ActivityMode::Messages => {
-                    let window =
-                        db.messages_window(&Filter::default(), self.pages.last().copied(), PAGE)?;
+                    let window = db.messages_window(filter, self.pages.last().copied(), PAGE)?;
                     self.next = window.older;
                     self.through = window.snapshot;
                     self.messages = window.rows;
@@ -183,8 +190,9 @@ impl Desk {
             },
             Page::Tasks => {
                 let state = ["open", "ready", "claimed", "all"][self.task_filter];
+                self.criteria.state = Some(state.into());
                 let (_, mut tasks) =
-                    automation::tasks_page(db, None, Some(state), after, PAGE + 1)?;
+                    automation::filtered_tasks_page(db, &self.criteria, after, PAGE + 1)?;
                 if tasks.len() > PAGE {
                     tasks.truncate(PAGE);
                     self.next = tasks.last().map(|t| t.id);
@@ -277,6 +285,14 @@ impl State {
         let result = self.db().and_then(|b| b.get(id));
         if let Some(m) = self.result(result) {
             self.go(Page::Thread(m.re.unwrap_or(id)));
+            self.browse.position = if m.re.is_some() {
+                Position::Before(id.saturating_add(1))
+            } else {
+                Position::Latest
+            };
+            self.browse.focused = Some(id);
+            self.browse.reveal = Some(id);
+            self.refresh();
         }
     }
     fn result<T>(&mut self, result: Result<T>) -> Option<T> {
@@ -321,8 +337,11 @@ impl State {
         self.actor = actor.to_owned();
         self.desk.source.selected.clear();
         self.desk.source.outgoing = false;
+        self.desk.criteria = Default::default();
+        self.desk.task_filter = 0;
         self.history.clear();
         self.query.clear();
+        self.browse = Browse::default();
         self.starts.clear();
         self.channel = None;
         self.go(Page::Feed);
@@ -358,6 +377,55 @@ impl State {
         });
         if let Some(t) = self.result(result) {
             self.go(Page::Task(t.id));
+        }
+    }
+
+    pub fn edit_task_filters(&mut self) {
+        let c = &self.desk.criteria;
+        let f = &mut self.desk.form;
+        f.channel = TextEdit::new(c.channel.as_deref().unwrap_or(""));
+        f.name = TextEdit::new(c.owner.as_deref().unwrap_or(""));
+        f.value = TextEdit::new(c.assignee.as_deref().unwrap_or(""));
+        f.extra = TextEdit::new(c.needs.map(|n| n.to_string()).unwrap_or_default());
+        f.body = TextEdit::new(
+            c.label_terms
+                .iter()
+                .map(|t| {
+                    t.values
+                        .as_ref()
+                        .map_or_else(|| t.key.clone(), |v| format!("{}={}", t.key, v.join("|")))
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        self.desk.editing = true;
+    }
+
+    pub fn save_task_filters(&mut self) {
+        let build = || -> Result<automation::TaskFilter> {
+            let f = &self.desk.form;
+            let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
+            let terms: Vec<_> = f.body.text.lines().filter_map(opt).collect();
+            let c = automation::TaskFilter {
+                channel: opt(&f.channel.text),
+                owner: opt(&f.name.text),
+                assignee: opt(&f.value.text),
+                needs: opt(&f.extra.text)
+                    .map(|s| s.trim_start_matches('#').parse::<i64>())
+                    .transpose()
+                    .context("Enter a positive prerequisite ID")?,
+                label_terms: board_local::LabelTerm::parse(&terms)?,
+                ..Default::default()
+            };
+            automation::filtered_tasks_page(self.db()?, &c, 0, 1)?;
+            Ok(c)
+        };
+        let result = build();
+        if let Some(criteria) = self.result(result) {
+            self.desk.criteria = criteria;
+            self.desk.editing = false;
+            self.desk.first_page();
+            self.refresh();
         }
     }
 

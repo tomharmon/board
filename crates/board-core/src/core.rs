@@ -17,6 +17,7 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS messages_by_thread ON messages(re,id);
 CREATE INDEX IF NOT EXISTS messages_by_channel ON messages(channel,id);
 CREATE INDEX IF NOT EXISTS messages_by_actor ON messages(actor,id);
+CREATE TABLE IF NOT EXISTS private_messages(id INTEGER PRIMARY KEY REFERENCES messages(id));
 CREATE TABLE IF NOT EXISTS mentions(message_id INTEGER NOT NULL REFERENCES messages(id), handle TEXT NOT NULL, PRIMARY KEY(message_id,handle));
 CREATE INDEX IF NOT EXISTS mentions_by_handle ON mentions(handle,message_id);
 CREATE TABLE IF NOT EXISTS labels(message_id INTEGER NOT NULL REFERENCES messages(id), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(message_id,key));
@@ -46,6 +47,7 @@ INSERT OR IGNORE INTO client_batches(key,actor,fingerprint,ids)
 pub struct Board {
     pub(crate) conn: Connection,
     pub(crate) session: crate::access::Session,
+    pub(crate) request_avatar: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -69,13 +71,28 @@ pub struct Message {
     pub reply_to: Option<i64>,
     pub channel: String,
     pub actor: String,
+    #[serde(default)]
+    pub author: Option<crate::ActorEntry>,
+    #[serde(default)]
+    pub from: Option<String>,
     pub text: String,
     pub created_at: String,
+    #[serde(default)]
+    pub edited_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::MentionResolution>,
     pub revision: i64,
     pub deleted: bool,
+    /// This message (and, for a root, its entire thread) never leaves through a connector.
+    #[serde(default)]
+    pub no_sync: bool,
     pub labels: BTreeMap<String, String>,
     pub reactions: BTreeMap<String, Vec<String>>,
     pub attachments: Vec<Attachment>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_notices: Vec<crate::sources::FileNotice>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<crate::links::Link>,
     pub blocks: Vec<Block>,
     /// Last change to this message. Unlike revision, this includes metadata updates.
     #[serde(default)]
@@ -90,6 +107,8 @@ pub struct Message {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct PostOptions {
+    #[serde(default)]
+    pub no_sync: bool,
     pub key: Option<String>,
     pub after: Option<i64>,
     pub labels: BTreeMap<String, String>,
@@ -114,6 +133,14 @@ pub fn validate_channel(s: &str) -> Result<()> {
 }
 
 fn validate_key(s: &str) -> Result<()> {
+    validate_label_key(s)?;
+    ensure!(
+        !s.starts_with("board."),
+        Invalid.error("reserved_label", format!("reserved label: {s}"))
+    );
+    Ok(())
+}
+pub(crate) fn validate_label_key(s: &str) -> Result<()> {
     ensure!(
         s.len() <= 64
             && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
@@ -121,10 +148,6 @@ fn validate_key(s: &str) -> Result<()> {
                 || b.is_ascii_digit()
                 || matches!(b, b'_' | b'-' | b'.')),
         "invalid label key: {s}"
-    );
-    ensure!(
-        !s.starts_with("board."),
-        Invalid.error("reserved_label", format!("reserved label: {s}"))
     );
     ensure!(
         !matches!(s, "constructor" | "prototype"),
@@ -146,7 +169,7 @@ pub fn validate_actor(s: &str) -> Result<()> {
 fn validate_text(text: &str, attached: bool) -> Result<()> {
     ensure!(!text.contains('\0'), "message contains NUL");
     ensure!(
-        text.chars().count() <= 10_000,
+        text.encode_utf16().count() <= 10_000,
         "message exceeds 10000 characters"
     );
     ensure!(
@@ -184,7 +207,7 @@ pub fn validate_post(channel: &str, actor: &str, text: &str, opts: &PostOptions)
 }
 fn validate_value(v: &str) -> Result<()> {
     ensure!(
-        v.chars().count() <= 256 && !v.chars().any(char::is_control),
+        v.encode_utf16().count() <= 256 && !v.chars().any(char::is_control),
         "label values must be at most 256 characters without controls"
     );
     Ok(())
@@ -206,7 +229,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 7;
+const DB_VERSION: i64 = 10;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -229,25 +252,47 @@ fn enable_wal(conn: &Connection) -> Result<()> {
     }
 }
 
+/// Prepare a real database path without closing a raw descriptor to a published database.
+/// On Unix closing *any* descriptor to that inode would release this process's SQLite locks.
+pub fn prepare_sqlite_file(path: &Path) -> Result<()> {
+    use std::io::ErrorKind;
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => return Err(error).with_context(|| format!("inspect {}", path.display())),
+    }
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    // NamedTempFile is private (0600 on Unix). Drop its FD *before* publication:
+    // another thread may open the final path with SQLite as soon as it exists.
+    let closed = tempfile::NamedTempFile::new_in(parent)?.into_temp_path();
+    match closed.persist_noclobber(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.error.kind() == ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("prepare {}", path.display())),
+    }
+}
+
 impl Board {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if path == Path::new(":memory:") {
+            return Self::memory();
+        }
         if let Some(p) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(p)?;
         }
-        #[cfg(unix)]
-        if path != Path::new(":memory:") {
-            use std::os::unix::fs::OpenOptionsExt;
-            // SQLite creates its sidecar files with the database file's permissions.
-            std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .mode(0o600)
-                .open(path)
-                .with_context(|| format!("open {}", path.display()))?;
-        }
-        Self::from_conn(Connection::open(path).with_context(|| format!("open {}", path.display()))?)
+        prepare_sqlite_file(path)?;
+        // If another process removed the prepared path, fail rather than creating
+        // a replacement with ordinary process permissions behind a live connection.
+        let flags =
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        Self::from_conn(
+            Connection::open_with_flags(path, flags)
+                .with_context(|| format!("open {}", path.display()))?,
+        )
     }
     pub fn memory() -> Result<Self> {
         Self::from_conn(Connection::open_in_memory()?)
@@ -281,6 +326,7 @@ impl Board {
             return Ok(Self {
                 conn,
                 session: Default::default(),
+                request_avatar: None,
             });
         }
         let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
@@ -298,6 +344,7 @@ impl Board {
             return Ok(Self {
                 conn,
                 session: Default::default(),
+                request_avatar: None,
             });
         }
         tx.execute_batch(SCHEMA)?;
@@ -306,6 +353,7 @@ impl Board {
         tx.execute_batch(REPLAY_KEYS)?;
         crate::access::init(&tx)?;
         crate::sources::init(&tx)?;
+        crate::policy::init(&tx)?;
         crate::presence::init(&tx)?;
         crate::files::init(&tx)?;
         crate::actors::init(&tx)?;
@@ -315,10 +363,18 @@ impl Board {
         Ok(Self {
             conn,
             session: Default::default(),
+            request_avatar: None,
         })
     }
     pub(crate) fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        if let Some((actor, avatar)) = &self.request_avatar {
+            let a = self.access_on(&tx)?;
+            a.actor(actor)?;
+            if tx.execute("INSERT INTO actor_avatars VALUES(?,?) ON CONFLICT(id) DO UPDATE SET url=excluded.url WHERE url<>excluded.url",params![actor,avatar])?>0 {
+                Self::event_tx(&tx,"actor.updated",actor,None,json!({"id":actor}))?;
+            }
+        }
         let v = f(&tx)?;
         tx.commit()?;
         Ok(v)
@@ -383,9 +439,9 @@ impl Board {
         Ok(message)
     }
     pub(crate) fn get_on(c: &Connection, id: i64) -> Result<Message> {
-        let (channel,actor,text,re,reply_to,created_at,revision,deleted,blocks) = c.query_row(
-            "SELECT channel,actor,text,re,reply_to,created_at,revision,deleted,blocks FROM messages WHERE id=?",
-            [id], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get::<_,String>(8)?)),
+        let (channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,no_sync) = c.query_row(
+            "SELECT channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,EXISTS(SELECT 1 FROM private_messages p WHERE p.id=m.id) FROM messages m WHERE id=?",
+            [id], |r| Ok((r.get(0)?,r.get::<_,String>(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get::<_,String>(8)?,r.get(9)?)),
         ).optional()?.with_context(||Missing.error("message_not_found",format!("message #{id} not found")))?;
         let labels = labels_on(c, id)?;
         let mut reactions: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -399,30 +455,47 @@ impl Board {
             reactions.entry(emoji).or_default().push(who);
         }
         let attachments = crate::files::on_message(c, id)?;
-        let version=c.query_row("SELECT coalesce(max(cursor),?1) FROM events WHERE message_id=?1 AND (kind IN ('message.edited','message.deleted','labels.changed','reaction.added','reaction.removed') OR kind LIKE 'task.%')",[id],|r|r.get(0))?;
+        let edited_at=c.query_row("SELECT created_at FROM events WHERE message_id=? AND kind='message.edited' ORDER BY cursor DESC LIMIT 1",[id],|r|r.get(0)).optional()?;
+        let version=c.query_row("SELECT coalesce(max(cursor),?1) FROM events WHERE message_id=?1 AND (kind IN ('message.edited','message.deleted','message.links','attachment.added','attachment.unavailable','labels.changed','reaction.added','reaction.removed') OR kind LIKE 'task.%')",[id],|r|r.get(0))?;
         let task = if labels.contains_key("board.task") || deleted {
             crate::automation::task_optional(c, id)?
         } else {
             None
         };
+        let origin = crate::sources::origin_on(c, id)?;
         Ok(Message {
             id,
             re,
             reply_to,
             channel,
+            author: Some(crate::actors::card_on(c, &actor)?),
             actor,
+            from: origin.as_ref().map(|o| o.source.clone()),
             text,
             created_at,
+            edited_at,
+            mentions: vec![],
             revision,
             deleted,
+            no_sync,
             labels,
             reactions,
             attachments,
+            links: if deleted {
+                Vec::new()
+            } else {
+                crate::links::on(c, id)?
+            },
+            file_notices: if deleted {
+                Vec::new()
+            } else {
+                crate::sources::file_notices_on(c, id)?
+            },
             blocks: serde_json::from_str(&blocks)?,
             version,
             task,
             schedule: crate::automation::send_info(c, id)?,
-            origin: crate::sources::origin_on(c, id)?,
+            origin,
         })
     }
     pub fn post(
@@ -444,7 +517,37 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
+        self.post_guarded(channel, actor, text, opts, None)
+    }
+    pub fn post_composer(
+        &self,
+        channel: &str,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        stamp: &str,
+    ) -> Result<Message> {
+        Ok(self
+            .post_guarded(channel, actor, text, opts, Some(stamp))?
+            .0)
+    }
+    fn post_guarded(
+        &self,
+        channel: &str,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        stamp: Option<&str>,
+    ) -> Result<(Message, bool)> {
         self.write(|tx| {
+            if let Some(stamp) = stamp {
+                let draft = self.check_composer_options_on(tx, actor, "new", text, opts, None)?;
+                ensure!(
+                    draft.channel == channel && draft.reply_to.is_none(),
+                    Conflict.error("draft_changed", "draft destination no longer matches")
+                );
+                self.consume_composer_on(tx, actor, "new", stamp)?;
+            }
             let a = self.access_on(tx)?;
             a.actor(actor)?;
             a.require(Action::Post, channel)?;
@@ -452,9 +555,13 @@ impl Board {
             if !opts.labels.is_empty() {
                 a.require(Action::Label, channel)?;
             }
-            let (m, created) = Self::post_tx_with_outcome(tx, channel, actor, text, opts)?;
+            let (text, mentions) = crate::actors::settle(tx, &a, actor, None, text)?;
+            let (m, created) = Self::post_tx_with_outcome(tx, channel, actor, &text, opts)?;
             if a.allows(Action::Read, channel) {
-                return Ok((a.view(tx, m)?, created));
+                return Ok((
+                    crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
+                    created,
+                ));
             }
             if created {
                 tx.execute("INSERT INTO blind_posts VALUES(?)", [m.id])?;
@@ -463,7 +570,10 @@ impl Board {
                 a.blind_on(tx, m.id)?,
                 Conflict.error("duplicate_id", "client key belongs to a different write")
             );
-            Ok((a.original(tx, m.id)?, created))
+            Ok((
+                crate::actors::write_view(a.original(tx, m.id)?, &text, mentions, true),
+                created,
+            ))
         })
     }
     pub fn reply_with_outcome(
@@ -473,7 +583,36 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
+        self.reply_guarded(id, actor, text, opts, None)
+    }
+    pub fn reply_composer(
+        &self,
+        id: i64,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        guard: (&str, &str),
+    ) -> Result<Message> {
+        Ok(self.reply_guarded(id, actor, text, opts, Some(guard))?.0)
+    }
+    fn reply_guarded(
+        &self,
+        id: i64,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+        guard: Option<(&str, &str)>,
+    ) -> Result<(Message, bool)> {
         self.write(|tx| {
+            if let Some((scope, stamp)) = guard {
+                let draft = self.check_composer_options_on(tx, actor, scope, text, opts, None)?;
+                let root = self.draft_scope(tx, actor, scope)?;
+                ensure!(
+                    root.is_some() && draft.reply_to.or(root) == Some(id),
+                    Conflict.error("draft_changed", "draft reply target no longer matches")
+                );
+                self.consume_composer_on(tx, actor, scope, stamp)?;
+            }
             let a = self.access_on(tx)?;
             a.actor(actor)?;
             let channel = a.message(tx, id, Action::Post)?;
@@ -481,8 +620,12 @@ impl Board {
             if !opts.labels.is_empty() {
                 a.require(Action::Label, &channel)?;
             }
-            let (m, created) = Self::insert_reply(tx, id, actor, text, opts)?;
-            Ok((a.view(tx, m)?, created))
+            let (text, mentions) = crate::actors::settle(tx, &a, actor, Some(id), text)?;
+            let (m, created) = Self::insert_reply(tx, id, actor, &text, opts)?;
+            Ok((
+                crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
+                created,
+            ))
         })
     }
     pub(crate) fn post_tx(
@@ -538,6 +681,9 @@ impl Board {
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
         validate_post(channel, actor, text, opts)?;
+        if let Some(key) = &opts.key {
+            crate::automation::authorize_callback_key(tx, actor, key)?;
+        }
         let re = parent.map(|p| p.0);
         let reply_to = parent.and_then(|(root, p)| (p != root).then_some(p));
         ensure!(
@@ -563,7 +709,6 @@ impl Board {
             );
             return Ok((original, false));
         }
-        let blocks = Self::blocks_on(tx, text)?;
         if let Some(after) = opts.after {
             let (root, _) = parent.context("after is only valid for replies")?;
             let valid: bool = tx.query_row(
@@ -588,6 +733,32 @@ impl Board {
                 )
             );
         }
+        let attached = !opts.files.is_empty() || !opts.attachment_ids.is_empty();
+        let patch = crate::policy::filter(
+            tx,
+            crate::policy::Write {
+                channel,
+                actor,
+                id: None,
+                root: re,
+                text,
+                labels: &opts.labels,
+                attached,
+                no_sync: opts.no_sync,
+            },
+        )?;
+        let (text, labels) = match &patch {
+            Some((t, l)) => (t.as_str(), l),
+            None => (text, &opts.labels),
+        };
+        if patch.is_some() {
+            validate_text(text, attached)?;
+            for (k, v) in labels {
+                validate_key(k)?;
+                validate_value(v)?;
+            }
+        }
+        let blocks = Self::blocks_on(tx, text)?;
         tx.execute("INSERT OR IGNORE INTO channels VALUES (?)", [channel])?;
         let ts = now();
         tx.execute(
@@ -596,10 +767,14 @@ impl Board {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("INSERT INTO messages(id,channel,actor,text,re,reply_to,created_at,revision,blocks) VALUES(?1,?2,?3,?4,?5,?6,?7,?1,?8)",params![id,channel,actor,text,re,reply_to,ts,serde_json::to_string(&blocks)?])?;
-        for (k, v) in &opts.labels {
+        if opts.no_sync {
+            tx.execute("INSERT INTO private_messages VALUES(?)", [id])?;
+        }
+        for (k, v) in labels {
             tx.execute("INSERT INTO labels VALUES(?,?,?)", params![id, k, v])?;
         }
         update_mentions(tx, id, text)?;
+        crate::links::capture(tx, id, channel, text)?;
         crate::files::attach(tx, id, actor, channel, opts)?;
         if let Some(key) = &opts.key {
             tx.execute(
@@ -684,16 +859,23 @@ impl Board {
         self.write(|tx| {
             let a = self.access_on(tx)?;
             let blind = a.own_post(tx, id, actor)?;
-            let m = Self::edit_tx(tx, id, actor, text, revision)?;
+            let (text, mentions) = crate::actors::settle(tx, &a, actor, Some(id), text)?;
+            let m = Self::edit_tx(tx, id, actor, &text, revision)?;
             if !blind {
-                return a.view(tx, m);
+                return Ok(crate::actors::write_view(
+                    a.view(tx, m)?,
+                    &text,
+                    mentions,
+                    false,
+                ));
             }
             let mut own = a.original(tx, id)?;
-            own.text = m.text;
+            own.text = crate::prose::redact_exact(&m.text, &own.actor);
             own.blocks = m.blocks;
             own.revision = m.revision;
             own.version = m.version;
-            Ok(own)
+            own.edited_at = m.edited_at;
+            Ok(crate::actors::write_view(own, &text, mentions, true))
         })
     }
     pub(crate) fn edit_tx(
@@ -706,6 +888,20 @@ impl Board {
         let old = Self::get_on(tx, id)?;
         may_edit(&old, actor, revision)?;
         ensure!(!old.deleted, Gone.error("deleted", "message removed"));
+        let patch = crate::policy::filter(
+            tx,
+            crate::policy::Write {
+                channel: &old.channel,
+                actor,
+                id: Some(id),
+                root: Some(old.re.unwrap_or(old.id)),
+                text,
+                labels: &old.labels,
+                attached: !old.attachments.is_empty(),
+                no_sync: old.no_sync,
+            },
+        )?;
+        let text = patch.as_ref().map_or(text, |(s, _)| s.as_str());
         validate_text(text, !old.attachments.is_empty())?;
         let blocks = Self::blocks_on(tx, text)?;
         tx.execute(
@@ -713,6 +909,7 @@ impl Board {
             params![text, serde_json::to_string(&blocks)?, id],
         )?;
         update_mentions(tx, id, text)?;
+        crate::links::capture(tx, id, &old.channel, text)?;
         Self::changed(tx, "message.edited", actor, &old, json!({}), true)?;
         if old.re.is_none() {
             crate::automation::on_root_edit(tx, id, actor)?;
@@ -799,6 +996,16 @@ impl Board {
         conditions: &BTreeMap<String, Option<String>>,
     ) -> Result<Message> {
         validate_actor(actor)?;
+        ensure!(conditions.len() <= 16, "at most 16 label conditions");
+        for (key, value) in conditions {
+            validate_label_key(key)?;
+            ensure!(
+                value
+                    .as_ref()
+                    .is_none_or(|s| s.encode_utf16().count() <= 256 && !s.contains('\0')),
+                "invalid expected label value"
+            );
+        }
         for k in set.keys().chain(unset.iter()) {
             validate_key(k)?;
         }
@@ -853,20 +1060,7 @@ impl Board {
         remove: bool,
     ) -> Result<Message> {
         validate_actor(actor)?;
-        let emoji = match emoji.trim_matches(':') {
-            "👍" | "+1" | "thumbsup" => "thumbs_up",
-            "👀" => "eyes",
-            "✅" | "white_check_mark" => "check",
-            "❤️" | "❤" => "heart",
-            "🎉" => "tada",
-            other => other,
-        };
-        ensure!(
-            !emoji.is_empty()
-                && emoji.len() <= 64
-                && !emoji.chars().any(|c| c.is_control() || c.is_whitespace()),
-            "invalid reaction"
-        );
+        let emoji = crate::reactions::normalize(emoji)?;
         let old = Self::get_on(tx, id)?;
         ensure!(!old.deleted, Gone.error("deleted", "message removed"));
         let sql = if remove {

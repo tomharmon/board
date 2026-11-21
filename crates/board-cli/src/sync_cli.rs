@@ -12,6 +12,14 @@ use std::{
 #[derive(Subcommand)]
 pub enum Sources {
     List,
+    /// Show a source's local outbound renderer, install a Rhai program, or clear it.
+    Renderer {
+        name: String,
+        #[arg(long, conflicts_with = "clear")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        clear: bool,
+    },
     /// Map an external repository, Slack channel, Linear team, or local stream to a board channel.
     Add {
         name: String,
@@ -28,6 +36,19 @@ pub enum Sources {
         name: String,
         #[arg(value_enum)]
         mode: Switch,
+    },
+    /// Change only the named settings. All mirroring is disabled by default.
+    Configure {
+        name: String,
+        #[arg(long)]
+        mirror_roots: Option<bool>,
+        #[arg(long)]
+        mirror_files: Option<bool>,
+        #[arg(long)]
+        display_authors: Option<bool>,
+        /// Choose which new GitHub conversations this source imports: all, issues, or pulls.
+        #[arg(long)]
+        github_items: Option<GithubItems>,
     },
 }
 #[derive(Clone, ValueEnum)]
@@ -54,6 +75,15 @@ pub enum Switch {
 }
 #[derive(Subcommand)]
 pub enum Sync {
+    /// Show private Slack file transfers that need attention after three unsuccessful pulls.
+    FileFailures { name: String },
+    /// Explicitly publish a Slack assistant thread status; omit STATUS to clear it.
+    Status {
+        name: String,
+        thread: String,
+        #[arg(default_value = "")]
+        status: String,
+    },
     /// Fetch one private Slack file onto its original, already-imported Board message.
     FetchFile {
         name: String,
@@ -79,10 +109,18 @@ pub enum Sync {
     Preview {
         name: String,
         thread: Option<String>,
+        #[arg(long)]
+        channel: Option<String>,
+        #[arg(long, conflicts_with = "thread")]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 15)]
+        limit: usize,
     },
     /// Explicitly join the configured public, non-shared Slack channel. Never performed by pull.
     Join {
         name: String,
+        #[arg(long)]
+        channel: Option<String>,
         #[arg(long, required = true)]
         confirm: bool,
     },
@@ -93,6 +131,12 @@ pub enum Sync {
         delivery: String,
         #[arg(default_value = "-")]
         file: PathBuf,
+        /// Verify the provider's original signature with BOARD_SYNC_<NAME>_SIGNING_SECRET.
+        #[arg(long)]
+        signature: Option<String>,
+        /// Slack's X-Slack-Request-Timestamp with a signed Slack event.
+        #[arg(long, requires = "signature")]
+        timestamp: Option<String>,
     },
     /// Queue a new provider conversation for this local thread and its existing local replies.
     Start {
@@ -211,6 +255,9 @@ pub enum Inbox {
     },
 }
 fn file<T: DeserializeOwned>(p: &Path) -> Result<T> {
+    Ok(serde_json::from_slice(&raw_file(p)?)?)
+}
+fn raw_file(p: &Path) -> Result<Vec<u8>> {
     let input: Box<dyn Read> = if p == Path::new("-") {
         Box::new(std::io::stdin())
     } else {
@@ -219,7 +266,7 @@ fn file<T: DeserializeOwned>(p: &Path) -> Result<T> {
     let mut b = Vec::new();
     input.take(2 * 1024 * 1024 + 1).read_to_end(&mut b)?;
     ensure!(b.len() <= 2 * 1024 * 1024, "input exceeds 2 MiB");
-    Ok(serde_json::from_slice(&b)?)
+    Ok(b)
 }
 fn print<T: Serialize>(v: &T, js: bool, human: impl FnOnce() -> String) -> Result<()> {
     if js {
@@ -234,6 +281,18 @@ fn dir(out: bool) -> Direction {
 }
 pub fn sources(b: &Board, a: &str, cmd: Option<Sources>, js: bool) -> Result<()> {
     let source = match cmd.unwrap_or(Sources::List) {
+        Sources::Renderer { name, file, clear } => {
+            if let Some(p) = file {
+                let body = crate::load_text(&p)?;
+                b.set_source_renderer(a, &name, Some(&body))?;
+            } else if clear {
+                b.set_source_renderer(a, &name, None)?;
+            }
+            let value = b.source_renderer(a, &name)?;
+            return print(&json!({"script":value}), js, || {
+                value.unwrap_or_else(|| "default renderer".into())
+            });
+        }
         Sources::List => {
             let list = b.sources(a)?;
             return print(&list, js, || {
@@ -258,19 +317,72 @@ pub fn sources(b: &Board, a: &str, cmd: Option<Sources>, js: bool) -> Result<()>
                 .0
         }
         Sources::Show { name } => b.source(a, &name)?,
+        Sources::Configure {
+            name,
+            mirror_roots,
+            mirror_files,
+            display_authors,
+            github_items,
+        } => b.patch_source(
+            a,
+            &name,
+            &SourcePatch {
+                outbound: None,
+                mirror_roots,
+                mirror_files,
+                display_authors,
+                github_items,
+            },
+        )?,
         Sources::Publishing { name, mode } => {
             b.set_outbound(a, &name, matches!(mode, Switch::On))?
         }
     };
     print(&source, js, || {
         format!(
-            "{}  {:?} {} -> {}  publishing {}",
-            source.name, source.provider, source.remote, source.channel, source.outbound
+            "{}  {:?} {} -> {}  publishing {}; roots {}, files {}, author names {}",
+            source.name,
+            source.provider,
+            source.remote,
+            source.channel,
+            source.outbound,
+            source.settings.mirror_roots,
+            source.settings.mirror_files,
+            source.settings.display_authors
         )
     })
 }
 pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
     match cmd {
+        Sync::FileFailures { name } => {
+            let files = b.pending_media(a, &name, true)?;
+            print(&files, js, || {
+                files
+                    .iter()
+                    .map(|f| {
+                        format!(
+                            "{} {} {}: {}",
+                            f.thread,
+                            f.external,
+                            f.file,
+                            f.error.as_deref().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Sync::Status {
+            name,
+            thread,
+            status,
+        } => {
+            let src = b.source(a, &name)?;
+            board_sync::Connector::from_env(&src)?.slack_status(b, a, &name, &thread, &status)?;
+            print(&json!({"thread":thread,"status":status}), js, || {
+                "status updated".into()
+            })
+        }
         Sync::FetchFile {
             name,
             thread,
@@ -307,22 +419,45 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
                     .join("\n")
             })
         }
-        Sync::Preview { name, thread } => {
+        Sync::Preview {
+            name,
+            thread,
+            channel,
+            cursor,
+            limit,
+        } => {
             b.require_owner()?;
             let cfg = b.source(a, &name)?;
-            let v =
-                board_sync::Connector::from_env(&cfg)?.preview(b, a, &name, thread.as_deref())?;
+            let v = board_sync::Connector::from_env(&cfg)?.preview_target(
+                b,
+                a,
+                &name,
+                thread.as_deref(),
+                channel.as_deref(),
+                cursor.as_deref(),
+                limit,
+            )?;
             print(&v, js, || {
                 serde_json::to_string_pretty(&v).unwrap_or_default()
             })
         }
-        Sync::Join { name, confirm } => {
+        Sync::Join {
+            name,
+            confirm,
+            channel,
+        } => {
             ensure!(confirm, "joining a public Slack channel requires --confirm");
             b.require_owner()?;
             let cfg = b.source(a, &name)?;
-            board_sync::Connector::from_env(&cfg)?.join_public_slack(b, a, &name)?;
-            print(&json!({"channel":cfg.remote}), js, || {
-                format!("joined {}", cfg.remote)
+            board_sync::Connector::from_env(&cfg)?.join_slack_target(
+                b,
+                a,
+                &name,
+                channel.as_deref(),
+            )?;
+            let channel = channel.unwrap_or(cfg.remote);
+            print(&json!({"channel":channel}), js, || {
+                format!("joined {channel}")
             })
         }
         Sync::Ingest {
@@ -330,8 +465,39 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
             kind,
             delivery,
             file: p,
+            signature,
+            timestamp,
         } => {
-            let id = board_sync::ingest(b, a, &name, &kind, &delivery, file(&p)?)?;
+            let cfg = b.source(a, &name)?;
+            let body = raw_file(&p)?;
+            let var = format!(
+                "BOARD_SYNC_{}_SIGNING_SECRET",
+                name.replace('-', "_").to_ascii_uppercase()
+            );
+            let secret = std::env::var(&var).ok();
+            if secret.is_some() || signature.is_some() {
+                board_sync::verify_intake(
+                    &cfg.provider,
+                    secret
+                        .as_deref()
+                        .with_context(|| format!("set {var}"))?
+                        .as_bytes(),
+                    &body,
+                    signature
+                        .as_deref()
+                        .context("source requires --signature")?,
+                    timestamp.as_deref(),
+                    chrono::Utc::now().timestamp(),
+                )?;
+            }
+            let id = board_sync::ingest(
+                b,
+                a,
+                &name,
+                &kind,
+                &delivery,
+                serde_json::from_slice(&body)?,
+            )?;
             print(&json!({"id":id}), js, || format!("queued {id}"))
         }
         Sync::Start { name, root } => {
@@ -361,8 +527,8 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
                 let r = client.pull(b, a, &name, thread.as_deref())?;
                 print(&r, js, || {
                     format!(
-                        "{} threads; {} records, {} applied, {} deferred",
-                        r.threads, r.records, r.applied, r.failed
+                        "{} threads; {} records, {} applied, {} deferred; {} files, {} file transfers deferred",
+                        r.threads, r.records, r.applied, r.failed, r.files, r.files_deferred
                     )
                 })?;
                 ensure!(
@@ -380,26 +546,42 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
             let cfg = b.source(a, &name)?;
             let client = board_sync::Connector::from_env(&cfg)?;
             let mut delivered = Vec::new();
-            while delivered.len() < limit {
+            let mut skipped = Vec::new();
+            while delivered.len() + skipped.len() < limit {
                 let Some(j) = client.send_next(b, a, &name)? else {
                     break;
                 };
-                delivered.push(j.id);
+                if j.state == "done" {
+                    delivered.push(j.id);
+                } else {
+                    skipped.push(j.id);
+                }
             }
-            print(&json!({"delivered":delivered}), js, || {
-                format!("delivered {} changes", delivered.len())
-            })
+            print(
+                &json!({"delivered":delivered,"skipped":skipped}),
+                js,
+                || {
+                    format!(
+                        "delivered {} changes, skipped {}",
+                        delivered.len(),
+                        skipped.len()
+                    )
+                },
+            )
         }
         Sync::Import { name, file: p } => {
             let m = b.import_source(a, &name, &file(&p)?)?;
             print(&m, js, || m.id.to_string())
         }
         Sync::Drain { name, limit } => {
-            let (n, f) = b.drain_source(a, &name, limit)?;
-            print(&json!({"applied":n,"failed":f}), js, || {
-                format!("{n} applied, {f} deferred")
+            let report = b.drain_source_report(a, &name, limit)?;
+            print(&report, js, || {
+                format!(
+                    "{} applied, {} skipped, {} deferred",
+                    report.applied, report.skipped, report.failed
+                )
             })?;
-            ensure!(f == 0, "some imports failed");
+            ensure!(report.failed == 0, "some imports failed");
             Ok(())
         }
         Sync::Link {
@@ -507,8 +689,13 @@ pub fn inbox(b: &Board, a: &str, cmd: Inbox, js: bool) -> Result<()> {
                 url,
                 thread,
             });
-            let m = b.finish_source(a, &name, id, &receipt, r.as_ref())?;
-            print(&m, js, || format!("acknowledged {id} -> #{}", m.id))
+            let m = b.ack_source(a, &name, id, &receipt, r.as_ref())?;
+            print(&m, js, || {
+                m.as_ref().map_or_else(
+                    || format!("acknowledged {id}"),
+                    |m| format!("acknowledged {id} -> #{}", m.id),
+                )
+            })
         }
         Inbox::Fail {
             name,

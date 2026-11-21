@@ -1,7 +1,17 @@
+mod browse;
 mod drafts;
 mod files;
+mod people;
 mod sources;
+mod templates;
+mod video;
 mod workspace;
+pub use browse::{Browse, Position};
+pub use drafts::Delivery;
+pub use files::{AttachmentPreview, Preview};
+pub use people::People;
+pub use templates::SchemaPart;
+pub use video::Clip;
 pub use workspace::{ActivityMode, Desk, TaskCommand};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -28,6 +38,7 @@ pub enum Page {
     Sources,
     Inbox,
     Profiles,
+    People,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -46,6 +57,7 @@ pub struct Properties {
     pub label_value: TextEdit,
     pub reaction: TextEdit,
     pub confirm_delete: bool,
+    pub deliveries: Vec<board_local::sources::DeliveryNotice>,
     labels_at_open: BTreeMap<String, String>,
 }
 
@@ -60,6 +72,7 @@ impl Properties {
             label_value: TextEdit::new(""),
             reaction: TextEdit::new(""),
             confirm_delete: false,
+            deliveries: Vec::new(),
             labels_at_open: message.labels.clone(),
         }
     }
@@ -72,13 +85,6 @@ impl Properties {
 }
 
 type Files = Vec<(String, Vec<u8>)>;
-struct Draft {
-    body: TextEdit,
-    destination: TextEdit,
-    reply_to: Option<i64>,
-    files: Files,
-    unsaved: bool,
-}
 
 pub struct State {
     board: Option<Board>,
@@ -92,6 +98,8 @@ pub struct State {
     pub channels: Vec<Channel>,
     pub threads: Vec<ThreadSummary>,
     pub thread: Vec<Message>,
+    pub browse: Browse,
+    pub people: People,
     pub typing: Vec<board_local::presence::Typing>,
     typing_attempt: Option<(i64, Instant)>,
     pub query: TextEdit,
@@ -101,8 +109,9 @@ pub struct State {
     pub files: Files,
     pub reply_to: Option<i64>,
     pub properties: Option<Properties>,
+    pub preview: Option<AttachmentPreview>,
     pub raw_blocks: HashSet<(i64, usize)>,
-    drafts: HashMap<(String, Page), Draft>,
+    pub delivery: Delivery,
     draft_dirty: bool,
     pub error: Option<String>,
     pub starts: Vec<i64>,
@@ -120,7 +129,11 @@ impl State {
     }
 
     pub fn open() -> Self {
-        let (board, identity, error) = match Self::connect() {
+        Self::opened(Self::connect())
+    }
+
+    fn opened(connection: Result<(Board, Option<String>)>) -> Self {
+        let (board, identity, error) = match connection {
             Ok((b, actor)) => (Some(b), actor, None),
             Err(e) => (None, None, Some(format!("{e:#}"))),
         };
@@ -137,6 +150,8 @@ impl State {
             channels: Vec::new(),
             threads: Vec::new(),
             thread: Vec::new(),
+            browse: Browse::default(),
+            people: People::default(),
             typing: Vec::new(),
             typing_attempt: None,
             query: TextEdit::new(""),
@@ -146,8 +161,9 @@ impl State {
             files: Vec::new(),
             reply_to: None,
             properties: None,
+            preview: None,
             raw_blocks: HashSet::new(),
-            drafts: HashMap::new(),
+            delivery: Delivery::default(),
             draft_dirty: false,
             starts: Vec::new(),
             older: None,
@@ -192,12 +208,15 @@ impl State {
         // Sample before reading: a concurrent writer during the load forces another refresh.
         let version = db.data_version()?;
         let channels = db.channels()?;
-        let mut filter = Filter {
-            channel: self.channel.clone(),
-            text: (!self.query.text.trim().is_empty()).then(|| self.query.text.trim().to_owned()),
-            ..Default::default()
+        let mut filter = self.browse.filter.clone();
+        filter.channel = if self.page == Page::Feed {
+            self.channel.clone()
+        } else {
+            None
         };
-        if self.tasks_only {
+        filter.text =
+            (!self.query.text.trim().is_empty()).then(|| self.query.text.trim().to_owned());
+        if self.tasks_only && self.page == Page::Feed {
             filter.labels.insert("board.task".into(), String::new());
         }
         let (threads, older) = if self.page == Page::Feed {
@@ -208,7 +227,7 @@ impl State {
             (Vec::new(), None)
         };
         let thread = match self.page {
-            Page::Thread(id) => db.thread(id)?,
+            Page::Thread(id) => self.browse.read_thread(db, id)?,
             _ => Vec::new(),
         };
         let typing = match self.page {
@@ -219,12 +238,30 @@ impl State {
                 .collect(),
             _ => Vec::new(),
         };
-        self.desk.load(db, &self.actor, self.page, self.delegated)?;
+        self.desk
+            .load(db, &self.actor, self.page, self.delegated, &filter)?;
+        if self.page == Page::People || self.people.picking {
+            self.people.rows = db.actor_directory(Some(self.people.query.text.trim()))?;
+            self.people.offset = self
+                .people
+                .offset
+                .min(self.people.rows.len().saturating_sub(1) / 30 * 30);
+        }
         self.version = version;
         self.channels = channels;
         self.threads = threads;
         self.older = older;
         self.thread = thread;
+        if let Some(p) = &mut self.properties {
+            p.deliveries = db.message_deliveries(&self.actor, p.id)?;
+        }
+        if self.preview.as_ref().is_some_and(|p| {
+            !self.thread.iter().any(|m| {
+                m.id == p.message && !m.deleted && m.attachments.iter().any(|a| a.id == p.file.id)
+            })
+        }) {
+            self.preview = None;
+        }
         self.typing = typing;
         Ok(())
     }
@@ -235,7 +272,10 @@ impl State {
             self.channels.clear();
             self.threads.clear();
             self.thread.clear();
+            self.browse.schedules.clear();
+            self.preview = None;
             self.typing.clear();
+            self.people.rows.clear();
             self.desk.clear_data();
             self.error = Some(format!("{e:#}"));
         } else if self.access_blocked {
@@ -254,58 +294,36 @@ impl State {
     pub fn go(&mut self, page: Page) {
         let mut draft_warning = None;
         self.properties = None;
+        self.preview = None;
+        self.browse.jump_open = false;
+        self.browse.filter_open = false;
+        self.people = People::default();
         if self.page != page {
-            draft_warning = self
-                .flush_draft()
-                .err()
-                .map(|e| format!("Draft not saved: {e:#}"));
+            if let Err(e) = self.flush_draft() {
+                self.error = Some(format!("Draft not saved: {e:#}"));
+                self.delivery.open = true;
+                return;
+            }
             self.clear_typing();
             self.history.push(self.page);
             if self.history.len() > 64 {
                 self.history.remove(0);
             }
             self.raw_blocks.clear();
-            if matches!(self.page, Page::Thread(_) | Page::Compose) {
-                let body = std::mem::replace(&mut self.body, TextEdit::new(""));
-                let files = std::mem::take(&mut self.files);
-                let destination =
-                    std::mem::replace(&mut self.destination, TextEdit::new("general"));
-                if !files.is_empty()
-                    || draft_warning.is_some()
-                    || self.reply_to.is_some() && body.text.is_empty()
-                {
-                    self.drafts.insert(
-                        (self.actor.clone(), self.page),
-                        Draft {
-                            body,
-                            destination,
-                            files,
-                            unsaved: draft_warning.is_some(),
-                            reply_to: self.reply_to,
-                        },
-                    );
-                }
-            }
-            let draft = self
-                .drafts
-                .remove(&(self.actor.clone(), page))
-                .unwrap_or_else(|| Draft {
-                    body: TextEdit::new(""),
-                    destination: TextEdit::new(
-                        self.channel
-                            .as_deref()
-                            .unwrap_or("general")
-                            .trim_end_matches('/'),
-                    ),
-                    reply_to: None,
-                    files: Vec::new(),
-                    unsaved: false,
-                });
-            (self.body, self.reply_to, self.files, self.destination) =
-                (draft.body, draft.reply_to, draft.files, draft.destination);
+            self.body.clear();
+            self.reply_to = None;
+            self.files.clear();
+            self.delivery = Delivery::default();
+            self.destination = TextEdit::new(
+                self.channel
+                    .as_deref()
+                    .unwrap_or("general")
+                    .trim_end_matches('/'),
+            );
             self.desk.enter(page);
+            self.browse.reset_thread();
             self.page = page;
-            if let Err(e) = self.restore_draft(draft.unsaved) {
+            if let Err(e) = self.restore_draft() {
                 self.body.clear();
                 self.reply_to = None;
                 self.files.clear();
@@ -322,55 +340,6 @@ impl State {
         let history = std::mem::take(&mut self.history);
         self.go(page);
         self.history = history;
-    }
-
-    pub fn send(&mut self, tx: &mut Tx) {
-        let options = PostOptions {
-            files: std::mem::take(&mut self.files),
-            ..Default::default()
-        };
-        let result = self.db().and_then(|db| match self.page {
-            Page::Compose => db.post(
-                self.destination.text.trim(),
-                &self.actor,
-                &self.body.text,
-                &options,
-            ),
-            Page::Thread(id) => db.reply(
-                self.reply_to.unwrap_or(id),
-                &self.actor,
-                &self.body.text,
-                &options,
-            ),
-            _ => anyhow::bail!("No active composer"),
-        });
-        match result {
-            Ok(m) => {
-                self.clear_typing();
-                self.body.clear();
-                self.reply_to = None;
-                self.draft_dirty = true;
-                let warning = self
-                    .flush_draft()
-                    .err()
-                    .map(|e| format!("Sent, but could not clear the draft: {e:#}"));
-                if self.page == Page::Compose {
-                    self.channel = Some(m.channel);
-                    self.query.clear();
-                    self.tasks_only = false;
-                    self.starts.clear();
-                }
-                self.go(Page::Thread(m.re.unwrap_or(m.id)));
-                if warning.is_some() {
-                    self.error = warning;
-                }
-                tx.scroll_to_bottom("conversation");
-            }
-            Err(e) => {
-                self.files = options.files;
-                self.error = Some(format!("{e:#}"));
-            }
-        }
     }
 
     pub fn star(&mut self, id: i64, remove: bool) {
@@ -418,6 +387,15 @@ impl State {
         if let Some(m) = self.thread.iter().find(|m| m.id == id) {
             self.properties = Some(Properties::new(m));
             self.error = None;
+            self.refresh();
+        }
+    }
+
+    pub fn copy_message_text(&mut self, id: i64, tx: &mut Tx) {
+        match self.db().and_then(|b| b.get(id)) {
+            Ok(m) if !m.deleted => tx.copy(m.text),
+            Ok(_) => self.error = Some("Message deleted".into()),
+            Err(e) => self.error = Some(e.to_string()),
         }
     }
 
@@ -497,8 +475,22 @@ impl State {
     }
 
     pub fn poll(&mut self, now: f64, tx: &mut Tx) -> bool {
+        if let Some(id) = self.browse.reveal.take() {
+            let key = format!("inspect-{id}");
+            tx.focus_when_shown(&key, true);
+            tx.scroll_into_view(key);
+        }
+        let frame_changed = if let Some(AttachmentPreview {
+            content: Preview::Clip(clip),
+            ..
+        }) = &mut self.preview
+        {
+            clip.poll(now, tx)
+        } else {
+            false
+        };
         if now < self.next_poll {
-            return false;
+            return frame_changed;
         }
         self.next_poll = now + 1.0;
         tx.wake_after(Duration::from_millis(1050));
@@ -556,7 +548,9 @@ impl State {
             return true;
         }
         match db.data_version() {
-            Ok(version) if version == self.version => draft_update || length != self.typing.len(),
+            Ok(version) if version == self.version => {
+                frame_changed || draft_update || length != self.typing.len()
+            }
             Ok(_) => {
                 self.refresh();
                 true

@@ -9,8 +9,13 @@ use serde::Deserialize;
 type Data = ApiResult<Json<Value>>;
 pub(super) fn routes() -> Router<App> {
     Router::new()
+        .route("/messages/{id}/deliveries", get(notices))
         .route("/sources", get(list).post(add))
         .route("/sources/{name}", get(one).patch(configure))
+        .route(
+            "/sources/{name}/renderer",
+            get(renderer).put(set_renderer).delete(clear_renderer),
+        )
         .route("/sources/{name}/imports", post(import))
         .route("/sources/{name}/links", put(link).get(find))
         .route("/sources/{name}/starts", post(start))
@@ -25,8 +30,43 @@ pub(super) fn routes() -> Router<App> {
         .route("/sources/{name}/deliveries/{id}/failure", post(fail))
         .route("/sources/{name}/deliveries/{id}/resolution", put(resolve))
 }
+async fn notices(State(a): State<App>, Path(id): Path<i64>) -> Data {
+    Ok(Json(
+        json!({"deliveries":a.call(move|b,u|b.message_deliveries(u,id)).await?}),
+    ))
+}
 async fn list(State(a): State<App>) -> Data {
     Ok(Json(json!({"sources":a.call(|b,u|b.sources(u)).await?})))
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Renderer {
+    script: String,
+}
+async fn renderer(State(a): State<App>, Path(n): Path<String>) -> Data {
+    Ok(Json(
+        json!({"script":a.call(move|b,u|b.source_renderer(u,&n)).await?}),
+    ))
+}
+async fn set_renderer(
+    State(a): State<App>,
+    Path(n): Path<String>,
+    Json(r): Json<Renderer>,
+) -> ApiResult<Response> {
+    let location = format!("/v1/sources/{n}/renderer");
+    let new = a
+        .call(move |b, u| b.set_source_renderer(u, &n, Some(&r.script)))
+        .await?;
+    Ok(if new {
+        created(location, json!({"created":true}))
+    } else {
+        StatusCode::NO_CONTENT.into_response()
+    })
+}
+async fn clear_renderer(State(a): State<App>, Path(n): Path<String>) -> ApiResult<StatusCode> {
+    a.call(move |b, u| b.set_source_renderer(u, &n, None))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -49,15 +89,13 @@ async fn add(State(a): State<App>, Json(i): Json<New>) -> ApiResult<Response> {
 async fn one(State(a): State<App>, Path(n): Path<String>) -> Data {
     Ok(Json(json!(a.call(move |b, u| b.source(u, &n)).await?)))
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Config {
-    outbound: bool,
-}
-async fn configure(State(a): State<App>, Path(n): Path<String>, Json(i): Json<Config>) -> Data {
+async fn configure(
+    State(a): State<App>,
+    Path(n): Path<String>,
+    Json(i): Json<SourcePatch>,
+) -> Data {
     Ok(Json(json!(
-        a.call(move |b, u| b.set_outbound(u, &n, i.outbound))
-            .await?
+        a.call(move |b, u| b.patch_source(u, &n, &i)).await?
     )))
 }
 async fn import(State(a): State<App>, Path(n): Path<String>, Json(e): Json<Envelope>) -> Data {
@@ -248,7 +286,7 @@ struct Ack {
 }
 async fn ack(State(a): State<App>, Path((n, id)): Path<(String, i64)>, Json(i): Json<Ack>) -> Data {
     Ok(Json(json!(
-        a.call(move |b, u| b.finish_source(u, &n, id, &i.receipt, i.result.as_ref()))
+        a.call(move |b, u| b.ack_source(u, &n, id, &i.receipt, i.result.as_ref()))
             .await?
     )))
 }

@@ -1,6 +1,6 @@
 use super::*;
 
-fn repo(s: &Source) -> Result<String> {
+pub(super) fn repo(s: &Source) -> Result<String> {
     let p = s.remote.split('/').collect::<Vec<_>>();
     ensure!(
         p.len() == 2
@@ -19,6 +19,24 @@ fn num(s: &str) -> Result<u64> {
         .filter(|n| *n > 0)
         .context("expected a positive GitHub issue or comment number")
 }
+pub(super) fn issue_number(src: &Source, target: &str) -> Result<u64> {
+    if !target.contains("://") {
+        return num(target.trim_start_matches('#'));
+    }
+    let u = provider_url(target, "github.com")?;
+    let p: Vec<_> = u
+        .path_segments()
+        .unwrap()
+        .filter(|p| !p.is_empty())
+        .collect();
+    ensure!(
+        p.len() >= 4
+            && matches!(p[2], "issues" | "pull")
+            && format!("{}/{}", p[0], p[1]).eq_ignore_ascii_case(&src.remote),
+        "issue link is outside the configured repository"
+    );
+    num(p[3])
+}
 fn user(v: &Value) -> String {
     v["user"]["id"]
         .as_u64()
@@ -26,6 +44,35 @@ fn user(v: &Value) -> String {
         .unwrap_or_else(|| "ghost".into())
 }
 impl Connector {
+    pub(super) fn github_preview_page(
+        &self,
+        src: &Source,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        let page = num(cursor.unwrap_or("1"))?;
+        let v = self.req(
+            Method::GET,
+            &format!("{}/issues", repo(src)?),
+            &[
+                ("state", "all".into()),
+                ("sort", "created".into()),
+                ("direction", "asc".into()),
+                ("per_page", limit.to_string()),
+                ("page", page.to_string()),
+            ],
+            None,
+        )?;
+        let issues = v.as_array().context("expected GitHub issue list")?;
+        let rows = issues
+            .iter()
+            .map(|v| id(v, "number"))
+            .collect::<Result<Vec<_>>>()?;
+        let records=issues.iter().map(|v|json!({"thread":v["number"],"title":v["title"],"text":v["body"].as_str().unwrap_or("").chars().take(1500).collect::<String>(),"url":v["html_url"],"state":v["state"],"author":v["user"]["login"],"replies":v["comments"]})).collect::<Vec<_>>();
+        Ok(
+            json!({"threads":rows,"records":records,"next":(rows.len()==limit).then(||page.saturating_add(1).to_string())}),
+        )
+    }
     fn gh_pages(&self, path: &str, query: &[(&str, String)]) -> Result<Vec<Value>> {
         let mut out = Vec::new();
         for page in 1..=1000 {
@@ -70,13 +117,21 @@ impl Connector {
         }
         Ok(out.into_iter().collect())
     }
-    pub(super) fn github_read(&self, src: &Source, thread: &str) -> Result<Vec<Envelope>> {
+    pub(super) fn github_read(
+        &self,
+        src: &Source,
+        thread: &str,
+        already_linked_or_preview: bool,
+    ) -> Result<Vec<Envelope>> {
         let n = num(thread)?;
         let t = n.to_string();
         let base = repo(src)?;
         let path = format!("{base}/issues/{n}");
         let issue = self.req(Method::GET, &path, &[], None)?;
         let is_pr = !issue["pull_request"].is_null();
+        if !already_linked_or_preview && !src.settings.github_items.includes(is_pr) {
+            return Ok(Vec::new());
+        }
         let pr = if is_pr {
             Some(self.req(Method::GET, &format!("{base}/pulls/{n}"), &[], None)?)
         } else {

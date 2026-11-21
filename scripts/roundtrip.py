@@ -129,12 +129,14 @@ def exercise(path, bindir):
     # Neither the API nor the original inspector is running during this read/backup.
     assert command("read", str(root["id"]))["replies"] == [reply]
     command("backup", str(path / "backup.sqlite3"))
+    restored = command("--db", str(path / "backup.sqlite3"), "read", str(reply["id"]))
+    assert restored["message"] == root and restored["replies"] == [reply]
     with server() as request:
         status, _, persisted = request("GET", f"/threads/{reply['id']}")
         assert status == 200 and persisted["message"] == root and persisted["replies"] == [reply]
     subprocess.run(rune("restarted"), env=env, check=True, capture_output=True, timeout=45)
     visible("restarted")
-    print("Fresh CLI, REST server and Rune processes read the same persisted thread. Online backup written.")
+    print("Fresh CLI, REST server and Rune processes read the same persisted thread. Restored the thread from the online backup.")
 
 
 def main():

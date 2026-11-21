@@ -6,7 +6,7 @@ use board_local::{
 };
 
 #[test]
-fn grant_batches_are_atomic_replayable_and_owner_only() -> Result<()> {
+fn grant_batches_are_atomic_replayable_and_hidden_from_readers() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("policy.sqlite3");
     let b = Board::open(&path)?;
@@ -107,7 +107,7 @@ fn grant_batches_are_atomic_replayable_and_owner_only() -> Result<()> {
 }
 
 #[test]
-fn channel_rules_union_per_grant_intersect_caps_and_refresh_live() -> Result<()> {
+fn channel_rules_intersect_caps_refresh_live_and_filter_before_paging() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.sqlite3");
     let mut b = Board::open(&path)?;
@@ -366,6 +366,9 @@ fn reading_imported_text_and_people_does_not_reveal_connector_receipts() -> Resu
     let envelope = Envelope {
         key: "opaque-delivery-receipt".into(),
         import: Import {
+            links: Vec::new(),
+            no_sync: false,
+            mentioned: Default::default(),
             thread: "private-thread-id".into(),
             external: "sensitive-external-key".into(),
             author: "27".into(),

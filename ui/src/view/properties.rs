@@ -232,6 +232,7 @@ fn editor(p: &Properties) -> El {
 }
 
 pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
+    let id = m.id;
     let mut panel = col()
         .w_full()
         .px(inset)
@@ -254,16 +255,54 @@ pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
                 ),
         )
         .child(
-            mono(format!("@{}    Revision {}", m.actor, m.revision), MUTED)
+            row()
                 .w_full()
-                .wrap_anywhere(),
+                .center_y()
+                .gap(6.0)
+                .child(
+                    mono(format!("@{}    Revision {}", m.actor, m.revision), MUTED)
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .wrap_anywhere(),
+                )
+                .child(
+                    tool("copy-message-id", "Copy message ID", &glyphs::COPY)
+                        .on_press_tx(move |_: &mut State, tx| tx.copy(id.to_string())),
+                )
+                .child(
+                    tool("copy-message-body", "Copy message text", &glyphs::FILE_TEXT)
+                        .disabled(m.deleted)
+                        .on_press_tx(move |s: &mut State, tx| s.copy_message_text(id, tx)),
+                ),
         );
+    for j in &p.deliveries {
+        panel = panel.child(
+            mono(
+                format!(
+                    "{}   {}   {}   Attempts: {}",
+                    j.source, j.event, j.state, j.attempts
+                ),
+                MUTED,
+            )
+            .key(format!("delivery-notice-{}", j.id))
+            .w_full()
+            .wrap_anywhere(),
+        );
+    }
     if m.deleted {
         return scroll(
             "details-scroll",
             panel.child(label("Message deleted", 15.0, 500.0, MUTED)),
         );
     }
+    panel = panel.child(
+        action("guard-reply", "Reply only if still newest", false)
+            .help(format!(
+                "Reply only if #{} remains the newest message in this thread",
+                id
+            ))
+            .on_press_tx(move |s: &mut State, tx| s.guard_reply(id, tx)),
+    );
     let can_edit = board_local::owned_by(&m.actor, &s.actor);
     let tabs: &[&str] = if can_edit {
         &["Labels", "Reactions", "Edit"]

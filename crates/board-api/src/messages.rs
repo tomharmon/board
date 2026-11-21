@@ -13,15 +13,17 @@ type Data = ApiResult<Json<Value>>;
 pub(super) struct ChannelQuery {
     after: Option<String>,
     scope: Option<String>,
+    prefix: Option<String>,
     limit: Option<usize>,
 }
 pub(super) async fn channels(State(a): State<App>, Query(q): Query<ChannelQuery>) -> Data {
     let (cursor, rows, next) = a
         .call(move |b, _| {
-            b.channel_page(
+            b.channels_window(
                 q.after.as_deref().unwrap_or(""),
                 q.scope.as_deref(),
-                q.limit.unwrap_or(50),
+                q.prefix.as_deref(),
+                q.limit.unwrap_or(100),
             )
         })
         .await?;
@@ -36,16 +38,38 @@ pub(super) async fn one_channel(State(a): State<App>, Path(name): Path<String>) 
 #[serde(deny_unknown_fields)]
 pub(super) struct ActorQuery {
     query: Option<String>,
-    id: Option<String>,
     #[serde(default)]
     details: bool,
 }
-pub(super) async fn actors(State(a): State<App>, Query(q): Query<ActorQuery>) -> Data {
+fn actor_query(raw: Option<String>) -> ApiResult<(ActorQuery, std::collections::BTreeSet<String>)> {
+    let mut ids = std::collections::BTreeSet::new();
+    let mut count = 0;
+    let mut scalars = url::form_urlencoded::Serializer::new(String::new());
+    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes()) {
+        if k == "id" {
+            count += 1;
+            if count > 100 || board_local::validate_actor(&v).is_err() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "at most 100 valid actor IDs",
+                ));
+            }
+            ids.insert(v.into_owned());
+        } else {
+            scalars.append_pair(&k, &v);
+        }
+    }
+    let q = serde_urlencoded::from_str(&scalars.finish())
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid actors query"))?;
+    Ok((q, ids))
+}
+pub(super) async fn actors(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
+    let (q, ids) = actor_query(raw)?;
     let rows = a
         .call(move |b, _| {
             let mut rows = b.actor_directory(q.query.as_deref())?;
-            if let Some(id) = q.id {
-                rows.retain(|a| a.id == id);
+            if !ids.is_empty() {
+                rows.retain(|a| ids.contains(&a.id));
             }
             Ok(rows)
         })
@@ -61,13 +85,16 @@ pub(super) async fn actors(State(a): State<App>, Query(q): Query<ActorQuery>) ->
 pub(super) struct ActorProfile {
     handle: String,
     name: String,
+    avatar: Option<String>,
 }
 pub(super) async fn save_profile(
     State(a): State<App>,
     Json(p): Json<ActorProfile>,
 ) -> ApiResult<StatusCode> {
-    a.call(move |b, who| b.set_actor_profile(who, &p.handle, &p.name))
-        .await?;
+    a.call(move |b, who| {
+        b.set_actor_profile_with_avatar(who, &p.handle, &p.name, p.avatar.as_deref())
+    })
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Deserialize)]
@@ -97,6 +124,7 @@ pub(super) async fn channel(
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Browse {
     channel: Option<String>,
+    from: Option<String>,
     text: Option<String>,
     by: Option<String>,
     mentions: Option<String>,
@@ -117,6 +145,7 @@ impl Browse {
         Ok((
             Filter {
                 channel: self.channel,
+                from: self.from,
                 text: self.text,
                 by: self.by,
                 mentions: self.mentions,
@@ -148,12 +177,7 @@ fn query_terms<T: serde::de::DeserializeOwned>(raw: Option<String>) -> ApiResult
     Ok((q, labels))
 }
 fn resolve_me(f: &mut Filter, who: &str) {
-    if f.by.as_deref() == Some("me") {
-        f.by = Some(who.into());
-    }
-    if matches!(f.mentions.as_deref(), Some("" | "me")) {
-        f.mentions = Some(who.into());
-    }
+    f.bind_actor(who);
 }
 pub(super) async fn threads(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
     let (q, terms) = query_terms::<Browse>(raw)?;
@@ -218,6 +242,8 @@ pub(super) async fn message(State(a): State<App>, Path(id): Path<i64>) -> Data {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NewMessage {
+    #[serde(default)]
+    no_sync: bool,
     channel: Option<String>,
     reply_to: Option<i64>,
     #[serde(default)]
@@ -262,6 +288,7 @@ pub(super) async fn post_message(
         .call(move |b, actor| {
             let files = decode_files(input.attachments)?;
             let opts = PostOptions {
+                no_sync: input.no_sync,
                 key,
                 after: input.after,
                 labels: input.labels,
@@ -369,6 +396,7 @@ pub(super) async fn attachment(
 #[serde(deny_unknown_fields)]
 pub(super) struct EventQuery {
     after: Option<i64>,
+    from: Option<String>,
     limit: Option<usize>,
     channel: Option<String>,
     re: Option<i64>,
@@ -414,6 +442,7 @@ pub(super) async fn events(
         before: None,
         limit: q.limit,
         channel: q.channel,
+        from: q.from,
         re: q.re,
         by: q.by,
         text: q.text,
@@ -478,13 +507,7 @@ pub(super) async fn schemas(State(a): State<App>) -> Data {
     Ok(Json(json!({"schemas":a.call(|b,_|b.schemas()).await?})))
 }
 pub(super) async fn schema(State(a): State<App>, Path((name, v)): Path<(String, u32)>) -> Data {
-    let schemas = a.call(|b, _| b.schemas()).await?;
-    Ok(Json(json!(
-        schemas
-            .into_iter()
-            .find(|s| s.name == name && s.version == v)
-            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "schema not found"))?
-    )))
+    Ok(Json(json!(a.call(move |b, _| b.schema(&name, v)).await?)))
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -499,12 +522,18 @@ pub(super) async fn register_schema(
     Json(i): Json<SchemaInput>,
 ) -> ApiResult<Response> {
     let location = format!("/v1/schemas/{name}/{v}");
-    let new = a
-        .call(move |b, actor| b.register_schema_as(&name, v, &i.description, &i.schema, actor))
+    let (new, schema) = a
+        .call(move |b, actor| {
+            Ok((
+                b.register_schema_as(&name, v, &i.description, &i.schema, actor)?,
+                b.schema(&name, v)?,
+            ))
+        })
         .await?;
+    let reply = json!({"created":new,"schema":schema});
     Ok(if new {
-        created(location, json!({"created":true}))
+        created(location, reply)
     } else {
-        StatusCode::NO_CONTENT.into_response()
+        Json(reply).into_response()
     })
 }

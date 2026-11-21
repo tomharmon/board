@@ -79,8 +79,12 @@ fn prose_tokens_exact_actor_directory_visibility_and_aliases_respect_scope() -> 
     );
     assert_eq!(
         mentioned(&viewer, "sam")?,
-        [first.id],
-        "a scoped reader matches literal terms, not alternate names"
+        [first.id, second.id],
+        "both writers' @dispatch mentions were stored using the resolved ID"
+    );
+    assert!(
+        mentioned(&viewer, "dispatch")?.is_empty(),
+        "the scoped reader cannot expand an alias through the global directory"
     );
     let directory = viewer.actor_directory(None)?;
     assert!(
@@ -101,7 +105,7 @@ fn prose_tokens_exact_actor_directory_visibility_and_aliases_respect_scope() -> 
         "a typed unknown bracket is not an identity registration"
     );
     b.edit(first.id, "ann", "formerly known", None)?;
-    assert!(!viewer.actor_directory(None)?.iter().any(|a| a.id == "sam"));
+    assert!(viewer.actor_directory(None)?.iter().any(|a| a.id == "sam"));
     let words = Filter {
         mentions: Some("sam".into()),
         ..Default::default()
@@ -112,7 +116,9 @@ fn prose_tokens_exact_actor_directory_visibility_and_aliases_respect_scope() -> 
             .iter()
             .any(|e| e.message.as_ref().is_some_and(|m| m.id == second.id))
     );
-    assert!(viewer.event_tail(100, &words)?.1.is_empty());
+    assert!(!viewer.event_tail(100, &words)?.1.is_empty());
+    b.edit(second.id, "ann", "formerly mentioned here too", None)?;
+    assert!(!viewer.actor_directory(None)?.iter().any(|a| a.id == "sam"));
     b.set_grant("admin", None, "blind", &Rules::parse("dev=post")?)?;
     let mut blind = Board::open(&path)?;
     blind.bind_token(&b.issue_credential("admin", "blind", None, None)?.token)?;

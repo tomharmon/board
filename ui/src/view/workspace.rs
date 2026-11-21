@@ -24,6 +24,7 @@ pub(super) fn name(page: Page, s: &State) -> String {
         Page::Sources => "Sources".into(),
         Page::Inbox => "Inbox".into(),
         Page::Profiles => "Profiles".into(),
+        Page::People => "People".into(),
     }
 }
 
@@ -36,7 +37,7 @@ fn seg(labels: &[&str], selected: usize, name: &str, key: &str, pick: fn(&mut St
         .key(key)
 }
 
-fn field(
+pub(super) fn field(
     key: &str,
     name: &str,
     value: &TextEdit,
@@ -173,7 +174,7 @@ fn pager(s: &State) -> El {
                 }),
         )
 }
-fn utc(ts: i64) -> String {
+pub(super) fn utc(ts: i64) -> String {
     chrono::DateTime::from_timestamp(ts, 0).map_or_else(
         || ts.to_string(),
         |t| t.format("%Y-%m-%d %H:%M UTC").to_string(),
@@ -209,11 +210,19 @@ fn activity(s: &State) -> El {
             },
         ));
     if d.mode == ActivityMode::Messages {
+        panel = panel.child(
+            row()
+                .w_full()
+                .center_y()
+                .gap(8.0)
+                .child(filters::summary(s).grow(1.0).min_w(0.0))
+                .child(filters::button()),
+        );
         if d.messages.is_empty() {
             panel = panel.child(empty("No messages yet"));
         }
         for m in &d.messages {
-            let root = m.re.unwrap_or(m.id);
+            let id = m.id;
             panel = panel.child(
                 col()
                     .key(format!("activity-message-{}", m.id))
@@ -226,7 +235,12 @@ fn activity(s: &State) -> El {
                             .w_full()
                             .center_y()
                             .gap(8.0)
-                            .child(label(&m.actor, 14.0, 600.0, INK).max_w(130.0).truncate())
+                            .child(
+                                label(author(m), 14.0, 600.0, INK)
+                                    .max_w(130.0)
+                                    .truncate()
+                                    .help(&m.actor),
+                            )
                             .child(
                                 mono(format!("#{}  #{}", m.channel, m.id), MUTED)
                                     .grow(1.0)
@@ -239,7 +253,7 @@ fn activity(s: &State) -> El {
                                     "Open thread",
                                     &glyphs::ARROW_RIGHT,
                                 )
-                                .on_press(move |s: &mut State| s.go(Page::Thread(root))),
+                                .on_press(move |s: &mut State| s.open_message_thread(id)),
                             ),
                     )
                     .child(rich::body(s, m))
@@ -319,12 +333,12 @@ fn activity(s: &State) -> El {
                     .wrap_anywhere(),
                 );
             if let Some(m) = &e.message {
-                let root = m.re.unwrap_or(m.id);
+                let id = m.id;
                 entry = entry.child(listrow(
                     &format!("open-event-{}", e.cursor),
                     message_text(m),
                     &format!("#{}  #{}", m.channel, m.id),
-                    move |s| s.go(Page::Thread(root)),
+                    move |s| s.open_message_thread(id),
                 ));
             } else if e.payload.as_object().is_some_and(|o| !o.is_empty()) {
                 entry = entry.child(

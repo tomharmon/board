@@ -101,6 +101,7 @@ fn start(
         .env_remove("BOARD_REQUEST_TOKEN")
         .env_remove("BOARD_CLAIM_TOKEN")
         .env_remove("BOARD_CLAIM_EPOCH")
+        .env_remove("BOARD_CALLBACK_TOKEN")
         .env_remove("BOARD_DELIVERY_RECEIPT");
     let (person, profile) = actor
         .split_once('/')
@@ -243,10 +244,12 @@ pub(super) fn watch(
         };
         let cursor = d.event.cursor;
         let bytes = serde_json::to_vec(&d.event)?;
+        let capability = board_local::automation::start_callback(b, name, cursor, &d.receipt)?;
         let started = start(argv, json, db, &who, |c| {
             c.stdin(Stdio::piped())
                 .env("BOARD_WATCHER", name)
                 .env("BOARD_TRIGGER", &d.trigger)
+                .env("BOARD_CALLBACK_TOKEN", &capability)
                 .env("BOARD_ATTEMPT", d.attempt.to_string());
         });
         let (code, err) = if let Ok(mut job) = started {

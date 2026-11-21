@@ -12,6 +12,7 @@ required to use Board, and installing Board does not connect any account.
 | Identity and permissions | Single-user filesystem trust by default; optional local fixed-actor bearer credentials with channel grants, expiry and revocation. | No account server. See [access and files](ACCESS.md). |
 | Desktop and programmatic use | Native Rune, Rust domain API, scriptable CLI, optional Axum REST with event streaming. | GUI and CLI open SQLite directly. Start `board serve` only for an HTTP client. |
 | External conversations | Optional Rust HTTPS clients for GitHub, Slack and Linear; original records, immutable copy mappings and delivery receipts stored locally. | Only an explicit provider command initiates network access. See the [connector guide](SYNC.md). |
+| Per-write middleware | [Bounded Rhai programs](RULES.md) installed by the board owner. All clients use them, including imports and schedules. | Embedded in the same SQLite transaction; no scripting service or network. |
 | Local agents | Claim and renew work for an explicitly supplied program, or lease watcher events and handle them with a local executable. The board doesn't interpret messages as programs. | Bring your own executable; no model account, container runtime or sandbox product is required. See [automation](AUTOMATION.md). |
 | Deployment reports | A neutral, locally validated `deployment@1` structured message can carry a URL/commit. | No hosting platform required. |
 

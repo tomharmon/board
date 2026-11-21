@@ -40,6 +40,45 @@ fn board() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 #[test]
+fn dash_prefixed_base64url_claim_proofs_are_values_not_cli_options() {
+    let (_dir, db) = board();
+    let proof = format!("-{}", "A".repeat(42));
+    let created = ok(
+        &db,
+        &[
+            "tasks", "create", "ops", "first", "--claim", "--token", &proof,
+        ],
+    );
+    assert_eq!(created["claim_token"], proof);
+    let id = created["id"].to_string();
+    assert_eq!(
+        ok(&db, &["tasks", "recover", "--token", &proof])["id"],
+        created["id"]
+    );
+    assert_eq!(
+        ok(
+            &db,
+            &["tasks", "release", &id, "--epoch", "1", "--token", &proof]
+        )["state"],
+        "ready"
+    );
+    let more = format!("-{}", "B".repeat(42));
+    assert_eq!(
+        ok(&db, &["tasks", "claim", &id, "--token", &more])["epoch"],
+        2
+    );
+    assert_eq!(
+        ok(
+            &db,
+            &[
+                "tasks", "block", &id, "hold", "--epoch", "2", "--token", &more
+            ]
+        )["state"],
+        "blocked"
+    );
+}
+
+#[test]
 fn failed_ack_after_cli_claim_commit_recovers_pending_proof_without_sharing_profiles() {
     let (d, db) = board();
     let first = ok(
@@ -311,4 +350,74 @@ fn explicit_watcher_handler_receives_json_renews_and_retries_without_self_trigge
                 m.text == format!("processed by triage:{}", done["trigger"].as_str().unwrap())
             })
     }));
+}
+
+#[cfg(unix)]
+#[test]
+fn retrying_a_handler_emits_each_post_reply_task_and_named_output_once() {
+    let (_dir, db) = board();
+    ok(
+        &db,
+        &["watchers", "add", "bot", "in", "--kind", "message.posted"],
+    );
+    let id = ok(&db, &["post", "in", "source"])["message"]["id"].to_string();
+    let run = || {
+        command(
+            &db,
+            &[
+                "watchers",
+                "run",
+                "bot",
+                "--once",
+                "--",
+                "sh",
+                "-ec",
+                r#"
+        "$BOARD_BIN" post work "unkeyed output"
+        "$BOARD_BIN" reply "$INPUT" "reply output"
+        "$BOARD_BIN" tasks create work "task output"
+        "$BOARD_BIN" post work "named output" --idempotency-key same-name
+        if [ "$BOARD_ATTEMPT" = 1 ]; then exit 7; fi
+        "#,
+            ],
+        )
+        .env("BOARD_BIN", env!("CARGO_BIN_EXE_board"))
+        .env("INPUT", &id)
+        .output()
+        .unwrap()
+    };
+    assert_eq!(run().status.code(), Some(7));
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(run().status.success());
+    let b = board_local::Board::open(&db).unwrap();
+    let events = b
+        .events(0, 100)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "message.posted" && e.actor == "ada/bot")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 4);
+    assert_eq!(
+        board_local::automation::list_tasks(&b, None, None)
+            .unwrap()
+            .len(),
+        1
+    );
+    // A callback's explicit name does not steal an ordinary client's key.
+    assert!(
+        command(
+            &db,
+            &[
+                "post",
+                "work",
+                "ordinary key",
+                "--idempotency-key",
+                "same-name"
+            ]
+        )
+        .output()
+        .unwrap()
+        .status
+        .success()
+    );
 }

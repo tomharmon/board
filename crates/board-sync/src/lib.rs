@@ -3,8 +3,11 @@ mod github;
 mod intake;
 mod linear;
 mod media;
+mod signed;
 mod slack;
+mod slack_text;
 pub use intake::ingest;
+pub use signed::verify_intake;
 #[cfg(test)]
 mod tests;
 
@@ -32,7 +35,10 @@ pub struct PollReport {
     pub threads: usize,
     pub records: usize,
     pub applied: usize,
+    pub skipped: usize,
     pub failed: usize,
+    pub files: usize,
+    pub files_deferred: usize,
 }
 #[derive(Debug)]
 struct HttpStatus(u16, Option<i64>);
@@ -67,6 +73,15 @@ fn key(input: &Import) -> String {
         Sha256::digest(serde_json::to_vec(input).expect("serializable normalized event"))
     )
 }
+fn utf16_prefix(s: &str, mut units: usize) -> &str {
+    for (i, c) in s.char_indices() {
+        if c.len_utf16() > units {
+            return &s[..i];
+        }
+        units -= c.len_utf16();
+    }
+    s
+}
 fn envelope(mut import: Import, raw: Value) -> Envelope {
     let profile = raw
         .get("user")
@@ -88,11 +103,15 @@ fn envelope(mut import: Import, raw: Value) -> Envelope {
                 .map(str::to_owned),
         });
     }
-    if let Change::Upsert { text, .. } = &mut import.change
-        && text.chars().count() > 10_000
+    if let Change::Post { text, .. }
+    | Change::Upsert { text, .. }
+    | Change::Reconcile { text, .. }
+    | Change::Edit { text } = &mut import.change
+        && text.encode_utf16().count() > 10_000
     {
         let marker = "\n[truncated; original in connector inbox]";
-        *text = text.chars().take(10_000 - marker.len()).collect::<String>() + marker;
+        text.truncate(utf16_prefix(text, 10_000 - marker.len()).len());
+        text.push_str(marker);
     }
     Envelope {
         key: key(&import),
@@ -113,6 +132,9 @@ fn upsert(
     text: String,
 ) -> Import {
     Import {
+        links: Vec::new(),
+        no_sync: false,
+        mentioned: Default::default(),
         thread: thread.into(),
         external,
         author,
@@ -134,26 +156,39 @@ fn labels(m: &mut Import, fields: &[(&str, &str)]) {
     }
 }
 fn property(m: &mut Import, prefix: &str, name: &str) {
-    let slug = name
-        .trim()
-        .to_ascii_lowercase()
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    let slug = slug.trim_matches('-');
+    let slug = property_slug(name);
     if !slug.is_empty() {
         let key = format!(
             "{prefix}.{}",
             slug.chars().take(63 - prefix.len()).collect::<String>()
         );
-        labels(m, &[(&key, "")]);
+        let value: String = name.chars().filter(|c| !c.is_control()).collect();
+        labels(m, &[(&key, utf16_prefix(&value, 256))]);
     }
+}
+fn property_slug(name: &str) -> String {
+    let normalizer = icu_normalizer::DecomposingNormalizerBorrowed::new_nfkd();
+    let mut result = String::new();
+    let mut separator = false;
+    for c in normalizer
+        .normalize_iter(name.chars())
+        .filter(|c| !('\u{300}'..='\u{36f}').contains(c))
+        .flat_map(char::to_lowercase)
+    {
+        if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+            if separator {
+                result.push('-');
+                separator = false;
+            }
+            result.push(c);
+        } else {
+            separator = true;
+        }
+    }
+    result
+        .trim_start_matches(['-', '_', '.'])
+        .trim_end_matches('-')
+        .to_owned()
 }
 fn content(prefix: &str, body: &Value) -> String {
     let body = body.as_str().unwrap_or("").trim();
@@ -214,24 +249,95 @@ fn endpoint(provider: &Provider) -> Result<&'static str> {
         Provider::Local => bail!("a local source uses inbox import, not a provider connection"),
     }
 }
+/// Parse a provider link for its identifier only. Never use this URL as a request destination.
+fn provider_url(raw: &str, host: &str) -> Result<reqwest::Url> {
+    let u = reqwest::Url::parse(raw)?;
+    ensure!(
+        u.scheme() == "https"
+            && u.host_str() == Some(host)
+            && u.port_or_known_default() == Some(443)
+            && u.username().is_empty()
+            && u.password().is_none(),
+        "expected an HTTPS link on {host}"
+    );
+    Ok(u)
+}
 impl Connector {
     /// Preview an explicitly configured source; neither a read nor a channel join creates Board records.
     pub fn preview(&self, b: &Board, who: &str, name: &str, thread: Option<&str>) -> Result<Value> {
+        self.preview_target(b, who, name, thread, None, None, 15)
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub fn preview_target(
+        &self,
+        b: &Board,
+        who: &str,
+        name: &str,
+        thread: Option<&str>,
+        channel: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
         b.require_owner()?;
-        let src = b.source(who, name)?;
+        let mut src = b.source(who, name)?;
+        ensure!(
+            src.provider == self.provider
+                && (1..=100).contains(&limit)
+                && cursor.is_none_or(|s| s.len() <= 1024 && !s.chars().any(char::is_control)),
+            "invalid preview options"
+        );
+        if self.provider == Provider::Slack {
+            let (ch, at) = match thread {
+                Some(raw)
+                    if let Some((ch, ts, parent)) = board_local::links::slack_address(raw) =>
+                {
+                    (Some(ch), Some(parent.unwrap_or(ts)))
+                }
+                Some(raw) if let Some((ch, ts)) = raw.split_once(':') => {
+                    slack::ts(ts)?;
+                    (Some(ch.to_owned()), Some(ts.to_owned()))
+                }
+                Some(raw) if raw.starts_with('#') || raw.starts_with('C') => {
+                    (Some(raw.to_owned()), None)
+                }
+                Some(raw) => {
+                    slack::ts(raw)?;
+                    (None, Some(raw.to_owned()))
+                }
+                None => (None, None),
+            };
+            ensure!(
+                ch.is_none() || channel.is_none(),
+                "specify the channel only once"
+            );
+            let info =
+                self.public_slack_channel(ch.as_deref().or(channel).unwrap_or(&src.remote))?;
+            ensure!(
+                info["is_member"] == true,
+                "the Slack app is not a member of this public channel"
+            );
+            src.remote = id(&info, "id")?;
+            return self.slack_preview_page(&src, at.as_deref(), cursor, limit);
+        }
+        ensure!(
+            channel.is_none(),
+            "--channel applies only to Slack previews"
+        );
+        if self.provider == Provider::Linear {
+            return self.linear_preview(&src, thread, cursor, limit);
+        }
+        ensure!(
+            thread.is_none() || cursor.is_none(),
+            "a provider thread is read as a whole; a cursor pages the listing"
+        );
         match (&self.provider, thread) {
-            (Provider::Github, Some(t)) => Ok(
-                json!({"records":order(self.github_read(&src,t)?)?.into_iter().map(|v|v.import).collect::<Vec<_>>()}),
-            ),
-            (Provider::Slack, Some(t)) => Ok(
-                json!({"records":order(self.slack_read(&src,t)?)?.into_iter().map(|v|v.import).collect::<Vec<_>>()}),
-            ),
-            (Provider::Linear, Some(t)) => Ok(
-                json!({"records":order(self.linear_read(&src,t)?)?.into_iter().map(|v|v.import).collect::<Vec<_>>()}),
-            ),
-            (Provider::Github, None) => Ok(json!({"threads":self.github_threads(&src,None)?})),
-            (Provider::Slack, None) => Ok(json!({"threads":self.slack_threads(&src)?})),
-            (Provider::Linear, None) => Ok(json!({"threads":self.linear_threads(&src,None)?})),
+            (Provider::Github, Some(t)) => {
+                let n = github::issue_number(&src, t)?;
+                Ok(
+                    json!({"records":order(self.github_read(&src,&n.to_string(),true)?)?.into_iter().map(|v|v.import).collect::<Vec<_>>()}),
+                )
+            }
+            (Provider::Github, None) => self.github_preview_page(&src, cursor, limit),
             _ => bail!("not a network source"),
         }
     }
@@ -352,11 +458,18 @@ impl Connector {
         let mut report = PollReport::default();
         for t in threads {
             let events = match source.provider {
-                Provider::Github => self.github_read(&source, &t)?,
+                Provider::Github => self.github_read(
+                    &source,
+                    &t,
+                    board.find_source(actor, name, &t, None)?.is_some(),
+                )?,
                 Provider::Slack => self.slack_read(&source, &t)?,
                 Provider::Linear => self.linear_read(&source, &t)?,
                 Provider::Local => unreachable!(),
             };
+            if events.is_empty() {
+                continue;
+            }
             let items = order(events)?;
             for batch in items.chunks(200) {
                 board.enqueue_imports(actor, name, batch, None)?;
@@ -378,11 +491,31 @@ impl Connector {
         }
         // Queue data is safe even if processing fails or the process stops after checkpointing.
         loop {
-            let (ok, fail) = board.drain_source(actor, name, 500)?;
-            report.applied += ok;
-            report.failed += fail;
-            if ok + fail < 500 {
+            let batch = board.drain_source_report(actor, name, 500)?;
+            report.applied += batch.applied;
+            report.failed += batch.failed;
+            report.skipped += batch.skipped;
+            if batch.processed() < 500 {
                 break;
+            }
+        }
+        if source.provider == Provider::Slack && source.settings.mirror_files {
+            for item in board.pending_media(actor, name, false)? {
+                match self.fetch_file_limit(
+                    board,
+                    actor,
+                    name,
+                    &item.thread,
+                    &item.external,
+                    &item.file,
+                    25 * 1024 * 1024,
+                ) {
+                    Ok(_) => report.files += 1,
+                    Err(e) => {
+                        board.record_media_failure(actor, name, &item, &e.to_string())?;
+                        report.files_deferred += 1;
+                    }
+                }
             }
         }
         Ok(report)
@@ -400,7 +533,12 @@ impl Connector {
         let Some(l) = b.lease_source(who, name, Direction::Out, 120)? else {
             return Ok(None);
         };
-        let d: Delivery = serde_json::from_value(l.job.payload.clone())?;
+        if l.job.payload["event"] == "source.response" {
+            let text = s(&l.job.payload, "text")?;
+            b.start_sending(who, name, l.job.id, &l.receipt)?;
+            return self.confirm(b, who, name, &l, self.respond(&src, &l.job.thread, text));
+        }
+        let mut d: Delivery = serde_json::from_value(l.job.payload.clone())?;
         let find = |id| -> Result<Option<Copy>> {
             Ok(b.source_copies(who, name, id)?
                 .into_iter()
@@ -408,6 +546,38 @@ impl Connector {
         };
         let copy = find(d.message)?;
         let parent = d.parent.map(find).transpose()?.flatten();
+        if matches!(
+            d.event.as_str(),
+            "message.posted" | "message.edited" | "thread.start" | "file.note"
+        ) {
+            let m = b.get(d.message)?;
+            if src.settings.display_authors {
+                let who = m
+                    .author
+                    .as_ref()
+                    .map_or(m.actor.as_str(), |a| a.name.as_str());
+                let name: String = who
+                    .chars()
+                    .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '/'))
+                    .take(80)
+                    .collect();
+                d.text.push_str(&format!("\n\nFrom {name} on Board"));
+            }
+            let declined = if self.provider == Provider::Slack {
+                b.declined_assets(who, name, &l.job.thread, m.id)?
+            } else {
+                Vec::new()
+            };
+            for file in &m.attachments {
+                if self.provider != Provider::Slack || declined.contains(&file.id) {
+                    let filename = file.name.replace('`', "'");
+                    d.text.push_str(&format!(
+                        "\n\nFile: `{filename}` ({} bytes; on Board #{})",
+                        file.size, m.id
+                    ));
+                }
+            }
+        }
         // The database records this intent before the HTTP request, including across process death.
         b.start_sending(who, name, l.job.id, &l.receipt)?;
         let result = match self.provider {
@@ -423,11 +593,65 @@ impl Connector {
             }
             Provider::Local => bail!("not a network source"),
         };
+        self.confirm(b, who, name, &l, result)
+    }
+    fn respond(&self, src: &Source, thread: &str, text: &str) -> Result<DeliveryResult> {
+        let (external, url) = match self.provider {
+            Provider::Github => {
+                let n = thread.parse::<u64>()?;
+                let v = self.req(
+                    Method::POST,
+                    &format!("{}/issues/{n}/comments", github::repo(src)?),
+                    &[],
+                    Some(&json!({"body":text})),
+                )?;
+                (
+                    format!("comment:{}", id(&v, "id")?),
+                    v["html_url"].as_str().map(str::to_owned),
+                )
+            }
+            Provider::Slack => {
+                slack::ts(thread)?;
+                let v=self.sl(Method::POST,"chat.postMessage",&[],Some(&json!({"channel":src.remote,"thread_ts":thread,"text":slack_text::outgoing(&src.name,text),"unfurl_links":false,"unfurl_media":false})))?;
+                (id(&v, "ts")?, None)
+            }
+            Provider::Linear => {
+                let v=self.gql("mutation BoardResponse($input:CommentCreateInput!){commentCreate(input:$input){success comment{id url}}}",json!({"input":{"issueId":thread,"body":text}}))?;
+                ensure!(
+                    v["commentCreate"]["success"] == true,
+                    "Linear did not confirm the response"
+                );
+                let c = &v["commentCreate"]["comment"];
+                (
+                    format!("comment:{}", id(c, "id")?),
+                    c["url"].as_str().map(str::to_owned),
+                )
+            }
+            Provider::Local => bail!("not a network source"),
+        };
+        Ok(DeliveryResult {
+            external,
+            url,
+            thread: None,
+        })
+    }
+    fn confirm(
+        &self,
+        b: &Board,
+        who: &str,
+        name: &str,
+        l: &Lease,
+        result: Result<DeliveryResult>,
+    ) -> Result<Option<Job>> {
         match result {
             Ok(r) => {
-                b.finish_source(who, name, l.job.id, &l.receipt, Some(&r))?;
+                b.ack_source(who, name, l.job.id, &l.receipt, Some(&r))?;
             }
             Err(e) => {
+                if e.is::<media::FileRefused>() {
+                    b.refused_file(who, name, l.job.id, &l.receipt)?;
+                    return Ok(Some(b.queue_item(who, name, l.job.id)?));
+                }
                 let status = e.downcast_ref::<HttpStatus>();
                 let ambiguous = status.is_none_or(|s| s.0 >= 500 || s.0 == 408);
                 b.fail_source(

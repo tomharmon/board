@@ -1,8 +1,8 @@
 use super::*;
 
-const ISSUE: &str = r#"query BoardIssue($id:String!, $after:String) {
+const ISSUE: &str = r#"query BoardIssue($id:String!, $after:String,$first:Int!) {
   issue(id:$id) { id identifier title description url updatedAt priority priorityLabel project { name } assignee { name displayName } labels(first:250) { nodes { name } } creator { id name avatarUrl } team { id key } state { type name }
-    comments(first:100, after:$after) { nodes { id body url updatedAt parent { id } user { id name avatarUrl } }
+    comments(first:$first, after:$after) { nodes { id body url updatedAt parent { id } user { id name avatarUrl } }
       pageInfo { hasNextPage endCursor } } }
 }"#;
 const ISSUES: &str = r#"query BoardIssues($filter:IssueFilter!, $after:String) {
@@ -23,7 +23,64 @@ fn next(v: &Value, seen: &mut HashSet<String>) -> Result<Option<String>> {
     Ok(Some(n.into()))
 }
 impl Connector {
-    fn gql(&self, query: &str, vars: Value) -> Result<Value> {
+    pub(super) fn linear_preview(
+        &self,
+        src: &Source,
+        target: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Value> {
+        let mut filter = json!({"team":{"key":{"eq":src.remote}}});
+        let mut issue = target
+            .filter(|t| !t.eq_ignore_ascii_case(&src.remote))
+            .map(str::to_owned);
+        if let Some(raw) = target.filter(|t| t.contains("://")) {
+            let u = provider_url(raw, "linear.app")?;
+            let path: Vec<_> = u.path_segments().unwrap().collect();
+            let mut pairs = path.windows(2);
+            let pair = pairs
+                .find(|p| matches!(p[0], "issue" | "project"))
+                .context("expected a Linear issue or project link")?;
+            if pair[0] == "issue" {
+                issue = Some(pair[1].to_uppercase());
+            } else {
+                let slug = pair[1].rsplit('-').next().unwrap_or("");
+                ensure!(
+                    (8..=64).contains(&slug.len()) && slug.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "invalid Linear project identifier"
+                );
+                let p=self.gql("query BoardProject($slug:String!){projects(filter:{slugId:{eq:$slug}},first:1){nodes{id name}}}",json!({"slug":slug}))?;
+                let project = arr(&p["projects"], "nodes")?
+                    .first()
+                    .context("Linear project was not found")?;
+                filter["project"] = json!({"id":{"eq":s(project,"id")?}});
+                issue = None;
+            }
+        }
+        if let Some(id) = issue {
+            ensure!(
+                id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
+                "invalid Linear issue identifier"
+            );
+            let mut page = Vec::new();
+            let mut seen = HashSet::new();
+            let next = self.linear_issue_page(src, &id, cursor, limit, &mut seen, &mut page)?;
+            let records = page.into_iter().map(|e| e.import).collect::<Vec<_>>();
+            return Ok(json!({"thread":id,"records":records,"next":next}));
+        }
+        let data=self.gql("query BoardPreview($filter:IssueFilter!,$after:String,$limit:Int!){issues(filter:$filter,first:$limit,after:$after){nodes{id identifier title description state{name} url creator{name}} pageInfo{hasNextPage endCursor}}}",json!({"filter":filter,"after":cursor,"limit":limit}))?;
+        let p = &data["issues"];
+        let ids = arr(p, "nodes")?
+            .iter()
+            .map(|v| id(v, "id"))
+            .collect::<Result<Vec<_>>>()?;
+        let records=arr(p,"nodes")?.iter().map(|v|json!({"thread":v["id"],"identifier":v["identifier"],"title":v["title"],"text":v["description"].as_str().unwrap_or("").chars().take(1500).collect::<String>(),"url":v["url"],"state":v["state"]["name"],"author":v["creator"]["name"]})).collect::<Vec<_>>();
+        Ok(json!({"threads":ids,"records":records,"next":next(p,&mut HashSet::new())?}))
+    }
+    pub(super) fn gql(&self, query: &str, vars: Value) -> Result<Value> {
         let v = self.req(
             Method::POST,
             "/graphql",
@@ -62,55 +119,67 @@ impl Connector {
         let mut after = None;
         let mut seen = HashSet::new();
         for _ in 0..1000 {
-            let data = self.gql(ISSUE, json!({"id":thread,"after":after}))?;
-            let i = &data["issue"];
-            ensure!(
-                i["team"]["key"] == src.remote,
-                "Linear issue is outside configured team"
-            );
-            // UUID is canonical even when the command was given a human-readable issue identifier.
-            let t = s(i, "id")?;
-            let issue = s(i, "identifier")?;
-            if out.is_empty() {
-                let mut root = upsert(
-                    t,
-                    "issue".into(),
-                    i["creator"]["id"].as_str().unwrap_or("system").into(),
-                    None,
-                    content(&format!("{issue}: {}", s(i, "title")?), &i["description"]),
-                );
-                root.url = Some(s(i, "url")?.into());
-                root.updated_at = stamp(i, "updatedAt")?;
-                labels(&mut root, &[("issue", issue)]);
-                linear_properties(&mut root, i);
-                let mut raw = i.clone();
-                raw.as_object_mut().unwrap().remove("comments");
-                out.push(envelope(root, raw));
-            }
-            let comments = &i["comments"];
-            for c in arr(comments, "nodes")? {
-                let mut m = upsert(
-                    t,
-                    format!("comment:{}", s(c, "id")?),
-                    c["user"]["id"].as_str().unwrap_or("system").into(),
-                    Some(
-                        c["parent"]["id"]
-                            .as_str()
-                            .map(|p| format!("comment:{p}"))
-                            .unwrap_or_else(|| "issue".into()),
-                    ),
-                    s(c, "body")?.to_owned(),
-                );
-                m.url = c["url"].as_str().map(str::to_owned);
-                m.updated_at = stamp(c, "updatedAt")?;
-                out.push(envelope(m, c.clone()));
-            }
-            after = next(comments, &mut seen)?;
+            after =
+                self.linear_issue_page(src, thread, after.as_deref(), 100, &mut seen, &mut out)?;
             if after.is_none() {
                 return Ok(out);
             }
         }
         bail!("Linear page ceiling reached; no checkpoint was advanced")
+    }
+    fn linear_issue_page(
+        &self,
+        src: &Source,
+        thread: &str,
+        cursor: Option<&str>,
+        limit: usize,
+        seen: &mut HashSet<String>,
+        out: &mut Vec<Envelope>,
+    ) -> Result<Option<String>> {
+        let data = self.gql(ISSUE, json!({"id":thread,"after":cursor,"first":limit}))?;
+        let i = &data["issue"];
+        ensure!(
+            i["team"]["key"] == src.remote,
+            "Linear issue is outside configured team"
+        );
+        // UUID is canonical even when the command was given a human-readable issue identifier.
+        let t = s(i, "id")?;
+        let issue = s(i, "identifier")?;
+        if cursor.is_none() {
+            let mut root = upsert(
+                t,
+                "issue".into(),
+                i["creator"]["id"].as_str().unwrap_or("system").into(),
+                None,
+                content(&format!("{issue}: {}", s(i, "title")?), &i["description"]),
+            );
+            root.url = Some(s(i, "url")?.into());
+            root.updated_at = stamp(i, "updatedAt")?;
+            labels(&mut root, &[("issue", issue)]);
+            linear_properties(&mut root, i);
+            let mut raw = i.clone();
+            raw.as_object_mut().unwrap().remove("comments");
+            out.push(envelope(root, raw));
+        }
+        let comments = &i["comments"];
+        for c in arr(comments, "nodes")? {
+            let mut m = upsert(
+                t,
+                format!("comment:{}", s(c, "id")?),
+                c["user"]["id"].as_str().unwrap_or("system").into(),
+                Some(
+                    c["parent"]["id"]
+                        .as_str()
+                        .map(|p| format!("comment:{p}"))
+                        .unwrap_or_else(|| "issue".into()),
+                ),
+                s(c, "body")?.to_owned(),
+            );
+            m.url = c["url"].as_str().map(str::to_owned);
+            m.updated_at = stamp(c, "updatedAt")?;
+            out.push(envelope(m, c.clone()));
+        }
+        next(comments, seen)
     }
     pub(super) fn linear_send(
         &self,
@@ -185,8 +254,14 @@ impl Connector {
         let c = copy.context("no Linear copy to change")?;
         ensure!(!c.origin, "only a connector's own messages may be changed");
         if c.external == "issue" {
-            let (title, body) = super::root_text(d);
-            let v=self.gql("mutation BoardUpdateIssue($id:String!,$input:IssueUpdateInput!){issueUpdate(id:$id,input:$input){success}}",json!({"id":t,"input":{"title":title,"description":body}}))?;
+            if d.event == "message.deleted" {
+                return Ok(DeliveryResult {
+                    thread: None,
+                    external: c.external.clone(),
+                    url: c.url.clone(),
+                });
+            }
+            let v=self.gql("mutation BoardUpdateIssue($id:String!,$input:IssueUpdateInput!){issueUpdate(id:$id,input:$input){success}}",json!({"id":t,"input":{"description":d.text}}))?;
             ensure!(
                 v["issueUpdate"]["success"] == true,
                 "Linear did not accept the issue update"
@@ -222,11 +297,26 @@ pub(super) fn linear_properties(m: &mut Import, i: &Value) {
     if let Some(state) = i["state"]["type"].as_str().or(i["state"]["name"].as_str()) {
         labels(m, &[("state", &state.to_lowercase())]);
     }
-    if let Some(p) = i["priorityLabel"].as_str() {
-        labels(m, &[("priority", &p.to_lowercase())]);
+    let mut owns = Vec::new();
+    if let Some(p) = i["priorityLabel"]
+        .as_str()
+        .filter(|v| *v != "No priority" && i["priority"] != 0)
+    {
+        let slug = property_slug(p);
+        if !slug.is_empty() {
+            labels(m, &[("priority", &slug)]);
+        }
+    }
+    if i["priority"] == 0 || i["priorityLabel"] == "No priority" {
+        owns.push("priority".into());
     }
     if let Some(p) = i["project"]["name"].as_str() {
-        labels(m, &[("project", p)]);
+        let slug = property_slug(p);
+        if !slug.is_empty() {
+            labels(m, &[("project", &slug)]);
+        }
+    } else if i["project"].is_null() && i["projectId"].is_null() {
+        owns.push("project".into());
     }
     if let Some(a) = i["assignee"]["displayName"]
         .as_str()
@@ -234,11 +324,24 @@ pub(super) fn linear_properties(m: &mut Import, i: &Value) {
     {
         property(m, "assignee", a);
     }
+    if !i["assignee"].is_null() || i["assigneeId"].is_null() {
+        owns.push("assignee.".into());
+    }
     if let Some(list) = i["labels"]["nodes"].as_array().or(i["labels"].as_array()) {
+        owns.push("tag.".into());
         for t in list {
             if let Some(k) = t["name"].as_str() {
                 property(m, "tag", k);
             }
         }
+    }
+    if let Change::Upsert { text, labels } = &m.change {
+        m.change = Change::Reconcile {
+            text: text.clone(),
+            labels: labels.clone(),
+            owns,
+            reset: BTreeMap::new(),
+            existing_only: false,
+        };
     }
 }

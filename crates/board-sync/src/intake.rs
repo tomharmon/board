@@ -18,24 +18,56 @@ pub fn ingest(
     for key in ["token", "access_token", "authorization", "signing_secret"] {
         obj.remove(key);
     }
+    if source.provider == Provider::Github
+        && kind != "workflow_run"
+        && source.settings.github_items != GithubItems::All
+    {
+        ensure!(
+            s(&raw["repository"], "full_name")?.eq_ignore_ascii_case(&source.remote),
+            "GitHub event is outside configured repository"
+        );
+        let item = raw
+            .get("issue")
+            .or(raw.get("pull_request"))
+            .context("missing issue or PR")?;
+        let t = id(item, "number")?;
+        let pr = raw.get("pull_request").is_some() || !item["pull_request"].is_null();
+        if !source.settings.github_items.includes(pr)
+            && board.find_source(actor, name, &t, None)?.is_none()
+        {
+            let mut m = upsert(&t, "filtered".into(), "system".into(), None, String::new());
+            m.change = Change::Ignore;
+            let mut e = envelope(m, Value::Null);
+            e.key = format!("event:{delivery}");
+            return Ok(board.enqueue_imports(actor, name, &[e], None)?[0]);
+        }
+    }
     if source.provider == Provider::Github && kind == "workflow_run" {
         ensure!(
             s(&raw["repository"], "full_name")?.eq_ignore_ascii_case(&source.remote),
             "GitHub event is outside configured repository"
         );
-        ensure!(
-            raw["action"] == "completed",
-            "expected a completed GitHub workflow run"
-        );
         let w = &raw["workflow_run"];
-        let conclusion = s(w, "conclusion")?;
-        let failed = matches!(conclusion, "failure" | "timed_out" | "startup_failure");
-        ensure!(
-            failed || conclusion == "success",
-            "workflow has no success/failure conclusion"
-        );
-        let head = s(w, "head_sha")?;
         let run = id(w, "id")?;
+        let conclusion = w["conclusion"].as_str().unwrap_or("");
+        let failed = matches!(conclusion, "failure" | "timed_out" | "startup_failure");
+        if raw["action"] != "completed"
+            || (!failed && conclusion != "success")
+            || arr(w, "pull_requests")?.is_empty()
+        {
+            let mut m = upsert(
+                &format!("run:{run}"),
+                format!("run:{run}"),
+                "actions".into(),
+                None,
+                String::new(),
+            );
+            m.change = Change::Ignore;
+            let mut e = envelope(m, raw);
+            e.key = format!("event:{delivery}");
+            return Ok(board.enqueue_imports(actor, name, &[e], None)?[0]);
+        }
+        let head = s(w, "head_sha")?;
         let repo = id(&raw["repository"], "id")?;
         let path = s(w, "path")?
             .split('@')
@@ -44,21 +76,18 @@ pub fn ingest(
             .rsplit('/')
             .next()
             .unwrap_or("");
-        let file = path
-            .to_ascii_lowercase()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect::<String>();
+        let file = property_slug(
+            path.strip_suffix(".yml")
+                .or_else(|| path.strip_suffix(".yaml"))
+                .unwrap_or(path),
+        );
         let mut items = Vec::new();
         for pr in arr(w, "pull_requests")? {
             let number = id(pr, "number")?;
-            let key = format!("ci.{repo}-{number}.{file}");
+            let key: String = format!("ci.{repo}-{number}.{file}")
+                .chars()
+                .take(64)
+                .collect();
             ensure!(
                 key.len() <= 64 && !file.is_empty(),
                 "invalid workflow label"
@@ -107,9 +136,92 @@ pub fn ingest(
         Provider::Linear => linear(board, actor, &source, &raw)?,
         Provider::Local => bail!("use inbox push for normalized local events"),
     };
+    // GitHub includes the parent issue/PR in a comment delivery. Establish an unknown
+    // root first without fetching, and never overwrite a known root with this snapshot.
+    let mut batch = Vec::new();
+    if source.provider == Provider::Github
+        && import.parent.is_some()
+        && let Some(item) = raw.get("issue").or(raw.get("pull_request"))
+        && item["title"].is_string()
+        && item["state"].is_string()
+        && board
+            .find_source(actor, name, &import.thread, None)?
+            .is_none()
+    {
+        let mut root = github(
+            &source,
+            if raw.get("pull_request").is_some() {
+                "pull_request"
+            } else {
+                "issues"
+            },
+            &raw,
+        )?;
+        if let Change::Reconcile { text, labels, .. } = root.change {
+            root.change = Change::Post { text, labels };
+        }
+        let mut e = envelope(root, Value::Null);
+        e.key = format!("anchor:{delivery}");
+        batch.push(e);
+    }
+    // Write the root update and its lifecycle signal into the inbox in order and together.
+    let mut secondary = None;
+    if source.provider == Provider::Github {
+        let action = raw["action"].as_str().unwrap_or("");
+        let author = raw["sender"]["login"].as_str().unwrap_or("someone");
+        let mut set = BTreeMap::new();
+        let mut unset = Vec::new();
+        let reply = match (kind, action) {
+            ("pull_request" | "issues", "closed" | "reopened") => Some(format!(
+                "{} by {author}",
+                if raw["pull_request"]["merged"] == true {
+                    "merged"
+                } else {
+                    action
+                }
+            )),
+            ("pull_request_review", "submitted") => {
+                if let Some(verdict) = raw["review"]["state"]
+                    .as_str()
+                    .map(str::to_lowercase)
+                    .filter(|s| matches!(s.as_str(), "approved" | "changes_requested"))
+                {
+                    set.insert("review".into(), verdict);
+                }
+                None
+            }
+            ("pull_request_review", "dismissed") => {
+                unset.push("review".into());
+                None
+            }
+            _ => None,
+        };
+        if reply.is_some() || !set.is_empty() || !unset.is_empty() {
+            let mut m = upsert(
+                &import.thread,
+                format!("activity:{delivery}"),
+                actor_id(&raw["sender"]),
+                None,
+                String::new(),
+            );
+            m.change = Change::Signal {
+                conditions: BTreeMap::new(),
+                set,
+                unset,
+                reply,
+            };
+            m.url = import.url.clone();
+            let mut x = envelope(m, Value::Null);
+            x.key = format!("activity:{delivery}");
+            secondary = Some(x);
+        }
+    }
     let mut e = envelope(import, raw);
     e.key = format!("event:{delivery}");
-    Ok(board.enqueue_imports(actor, name, &[e], None)?[0])
+    let ordinal = batch.len();
+    batch.push(e);
+    batch.extend(secondary);
+    Ok(board.enqueue_imports(actor, name, &batch, None)?[ordinal])
 }
 fn github(src: &Source, kind: &str, v: &Value) -> Result<Import> {
     ensure!(
@@ -154,6 +266,25 @@ fn github(src: &Source, kind: &str, v: &Value) -> Result<Import> {
                 ],
             );
             super::github::github_properties(&mut m, owner, is_pr.then_some(owner));
+            if let Change::Upsert { text, labels } = &m.change {
+                let mut owns = Vec::new();
+                for (field, prefix) in [("labels", "tag."), ("assignees", "assignee.")] {
+                    if owner[field].is_array() {
+                        owns.push(prefix.into());
+                    }
+                }
+                let mut reset = BTreeMap::new();
+                if is_pr && let Ok(repo) = id(&v["repository"], "id") {
+                    reset.insert("head".into(), format!("ci.{repo}-{t}."));
+                }
+                m.change = Change::Reconcile {
+                    text: text.clone(),
+                    labels: labels.clone(),
+                    owns,
+                    reset,
+                    existing_only: is_pr && action == "synchronize",
+                };
+            }
             m.url = owner["html_url"].as_str().map(str::to_string);
             m.updated_at = stamp(owner, "updated_at")?;
             m
@@ -259,17 +390,21 @@ fn slack(b: &Board, who: &str, src: &Source, v: &Value) -> Result<Import> {
         msg["user"].as_str().or(msg["bot_id"].as_str())
     }
     .unwrap_or("system");
-    let who_text = msg["text"]
-        .as_str()
+    let hints = super::slack::unfurls(msg);
+    let original = super::slack::with_forward(msg["text"].as_str().unwrap_or(""), msg, &hints);
+    let who_text = Some(original.as_str())
         .filter(|s| !s.trim().is_empty())
         .unwrap_or("[message without text]");
+    let (body, names) = slack_text::incoming(&src.name, who_text);
     let mut m = upsert(
         &thread,
         external.into(),
         a.into(),
         (thread != external).then(|| thread.clone()),
-        who_text.into(),
+        body,
     );
+    m.mentioned = names;
+    m.links = hints;
     m.updated_at = Some(super::slack::date(
         e["event_ts"].as_str().unwrap_or(external),
     )?);
@@ -326,6 +461,10 @@ fn linear(b: &Board, who: &str, src: &Source, v: &Value) -> Result<Import> {
             );
             labels(&mut m, &[("issue", identifier)]);
             super::linear::linear_properties(&mut m, d);
+            if let Change::Reconcile { existing_only, .. } = &mut m.change {
+                *existing_only = action == "update"
+                    && (v["actor"]["type"] != "user" || !d["archivedAt"].is_null());
+            }
             m
         }
         "Comment" => {

@@ -1,4 +1,5 @@
 use super::*;
+mod coverage;
 use board_local::PostOptions;
 use std::{
     io::{BufRead, BufReader, Write},
@@ -115,7 +116,7 @@ fn github_ci_updates_only_the_matching_head_and_redelivery_is_harmless() {
         ingest(&db, "p", "repo", "workflow_run", key, workflow(head, state)).unwrap();
         db.drain_source("p", "repo", 9).unwrap();
         let root = db.find_source("p", "repo", "7", None).unwrap().unwrap();
-        assert_eq!(root.labels.contains_key("ci.5-7.build.yml"), key == "3");
+        assert_eq!(root.labels.contains_key("ci.5-7.build"), key == "3");
         assert_eq!(
             db.conversation(root.id, &Default::default())
                 .unwrap()
@@ -199,6 +200,11 @@ fn private_files_require_an_explicit_verified_message_and_never_forward_upload_c
 fn slack_preview_public_join_and_aggregate_reactions_are_explicit() {
     let page = json!({"ok":true,"messages":[{"ts":"10.1","user":"U1","text":"root","reactions":[{"name":"eyes","users":["U2"]}]}]});
     let mock = Mock::new(vec![
+        (
+            "GET /conversations.info?",
+            200,
+            json!({"ok":true,"channel":{"id":"C1","is_channel":true,"is_private":false,"is_shared":false,"is_member":true}}),
+        ),
         ("GET /conversations.replies?", 200, page.clone()),
         (
             "GET /conversations.info?",

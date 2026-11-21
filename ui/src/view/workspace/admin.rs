@@ -1,4 +1,5 @@
 use super::*;
+use crate::state::SchemaPart;
 
 fn open_form(s: &mut State) {
     s.desk.enter(s.page);
@@ -250,7 +251,13 @@ fn profiles(s: &State) -> El {
     let mut panel = col()
         .w_full()
         .gap(12.0)
-        .child(heading("Profiles", None))
+        .child(heading(
+            "Profiles",
+            Some(
+                action("open-directory", "People", false)
+                    .on_press(|s: &mut State| s.go(Page::People)),
+            ),
+        ))
         .child(section("CURRENT", &s.actor));
     for (i, who) in s.desk.profiles.iter().enumerate() {
         let actor = who.clone();
@@ -434,25 +441,87 @@ pub(super) fn view(s: &State) -> El {
         }
         Page::Schemas => {
             for schema in &d.schemas {
-                let id = (schema.name.clone(), schema.version);
-                let open = d.schema_open.as_ref() == Some(&id);
+                let name = schema.name.clone();
+                let version = schema.version;
+                let page = d.schema_open.as_ref().filter(|p| p.id == schema.id);
+                let open = page.is_some();
                 out = out.child(listrow(
                     &format!("schema-{}-{}", schema.name, schema.version),
                     &format!("{}@{}", schema.name, schema.version),
                     &schema.description,
                     move |s| {
-                        s.desk.schema_open = (!open).then(|| id.clone());
+                        if open {
+                            s.desk.schema_open = None;
+                        } else {
+                            s.show_schema(&name, version);
+                        }
                     },
                 ));
-                if open {
-                    out = out.child(
-                        mono(
-                            serde_json::to_string_pretty(&schema.schema).expect("valid schema"),
-                            INK,
+                if let Some(page) = page {
+                    let copy = |key, part, name| {
+                        tool(
+                            key,
+                            name,
+                            if page.copied == Some(part) {
+                                &glyphs::CHECK
+                            } else {
+                                &glyphs::COPY
+                            },
                         )
-                        .w_full()
-                        .wrap_anywhere()
-                        .selectable(true),
+                        .on_press_tx(move |s: &mut State, tx| s.copy_schema_part(part, tx))
+                    };
+                    let mut detail = col().w_full().gap(8.0).py(8.0);
+                    if let Some(example) = &page.example {
+                        detail = detail
+                            .child(
+                                row()
+                                    .w_full()
+                                    .center_y()
+                                    .gap(6.0)
+                                    .child(label("Example block", 15.0, 600.0, INK).grow(1.0))
+                                    .child(copy(
+                                        "copy-schema-example",
+                                        SchemaPart::Example,
+                                        "Copy example block",
+                                    )),
+                            )
+                            .child(
+                                mono(example, INK)
+                                    .key("schema-example")
+                                    .w_full()
+                                    .wrap_anywhere()
+                                    .selectable(true),
+                            )
+                            .child(
+                                action("compose-schema-example", "Add example to draft", false)
+                                    .on_press_tx(State::compose_example),
+                            );
+                    } else {
+                        detail = detail.child(
+                            label("No validated example available", 14.0, 500.0, MUTED)
+                                .wrap_anywhere(),
+                        );
+                    }
+                    out = out.child(
+                        detail
+                            .child(
+                                row()
+                                    .w_full()
+                                    .center_y()
+                                    .gap(6.0)
+                                    .child(label("Schema definition", 15.0, 600.0, INK).grow(1.0))
+                                    .child(copy(
+                                        "copy-schema-definition",
+                                        SchemaPart::Definition,
+                                        "Copy schema definition",
+                                    )),
+                            )
+                            .child(
+                                mono(&page.definition, INK)
+                                    .w_full()
+                                    .wrap_anywhere()
+                                    .selectable(true),
+                            ),
                     );
                 }
             }

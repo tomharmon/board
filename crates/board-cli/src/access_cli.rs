@@ -1,7 +1,7 @@
 use anyhow::Result;
 use board_local::{
     Board,
-    access::{GrantBatch, GrantSpec, Rules},
+    access::{Grant, GrantBatch, GrantInput, Rules},
 };
 use clap::Subcommand;
 use serde_json::json;
@@ -11,15 +11,20 @@ use std::path::PathBuf;
 pub enum Grants {
     List,
     Create {
-        subject: String,
+        #[arg(required = true)]
+        subjects: Vec<String>,
         #[arg(long)]
         can: String,
+        #[arg(long)]
+        lock_me_out: bool,
     },
     /// Atomically create 1-16 grants from a JSON array. Use - for stdin.
     Batch {
         file: PathBuf,
         #[arg(long, visible_alias = "id")]
         idempotency_key: Option<String>,
+        #[arg(long)]
+        lock_me_out: bool,
     },
     /// Read the original immutable batch receipt.
     Receipt {
@@ -27,12 +32,29 @@ pub enum Grants {
     },
     Update {
         id: i64,
-        subject: String,
+        #[arg(required = true)]
+        subjects: Vec<String>,
         #[arg(long)]
         can: String,
+        #[arg(long)]
+        lock_me_out: bool,
+    },
+    /// Add or remove subjects without replacing the grant.
+    Patch {
+        id: i64,
+        #[arg(long)]
+        add: Vec<String>,
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long)]
+        can: Option<String>,
+        #[arg(long)]
+        lock_me_out: bool,
     },
     Revoke {
         id: i64,
+        #[arg(long)]
+        lock_me_out: bool,
     },
     Explain {
         subject: String,
@@ -52,10 +74,23 @@ fn print_batch(batch: GrantBatch, made: Option<bool>, js: bool) -> Result<()> {
             println!(
                 "{}  {}  {}",
                 grant.id,
-                grant.subject,
+                grant.subjects.join(","),
                 serde_json::to_string(&grant.can)?
             );
         }
+    }
+    Ok(())
+}
+fn print_grant(g: Grant, js: bool) -> Result<()> {
+    if js {
+        println!("{}", json!({"grant":g}));
+    } else {
+        println!(
+            "{}  {}  {}",
+            g.id,
+            g.subjects.join(","),
+            serde_json::to_string(&g.can)?
+        );
     }
     Ok(())
 }
@@ -78,9 +113,15 @@ pub fn grants(b: &Board, actor: &str, cmd: Grants, js: bool) -> Result<()> {
         Grants::Batch {
             file,
             idempotency_key,
+            lock_me_out,
         } => {
-            let grants: Vec<GrantSpec> = serde_json::from_str(&crate::load_text(&file)?)?;
-            let (batch, made) = b.create_grant_batch(actor, &grants, idempotency_key.as_deref())?;
+            let grants: Vec<GrantInput> = serde_json::from_str(&crate::load_text(&file)?)?;
+            let groups = grants
+                .into_iter()
+                .map(GrantInput::parts)
+                .collect::<Result<Vec<_>>>()?;
+            let (batch, made) =
+                b.group_grant_batch(actor, &groups, idempotency_key.as_deref(), lock_me_out)?;
             print_batch(batch, Some(made), js)?;
         }
         Grants::Receipt { id } => print_batch(b.grant_batch(id)?, None, js)?,
@@ -93,54 +134,76 @@ pub fn grants(b: &Board, actor: &str, cmd: Grants, js: bool) -> Result<()> {
                     println!(
                         "{}  {}  {}",
                         g.id,
-                        g.subject,
+                        g.subjects.join(","),
                         serde_json::to_string(&g.can)?
                     );
                 }
             }
         }
         Grants::Explain { subject, channel } => {
-            let actions = b.explain(&subject, &channel)?;
+            let decision = b.explain_decision(&subject, &channel)?;
             if js {
-                println!(
-                    "{}",
-                    json!({"subject":subject,"channel":channel,"actions":actions})
-                );
+                println!("{}", json!(decision));
             } else {
                 println!(
                     "{} in {}: {}",
                     subject,
                     channel,
-                    serde_json::to_string(&actions)?
+                    serde_json::to_string(&decision.actions)?
                 );
             }
         }
-        Grants::Revoke { id } => {
-            b.revoke_grant(actor, id)?;
+        Grants::Revoke { id, lock_me_out } => {
+            let revoked = b.revoke_grant_with_outcome(actor, id, lock_me_out)?;
             if js {
-                println!("{}", json!({"revoked":id}));
-            } else {
-                println!("revoked grant {id}");
-            }
-        }
-        cmd => {
-            let (id, subject, can) = match cmd {
-                Grants::Create { subject, can } => (None, subject, can),
-                Grants::Update { id, subject, can } => (Some(id), subject, can),
-                _ => unreachable!(),
-            };
-            let grant = b.set_grant(actor, id, &subject, &Rules::parse(&can)?)?;
-            if js {
-                println!("{}", json!({"grant":grant}));
+                println!("{}", json!({"id":id,"revoked":revoked}));
             } else {
                 println!(
-                    "{}  {}  {}",
-                    grant.id,
-                    grant.subject,
-                    serde_json::to_string(&grant.can)?
+                    "grant {id}: {}",
+                    if revoked { "revoked" } else { "already absent" }
                 );
             }
         }
+        Grants::Create {
+            subjects,
+            can,
+            lock_me_out,
+        } => print_grant(
+            b.set_group_grant(actor, None, &subjects, &Rules::parse(&can)?, lock_me_out)?,
+            js,
+        )?,
+        Grants::Update {
+            id,
+            subjects,
+            can,
+            lock_me_out,
+        } => print_grant(
+            b.set_group_grant(
+                actor,
+                Some(id),
+                &subjects,
+                &Rules::parse(&can)?,
+                lock_me_out,
+            )?,
+            js,
+        )?,
+        Grants::Patch {
+            id,
+            add,
+            remove,
+            can,
+            lock_me_out,
+        } => print_grant(
+            b.patch_grant(
+                actor,
+                id,
+                &add,
+                &remove,
+                can.as_deref().map(Rules::parse).transpose()?.as_ref(),
+                lock_me_out,
+            )?,
+            js,
+        )?,
     }
     Ok(())
 }

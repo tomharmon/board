@@ -16,14 +16,15 @@ const load = file => import(pathToFileURL(join(ref, file)).href);
 const { checkDefinition } = await load('data-schemas.ts');
 const { findBlocks, blocksIn } = await load('blocks.ts');
 const { mentionTerms } = await load('mentions.ts');
+const { tagOf } = await load('../sync/tags.ts');
 const tmp = mkdtempSync(join(tmpdir(), 'board-reference-'));
-const env = { ...process.env, BOARD_DB: join(tmp, 'scratch.db'), BOARD_USER: 'auditor' };
-for (const key of ['BOARD_TOKEN','BOARD_CAN','BOARD_PROFILE','BOARD_NAME']) delete env[key];
-const cli = (...args) => {
-  const run = spawnSync(binary, ['--json', ...args], { env, encoding: 'utf8', timeout: 10000 });
+const env = {PATH:process.env.PATH, HOME:tmp, BOARD_DB:join(tmp, 'scratch.db'), BOARD_USER:'auditor'};
+const command = (args,input) => {
+  const run = spawnSync(binary, ['--json', ...args], { env, input, encoding: 'utf8', timeout: 10000 });
   if (run.error) throw run.error;
   return { ok: run.status === 0, json: JSON.parse(run.status === 0 ? run.stdout : run.stderr) };
 };
+const cli=(...args)=>command(args);
 try {
   const field = schema => ({type:'object',properties:{x:schema}});
   const object = {type:'object'};
@@ -60,5 +61,13 @@ try {
       assert.equal(page.messages.length>0,expected.includes(q),`mention fixture ${i} (${q})`);
     }
   }
-  console.log(`Reference and Rust agree: ${definitions.length} schema definitions, ${blocks.length} block inputs, ${2*prose.length} mention-query results. Not the upstream wire conformance suite.`);
+  const names=['good first issue','...Déjà    VU.2','Équipe','Fix__Tomorrow','A---B','x / 🚀 y','.leading','🐛','a.'.repeat(50),'\tline\nbreak','Trailing-','Q₁','Æneid','ｅｖｅｎｔ','tag','Case'];
+  assert.equal(cli('sources','add','issuefeed','github','example/repo','audit/issues').ok,true);
+  const raw={action:'opened',repository:{full_name:'example/repo'},issue:{number:1,title:'Label comparison',state:'open',labels:names.map(name=>({name}))}};
+  assert.equal(command(['sync','ingest','issuefeed','issues','labels','-'],JSON.stringify(raw)).ok,true);
+  assert.equal(cli('sync','drain','issuefeed').ok,true);
+  const labels=cli('read','audit/issues','--flat').json.messages[0].labels;
+  assert.deepEqual(Object.fromEntries(Object.entries(labels).filter(([key])=>key.startsWith('tag.'))),
+    Object.fromEntries(names.map(name=>tagOf('tag',name)).filter(Boolean)));
+  console.log(`Reference and Rust agree: ${definitions.length} schema definitions, ${blocks.length} block inputs, ${2*prose.length} mention-query results, ${names.length} provider tag names. Not the upstream wire conformance suite.`);
 } finally { rmSync(tmp,{recursive:true,force:true}); }

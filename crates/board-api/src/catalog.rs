@@ -16,7 +16,7 @@ pub(super) fn routes() -> Router<App> {
 pub fn document() -> Value {
     json!({"name":"Board","version":env!("CARGO_PKG_VERSION"),"api":"v1","storage":"sqlite","transport":"loopback",
         "links":{"self":"/v1/discovery","openapi":"/v1/openapi.json","me":"/v1/me","channels":"/v1/channels","threads":"/v1/threads","events":"/v1/events","sources":"/v1/sources"},
-        "features":["threads","labels","reactions","schemas","uploads","tasks","schedules","watchers","channel-grants","sources","inbox","outbox","sse","local-typing"],
+        "features":["threads","labels","reactions","schemas","uploads","tasks","schedules","watchers","channel-grants","sources","inbox","outbox","sse","local-typing","write-rules","local-only-messages","channel-mirrors"],
         "providers":["local","github","slack","linear"],"limits":{"page":500,"message_characters":10000,"inline_file_bytes":board_local::MAX_ATTACHMENT_BYTES}})
 }
 async fn discovery() -> Json<Value> {
@@ -24,8 +24,12 @@ async fn discovery() -> Json<Value> {
 }
 async fn me(State(a): State<App>) -> ApiResult<Json<Value>> {
     Ok(Json(
-        a.call(|b, who| Ok(json!({"actor":who,"cursor":b.cursor()?,"transport":"loopback"})))
-            .await?,
+        a.call(|b, who| {
+            let mut me = json!(b.viewer(who)?);
+            me["transport"] = json!("loopback");
+            Ok(me)
+        })
+        .await?,
     ))
 }
 #[derive(Deserialize)]
@@ -73,6 +77,7 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/threads/{id}/typing", "get put delete"),
     ("/messages", "get post"),
     ("/messages/{id}", "get patch delete"),
+    ("/messages/{id}/deliveries", "get"),
     ("/posts/{key}", "get"),
     ("/messages/{id}/labels", "patch"),
     ("/messages/{id}/reactions/{name}", "put delete"),
@@ -86,7 +91,7 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/schemas", "get"),
     ("/schemas/{name}/{version}", "get put"),
     ("/grants", "get post"),
-    ("/grants/{id}", "get put delete"),
+    ("/grants/{id}", "get put patch delete"),
     ("/grant-batches", "post"),
     ("/grant-batches/{id}", "get"),
     ("/access", "get"),
@@ -103,7 +108,10 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/task-batches/{key}", "get"),
     ("/schedules", "get post"),
     ("/schedules/{id}", "get delete"),
-    ("/watchers", "get post"),
+    ("/watchers", "get post put"),
+    ("/watcher-matches", "post"),
+    ("/rules", "get"),
+    ("/rules/{name}", "get put delete"),
     ("/watchers/{name}", "get delete"),
     ("/watchers/{name}/next", "get"),
     ("/watchers/{name}/deliveries", "post"),
@@ -112,6 +120,7 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/watchers/{name}/acknowledgements/{cursor}", "put"),
     ("/sources", "get post"),
     ("/sources/{name}", "get patch"),
+    ("/sources/{name}/renderer", "get put delete"),
     ("/sources/{name}/links", "get put"),
     ("/sources/{name}/imports", "post"),
     ("/sources/{name}/inbox", "get post"),
@@ -147,7 +156,7 @@ fn spec() -> Value {
                 .unwrap_or("discovery");
             let mut op = json!({"summary":format!("{} {path}",method.to_uppercase()),"tags":[tag],"responses":{"2XX":{"description":"Successful local operation"},"default":{"description":"Rejected request","content":{"application/problem+json":{"schema":{"$ref":"#/components/schemas/Problem"}}}}}});
             if method == "get" && matches!(path, "/messages" | "/threads" | "/events") {
-                op["parameters"]=json!(["after","limit","channel","re","by","mentions","text","label"].into_iter().chain(if path=="/events"{vec!["last","kind","wait_ms"]}else{vec!["before"]}).map(|n|json!({"name":n,"in":"query","schema":if n=="label"{json!({"type":"array","items":{"type":"string"}})}else{json!({"type":"string"})}})).collect::<Vec<_>>());
+                op["parameters"]=json!(["after","limit","channel","re","by","mentions","text","label","from"].into_iter().chain(if path=="/events"{vec!["last","kind","wait_ms"]}else{vec!["before"]}).map(|n|json!({"name":n,"in":"query","schema":if n=="label"{json!({"type":"array","items":{"type":"string"}})}else{json!({"type":"string"})}})).collect::<Vec<_>>());
             }
             if matches!(method, "post" | "put" | "patch")
                 && !path.contains("/reactions/")
@@ -160,12 +169,13 @@ fn spec() -> Value {
                     json!({"content":{"application/json":{"schema":{"type":"object"}}}})
                 };
             }
+            crate::openapi::describe(&mut op, path, method);
             def[method] = op;
         }
         paths.insert(path.to_owned(), def);
     }
     json!({"openapi":"3.1.0","info":{"title":"Board local REST API","version":env!("CARGO_PKG_VERSION")},"servers":[{"url":"/v1"}],"security":[{"localBearer":[]}],"paths":paths,
-    "components":{"securitySchemes":{"localBearer":{"type":"http","scheme":"bearer"}},"schemas":{"Problem":{"type":"object","required":["status","code","detail"],"properties":{"status":{"type":"integer"},"code":{"type":"string"},"detail":{"type":"string"}}}}}})
+    "components":{"securitySchemes":{"localBearer":{"type":"http","scheme":"bearer"}},"schemas":crate::openapi::models()}})
 }
 async fn openapi() -> Json<Value> {
     Json(spec())

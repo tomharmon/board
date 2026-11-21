@@ -7,6 +7,33 @@ fn field(sub: Value) -> Value {
 }
 
 #[test]
+fn sample_validation_agrees_with_real_block_posts_without_writing_anything() -> Result<()> {
+    let board = Board::memory()?;
+    let def = json!({"type":"object", "required":["time","step"], "additionalProperties":false,
+        "properties":{"time":{"type":"string","format":"time"},"step":{"type":"number","multipleOf":0.1}}});
+    board.register_schema_as("sample", 1, "", &def, "owner")?;
+    let schema = board.schema("sample", 1)?;
+    for (candidate, expected) in [
+        (json!({"time":"23:59:60", "step":1.5}), true),
+        (json!({"time":"23:59:60", "step":-0.3}), false),
+        (json!({"time":"12:00:60", "step":0.2}), false),
+        (json!({"time":"10:10:10"}), false),
+        (json!([]), false),
+    ] {
+        let before = board.cursor()?;
+        assert_eq!(schema.accepts_sample(&candidate)?, expected, "{candidate}");
+        assert_eq!(board.cursor()?, before);
+        let body = format!("```json#sample@1\n{candidate}\n```");
+        let posted = board.post("preview", "owner", &body, &Default::default());
+        assert_eq!(posted.is_ok(), expected);
+        if !expected {
+            assert_eq!(board.cursor()?, before);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn registry_accepts_only_bounded_structural_keywords_with_meaningful_values() -> Result<()> {
     let b = Board::memory()?;
     for (i, sub) in [

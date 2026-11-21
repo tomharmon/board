@@ -41,6 +41,7 @@ pub(crate) fn init_automation(conn: &Connection) -> Result<()> {
         INSERT OR IGNORE INTO task_receipts SELECT k.digest,t.holder,t.id,t.epoch,X''
             FROM task_claim_keys k JOIN tasks t ON t.id=k.task WHERE t.state='claimed' AND t.holder IS NOT NULL;
         CREATE TABLE IF NOT EXISTS task_holds(task INTEGER PRIMARY KEY REFERENCES tasks(id),kind TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS blind_tasks(task INTEGER PRIMARY KEY REFERENCES tasks(id),actor TEXT NOT NULL,original TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS plan_progress(key TEXT NOT NULL,position INTEGER NOT NULL,digest BLOB NOT NULL,task INTEGER NOT NULL REFERENCES tasks(id),PRIMARY KEY(key,position));
         INSERT OR IGNORE INTO task_holds SELECT id,'edited' FROM tasks WHERE state='blocked' AND result='root edited by another actor';
         CREATE TABLE IF NOT EXISTS claim_namespace(id INTEGER PRIMARY KEY CHECK(id=1),value TEXT NOT NULL);
@@ -54,6 +55,14 @@ pub(crate) fn init_automation(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS watchers(
             name TEXT PRIMARY KEY, filter TEXT NOT NULL, kind TEXT, cursor INTEGER NOT NULL);",
     )?;
+    // Before task views separated creator from person, snapshots retained the
+    // exact creating actor under owner. Both values are recoverable without
+    // consulting current task state or changing log positions.
+    for column in ["message", "previous", "payload"] {
+        let old = format!("json_extract({column},'$.task.owner')");
+        conn.execute(&format!("UPDATE events SET {column}=json_set({column},'$.task.by',{old},'$.task.owner',substr({old},1,instr({old}||'/','/')-1))
+            WHERE json_type({column},'$.task.owner')='text' AND json_type({column},'$.task.by') IS NULL"),[])?;
+    }
     schedules::init(conn)?;
     watchers::init(conn)?;
     Ok(())

@@ -45,6 +45,25 @@ impl Board {
         scope: Option<&str>,
         limit: usize,
     ) -> Result<(i64, Vec<Channel>, Option<String>)> {
+        self.channels_window(after, scope, None, limit)
+    }
+    pub fn channels_window(
+        &self,
+        after: &str,
+        scope: Option<&str>,
+        prefix: Option<&str>,
+        limit: usize,
+    ) -> Result<(i64, Vec<Channel>, Option<String>)> {
+        ensure!(
+            scope.is_none() || prefix.is_none(),
+            "use scope or prefix, not both"
+        );
+        ensure!(
+            prefix.is_none_or(|s| !s.is_empty()
+                && s.len() <= 501
+                && !s.chars().any(char::is_control)),
+            "invalid channel prefix"
+        );
         ensure!((1..=500).contains(&limit), "limit must be 1..500");
         let root = scope.map(|s| s.strip_suffix('/').unwrap_or(s));
         if let Some(root) = root {
@@ -59,11 +78,12 @@ impl Board {
         let head = crate::read::cursor_on(&tx)?;
         let sql = format!(
             "{COUNTS} WHERE c.name > ?1 AND (?2 IS NULL OR c.name=?2 OR instr(c.name,?2||'/')=1)
-            AND (?4 IS NULL OR c.name IN (SELECT value FROM json_each(?4))) GROUP BY c.name ORDER BY c.name LIMIT ?3"
+            AND (?4 IS NULL OR c.name IN (SELECT value FROM json_each(?4))) AND (?5 IS NULL OR instr(c.name,?5)=1)
+            GROUP BY c.name ORDER BY c.name LIMIT ?3"
         );
         let mut rows: Vec<_> = tx
             .prepare(&sql)?
-            .query_map(params![after, root, limit + 1, channels], channel)?
+            .query_map(params![after, root, limit + 1, channels, prefix], channel)?
             .collect::<rusqlite::Result<_>>()?;
         let next = (rows.len() > limit).then(|| rows[limit - 1].name.clone());
         rows.truncate(limit);

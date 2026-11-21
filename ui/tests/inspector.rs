@@ -1002,6 +1002,9 @@ fn scoped_source_inbox_is_read_only_and_hides_raw_payloads_and_tokens() {
     let envelope = |key: &str| Envelope {
         key: key.into(),
         import: Import {
+            links: Vec::new(),
+            no_sync: false,
+            mentioned: Default::default(),
             thread: key.into(),
             external: key.into(),
             author: "worker".into(),
@@ -1204,4 +1207,1063 @@ fn deep_link_and_actor_draft_restore_after_restart() {
         .output()
         .unwrap();
     assert_eq!(error.status.code(), Some(2));
+}
+
+fn run_at(f: &Fixture, steps: Value, message: i64, end: &str) -> Tree {
+    let out = f
+        .command(steps, "900x720", end)
+        .arg("--thread")
+        .arg(message.to_string())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    f.tree()
+}
+
+#[test]
+fn guarded_reply_pins_visible_id_across_external_write_restart_and_explicit_reselection() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let root = b
+        .post("jobs", "owner", "Release", &Default::default())
+        .unwrap()
+        .id;
+    let seen = b
+        .reply(root, "owner", "Ready?", &Default::default())
+        .unwrap()
+        .id;
+    let mut cmd = f.command(json!([
+        {"t":0.2,"type":"tap","key":format!("inspect-{seen}")},{"t":0.5,"type":"tap","key":"guard-reply"},
+        {"t":0.8,"paste":"Ready to release"},{"t":1.0,"type":"mark","name":"writing"},
+        {"t":3.4,"type":"tap","key":"send"}
+    ]),"900x780","3.8");
+    cmd.arg("--thread").arg(root.to_string());
+    let t = f.at_mark(&mut cmd, "writing", || {
+        Board::open(&f.db)
+            .unwrap()
+            .reply(seen, "another", "Stop for review", &Default::default())
+            .unwrap();
+    });
+    let all = b.thread(root).unwrap();
+    assert_eq!(all.len(), 3);
+    let newest = all.last().unwrap().id;
+    let expected = format!("Only if #{seen} is still newest");
+    t.expect_text(&expected);
+    t.expect_text(&format!(
+        "newer_message: latest message is #{newest}, not #{seen}"
+    ));
+    t.expect_text("Stop for review");
+    let scope = format!("thread:{root}");
+    let saved = b.load_composer("reader", &scope).unwrap().unwrap();
+    assert_eq!(saved.settings.after, Some(seen));
+    assert_eq!(saved.draft.body, "Ready to release");
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":"send"}]),
+        root,
+        "0.6",
+    );
+    t.expect_text(&expected);
+    assert_eq!(b.thread(root).unwrap().len(), 3);
+    let t = run_at(
+        &f,
+        json!([
+            {"t":0.2,"type":"tap","key":format!("inspect-{newest}")},{"t":0.5,"type":"tap","key":"guard-reply"},
+            {"t":0.8,"type":"key","cmd":true,"name":"Enter"}
+        ]),
+        root,
+        "1.2",
+    );
+    t.expect_text("Ready to release");
+    assert!(!t.0.iter().any(|e| e["key"] == "pinned-guard"));
+    let all = b.thread(root).unwrap();
+    assert_eq!(
+        all.len(),
+        4,
+        "a continuously open independent reader must see the committed reply"
+    );
+    assert_eq!(all.last().unwrap().reply_to, Some(newest));
+    assert!(b.load_composer("reader", &scope).unwrap().is_none());
+}
+
+#[test]
+fn schema_examples_append_to_real_drafts_and_unsolved_shapes_offer_only_the_definition() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    b.register_schema("approval",3,"Local approval",&json!({"type":"object",
+        "additionalProperties":false,"required":["answer"],"properties":{"answer":{"const":"pending"}}})).unwrap();
+    b.register_schema(
+        "impossible",
+        1,
+        "No accepted object",
+        &json!({"type":"object","not":{"type":"object"}}),
+    )
+    .unwrap();
+    let draft = board_local::Draft {
+        body: "Keep this first".into(),
+        channel: "decisions".into(),
+        reply_to: None,
+    };
+    b.save_draft("reader", "new", Some(&draft)).unwrap();
+    let steps = json!([
+        {"t":0.2,"type":"tap","key":"workspace"},{"t":0.4,"type":"tap","key":"work-schemas"},
+        {"t":0.6,"type":"tap","key":"schema-approval-3"},{"t":0.9,"type":"tap","key":"copy-schema-example"},
+        {"t":1.2,"type":"tap","key":"compose-schema-example"},{"t":1.5,"type":"tap","key":"send"}
+    ]);
+    let t = f.render(steps, "900x820", "1.9");
+    let msgs = b.messages(&Filter::default(), 10).unwrap();
+    assert_eq!(msgs.len(), 1);
+    let m = &msgs[0];
+    assert_eq!(m.channel, "decisions");
+    assert!(
+        m.text
+            .starts_with("Keep this first\n\n```json#approval@3\n")
+    );
+    assert_eq!(m.blocks.len(), 1);
+    assert_eq!(m.blocks[0].data, json!({"answer":"pending"}));
+    t.expect_text("approval@3");
+    let t = f.render(json!([
+        {"t":0.2,"type":"tap","key":"workspace"},{"t":0.4,"type":"tap","key":"work-schemas"},
+        {"t":0.6,"type":"tap","key":"schema-impossible-1"},{"t":0.9,"type":"tap","key":"copy-schema-definition"}
+    ]),"870x790","1.2");
+    t.expect_key("copy-schema-definition");
+    t.expect_text("No validated example available");
+    assert!(
+        !t.0.iter()
+            .any(|e| e["key"] == "copy-schema-example" || e["key"] == "compose-schema-example")
+    );
+}
+
+#[test]
+fn local_raster_previews_render_pixels_and_never_overwrite_exports() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let mut bytes = Vec::new();
+    let rgb: Vec<_> = (0..128)
+        .flat_map(|p| {
+            if p % 16 < 8 {
+                [5, 236, 226]
+            } else {
+                [244, 15, 214]
+            }
+        })
+        .collect();
+    {
+        let mut enc = png::Encoder::new(&mut bytes, 16, 8);
+        enc.set_color(png::ColorType::Rgb);
+        enc.set_depth(png::BitDepth::Eight);
+        enc.write_header().unwrap().write_image_data(&rgb).unwrap();
+    }
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new(&mut jpeg)
+        .encode(&rgb, 16, 8, image::ExtendedColorType::Rgb8)
+        .unwrap();
+    let root = b
+        .post(
+            "design",
+            "maker",
+            "Swatches",
+            &PostOptions {
+                files: vec![
+                    ("swatch.png".into(), bytes.clone()),
+                    ("swatch.jpg".into(), jpeg),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let id = root.attachments[0].id;
+    let shot = f.dir.path().join("raster.png");
+    let saved = f.dir.path().join("copy.png");
+    let out = f
+        .command(
+            json!([
+                {"t":0.15,"type":"tap","key":format!("preview-{}-{id}",root.id)},
+                {"t":0.5,"type":"tap","key":"export-preview"},
+                {"t":0.8,"type":"file-dialog","path":saved}
+            ]),
+            "820x630",
+            "1.1",
+        )
+        .arg("--thread")
+        .arg(root.id.to_string())
+        .arg("--snap")
+        .arg(&shot)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let t = f.tree();
+    t.expect_key("preview-image");
+    t.expect_text("16 x 8 px");
+    assert_eq!(fs::read(&saved).unwrap(), bytes);
+    let painted = image::open(&shot).unwrap().into_rgb8();
+    for color in [[5_u8, 236, 226], [244, 15, 214]] {
+        assert!(
+            painted
+                .pixels()
+                .filter(|p| p.0.into_iter().zip(color).all(|(v, c)| v.abs_diff(c) < 12))
+                .count()
+                > 8_000,
+            "attachment color {color:?} missing from actual Rune PNG"
+        );
+    }
+    let t = run_at(
+        &f,
+        json!([
+            {"t":0.2,"type":"tap","key":format!("preview-{}-{}",root.id,root.attachments[1].id)},
+            {"t":0.4,"type":"tap","key":"export-preview"},
+            {"t":0.7,"type":"file-dialog","path":saved}
+        ]),
+        root.id,
+        "1.0",
+    );
+    t.expect_key("preview-image");
+    assert!(t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|s| s.contains("choose a new filename"))
+    }));
+    assert_eq!(fs::read(&saved).unwrap(), bytes);
+    let t = f.render(
+        json!([
+            {"t":0.1,"type":"key","cmd":true,"name":"n"},
+            {"t":0.4,"paste":{"png":saved}},
+            {"t":0.6,"type":"tap","key":"send"}
+        ]),
+        "830x680",
+        "1.0",
+    );
+    t.expect_text(&format!("clipboard-1.png ({} bytes)", bytes.len()));
+    let post = b
+        .messages(
+            &Filter {
+                by: Some("reader".into()),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(b.download(post.attachments[0].id).unwrap().1, bytes);
+}
+
+#[test]
+fn safe_preview_refuses_active_and_oversized_content_and_closes_on_tombstone() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let mut giant = Vec::new();
+    {
+        let enc = png::Encoder::new(&mut giant, 5000, 1);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[0; 5000])
+            .unwrap();
+    }
+    let html = "<script>fetch('http://127.0.0.1/private')</script>";
+    let m = b
+        .post(
+            "docs",
+            "reader",
+            "Review file",
+            &PostOptions {
+                files: vec![
+                    ("page.html".into(), html.as_bytes().into()),
+                    ("long.png".into(), giant),
+                    ("readme.txt".into(), b"# Literal **text**".to_vec()),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let open = |i: usize| json!({"t":0.15,"type":"tap","key":format!("preview-{}-{}",m.id,m.attachments[i].id)});
+    let t = run_at(&f, json!([open(0)]), m.id, "0.6");
+    t.expect_text("No inline preview for this file type");
+    assert!(!t.0.iter().any(|e| e.to_string().contains("127.0.0.1")));
+    let t = run_at(&f, json!([open(1)]), m.id, "0.6");
+    t.expect_key("preview-unavailable");
+    assert!(!t.0.iter().any(|e| e["key"] == "preview-image"));
+    let t = run_at(&f, json!([open(2)]), m.id, "0.6");
+    t.expect_text("# Literal **text**");
+    let mut cmd = f.command(
+        json!([open(2),{"t":0.7,"type":"mark","name":"previewed"}]),
+        "900x720",
+        "2.6",
+    );
+    let t = f.at_mark(
+        cmd.arg("--thread").arg(m.id.to_string()),
+        "previewed",
+        || {
+            b.delete(m.id, "reader", Some(m.revision)).unwrap();
+        },
+    );
+    t.expect_text("Message deleted");
+    assert!(
+        !t.0.iter()
+            .any(|e| e["key"] == "preview-text" || e["text"] == "# Literal **text**")
+    );
+}
+
+#[test]
+fn keyboard_seek_and_bounded_bidirectional_reply_pages() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let root = b
+        .post("dev", "reader", "Long running thread", &Default::default())
+        .unwrap();
+    let replies: Vec<_> = (1..=93)
+        .map(|n| {
+            b.reply(
+                root.id,
+                "worker",
+                &format!("Observation {n:03}"),
+                &Default::default(),
+            )
+            .unwrap()
+            .id
+        })
+        .collect();
+    let t = run_at(&f, json!([]), root.id, "0.6");
+    t.expect_text("Observation 054");
+    t.expect_text("Observation 093");
+    assert!(!t.0.iter().any(|e| e["text"] == "Observation 053"));
+    let target = replies[49];
+    let t = f.render(
+        json!([
+            {"t":0.15,"type":"key","cmd":true,"name":"l"},{"t":0.4,"paste":format!("#{target}")},
+            {"t":0.65,"type":"key","name":"Enter"}
+        ]),
+        "900x720",
+        "1.25",
+    );
+    t.expect_text("Observation 050");
+    t.expect_text("Observation 011");
+    t.expect_text("Long running thread");
+    let y = |key: &str| {
+        let el = t.0.iter().find(|v| v["key"] == key).unwrap();
+        (
+            el["rect"][1].as_f64().unwrap(),
+            el["rect"][3].as_f64().unwrap(),
+        )
+    };
+    let (top, height) = y("conversation");
+    let (target_y, _) = y(&format!("inspect-{target}"));
+    assert!(
+        (top..top + height).contains(&target_y),
+        "jump did not reveal the addressed reply"
+    );
+    assert!(
+        !t.0.iter()
+            .any(|e| e["text"] == "Observation 051" || e["text"] == "Observation 010")
+    );
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":"older-replies"}]),
+        target,
+        "0.6",
+    );
+    t.expect_text("Observation 001");
+    t.expect_text("Observation 010");
+    assert!(!t.0.iter().any(|e| e["text"] == "Observation 011"));
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":"newer-replies"}]),
+        target,
+        "0.6",
+    );
+    t.expect_text("Observation 051");
+    t.expect_text("Observation 090");
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":"latest-replies"}]),
+        target,
+        "0.6",
+    );
+    t.expect_text("Observation 093");
+}
+
+#[test]
+fn query_filters_replies_before_paging_and_separates_imported_origins() {
+    use board_local::sources::{Change, Envelope, Import, Provider};
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let root = b
+        .post(
+            "ops/build",
+            "lead",
+            "Target thread",
+            &PostOptions {
+                labels: [
+                    ("stage".to_string(), "review".into()),
+                    ("empty".into(), String::new()),
+                ]
+                .into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let reply = b
+        .reply(
+            root.id,
+            "worker/run",
+            "Need @reader signoff",
+            &Default::default(),
+        )
+        .unwrap();
+    for i in 0..65 {
+        b.post(
+            "ops/build",
+            "worker/run",
+            &format!("Distractor {i} @reader"),
+            &Default::default(),
+        )
+        .unwrap();
+    }
+    b.create_source("reader", "mirror", Provider::Local, "inbox", "ops/build")
+        .unwrap();
+    let imp = b
+        .import_source(
+            "reader",
+            "mirror",
+            &Envelope {
+                key: "in-1".into(),
+                raw: json!({}),
+                import: Import {
+                    links: Vec::new(),
+                    no_sync: false,
+                    mentioned: Default::default(),
+                    thread: "remote-1".into(),
+                    external: "note-1".into(),
+                    author: "bot".into(),
+                    profile: None,
+                    parent: None,
+                    url: None,
+                    updated_at: None,
+                    change: Change::Post {
+                        text: "Imported activity".into(),
+                        labels: Default::default(),
+                    },
+                },
+            },
+        )
+        .unwrap();
+    let steps = json!([
+        {"t":0.1,"type":"tap","key":"nav-ops:"},{"t":0.3,"type":"key","cmd":true,"shift":true,"name":"f"},
+        {"t":0.5,"paste":"worker"},{"t":0.7,"type":"tap","key":"filter-mention"},{"t":0.9,"paste":"reader"},
+        {"t":1.1,"type":"tap","key":"filter-text"},{"t":1.3,"paste":"signoff"},
+        {"t":1.5,"type":"tap","key":"filter-labels"},{"t":1.7,"paste":"stage=ready|review\nempty="},
+        {"t":1.9,"type":"tap","key":"apply-filters"}
+    ]);
+    let t = f.render(steps.clone(), "860x740", "2.2");
+    t.expect_text("Target thread");
+    assert!(!t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("Distractor"))
+    }));
+    let mut activity = steps.as_array().unwrap().clone();
+    activity.push(json!({"t":2.3,"type":"tap","key":"activity"}));
+    let t = f.render(Value::Array(activity), "860x740", "2.6");
+    t.expect_key(&format!("activity-message-{}", reply.id));
+    assert!(
+        !t.0.iter()
+            .any(|e| e["key"] == format!("activity-message-{}", root.id)),
+        "unexpected root in filtered activity: {:?}",
+        t.0.iter()
+            .filter_map(|e| e["text"].as_str())
+            .collect::<Vec<_>>()
+    );
+    let t=f.render(json!([
+        {"t":0.1,"type":"tap","key":"filter-messages"},{"t":0.3,"type":"tap","key":"filter-from"},
+        {"t":0.5,"paste":"mirror"},{"t":0.7,"type":"tap","key":"apply-filters"}
+    ]),"860x740","1.0");
+    t.expect_text("Imported activity");
+    t.expect_key(&format!("thread-{}", imp.id));
+    assert!(!t.0.iter().any(|e| e["text"] == "Target thread"));
+}
+
+#[test]
+fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    b.post("studio", "reader", "Start", &Default::default())
+        .unwrap();
+    b.set_actor_profile("artist/render", "shade", "Render worker")
+        .unwrap();
+    b.post(
+        "studio",
+        "artist/render",
+        "Visible profile",
+        &Default::default(),
+    )
+    .unwrap();
+    let t=f.render(json!([
+        {"t":0.1,"type":"tap","key":"choose-profile"},{"t":0.3,"type":"tap","key":"open-directory"},
+        {"t":0.5,"type":"tap","key":"edit-person"},{"t":0.7,"type":"key","cmd":true,"name":"a"},{"t":0.9,"paste":"Studio Reader"},
+        {"t":1.1,"type":"tap","key":"person-handle"},{"t":1.3,"type":"key","cmd":true,"name":"a"},{"t":1.5,"paste":"studio-reader"},
+        {"t":1.7,"type":"tap","key":"save-person"}
+    ]),"860x740","2.1");
+    t.expect_text("Studio Reader");
+    t.expect_text("Render worker");
+    assert_eq!(
+        b.actor_directory(Some("studio-reader")).unwrap()[0].id,
+        "reader"
+    );
+    let t = f.render(
+        json!([
+            {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.3,"paste":"Thanks "},
+            {"t":0.5,"type":"tap","key":"mention-person"},{"t":0.7,"paste":"shade"},
+            {"t":0.9,"type":"key","name":"Enter"},{"t":1.1,"type":"key","cmd":true,"name":"Enter"}
+        ]),
+        "860x740",
+        "1.6",
+    );
+    t.expect_key("conversation");
+    let sent = b
+        .messages(
+            &Filter {
+                by: Some("reader".into()),
+                mentions: Some("artist/render".into()),
+                ..Filter::default()
+            },
+            5,
+        )
+        .unwrap();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].text.trim(), "Thanks @[artist/render]");
+    b.set_grant(
+        "reader",
+        None,
+        "guest",
+        &board_local::access::Rules::parse("studio=read").unwrap(),
+    )
+    .unwrap();
+    b.post("private", "hidden/user", "Hidden", &Default::default())
+        .unwrap();
+    let credential = b.issue_credential("reader", "guest", None, None).unwrap();
+    let mut cmd=f.command(json!([
+        {"t":0.1,"type":"tap","key":"choose-profile"},{"t":0.3,"type":"tap","key":"open-directory"}
+    ]),"860x740","0.6");
+    assert!(
+        cmd.env("BOARD_TOKEN", &credential.token)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let t = f.tree();
+    t.expect_text("Render worker");
+    assert!(!t.0.iter().any(|e| e.to_string().contains("hidden/user")));
+}
+
+#[test]
+fn task_routing_filters_query_all_pages_and_pending_schedules_are_in_thread() {
+    use board_local::automation::{Destination, Timing, schedule};
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let make = |name: &str, actor: &str, ch: &str, needs: &[i64], labels: PostOptions| {
+        create_task(
+            &b,
+            actor,
+            TaskTarget::New {
+                channel: ch,
+                text: name,
+                options: &labels,
+            },
+            needs,
+            Some(&format!("{actor}/builder")),
+        )
+        .unwrap()
+    };
+    let prereq = make("First job", "reader", "ops/work", &[], Default::default());
+    for n in 0..43 {
+        make(
+            &format!("Other task {n}"),
+            "other",
+            "other",
+            &[],
+            Default::default(),
+        );
+    }
+    let target = make(
+        "Filtered job",
+        "reader",
+        "ops/work",
+        &[prereq.id],
+        PostOptions {
+            labels: [("batch".into(), "nightly".into())].into(),
+            ..Default::default()
+        },
+    );
+    let t=f.render(json!([
+        {"t":0.1,"type":"tap","key":"tasks"},{"t":0.3,"type":"tap","key":"task-criteria"},
+        {"t":0.5,"type":"tap","key":"criteria-owner"},{"t":0.7,"paste":"reader"},
+        {"t":0.9,"type":"tap","key":"criteria-assignee"},{"t":1.1,"paste":"reader/builder"},
+        {"t":1.3,"type":"tap","key":"criteria-channel"},{"t":1.5,"paste":"ops/"},
+        {"t":1.7,"type":"tap","key":"criteria-needs"},{"t":1.9,"paste":format!("#{}",prereq.id)},
+        {"t":2.1,"type":"tap","key":"criteria-labels"},{"t":2.3,"paste":"batch=weekly|nightly"},
+        {"t":2.5,"type":"tap","key":"apply-task-filters"}
+    ]),"900x820","2.8");
+    t.expect_text("Filtered job");
+    t.expect_key(&format!("task-row-{}", target.id));
+    assert!(
+        !t.0.iter()
+            .any(|e| e["text"] == "First job" || e["key"] == "next-page")
+    );
+    let scheduled = schedule(
+        &b,
+        "reader",
+        Destination::Reply(target.id),
+        "Scheduled followup",
+        Timing {
+            due: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64
+                + 3600,
+            every: None,
+            times: None,
+            until: None,
+        },
+        Default::default(),
+    )
+    .unwrap();
+    let t = run_at(&f, json!([]), target.id, "0.6");
+    t.expect_key(&format!("scheduled-reply-{}", scheduled.id));
+}
+
+fn stamp_in(seconds: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    chrono::DateTime::from_timestamp(now + seconds, 0)
+        .unwrap()
+        .to_rfc3339()
+}
+
+#[test]
+fn scheduled_private_composer_recovers_files_and_cancels_in_thread() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let root = b
+        .post("ops", "reader", "Plan", &Default::default())
+        .unwrap();
+    let parent = b
+        .reply(root.id, "reader", "Target", &Default::default())
+        .unwrap();
+    let file = f.dir.path().join("sample.bin");
+    fs::write(&file, [42, 0, 29]).unwrap();
+    let scope = format!("thread:{}", root.id);
+    let t = run_at(
+        &f,
+        json!([
+            {"t":0.2,"type":"tap","key":format!("reply-{}",parent.id)},{"t":0.4,"paste":"Private recurring follow-up"},
+            {"t":0.6,"type":"tap","key":"attach-file"},{"t":0.8,"type":"file-dialog","path":file},
+            {"t":1.0,"type":"tap","key":"delivery-options"},{"t":1.2,"type":"tap","key":"compose-no-sync"},
+            {"t":1.4,"type":"tap","key":"compose-labels"},{"t":1.6,"paste":"stage=classified"},
+            {"t":1.8,"type":"tap","key":"compose-later"},
+            {"t":2.0,"type":"tap","key":"compose-due"},{"t":2.2,"paste":stamp_in(3600)},
+            {"t":2.4,"type":"tap","key":"compose-every"},{"t":2.6,"paste":"60"},
+            {"t":2.8,"type":"tap","key":"compose-times"},{"t":3.0,"paste":"2"},
+            {"t":3.2,"type":"tap","key":"done-delivery"}
+        ]),
+        parent.id,
+        "3.6",
+    );
+    t.expect_text("Schedule");
+    t.expect_text("sample.bin (3 bytes)");
+    let saved = b.load_composer("reader", &scope).unwrap().unwrap();
+    assert!(saved.settings.no_sync && saved.settings.later);
+    assert_eq!(saved.draft.reply_to, Some(parent.id));
+    assert_eq!(saved.files[0].1, [42, 0, 29]);
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":"send"}]),
+        root.id,
+        "0.6",
+    );
+    let schedule = board_local::automation::schedules(&b, true)
+        .unwrap()
+        .pop()
+        .unwrap();
+    t.expect_key(&format!("scheduled-reply-{}", schedule.id));
+    assert!(schedule.no_sync);
+    assert_eq!(schedule.re, Some(parent.id));
+    assert_eq!(schedule.labels["stage"], "classified");
+    assert_eq!((schedule.every, schedule.max_sends), (Some(60), Some(2)));
+    assert_eq!(schedule.attachments[0].size, 3);
+    assert_eq!(b.thread(root.id).unwrap().len(), 2);
+    assert!(b.load_composer("reader", &scope).unwrap().is_none());
+    let t = run_at(
+        &f,
+        json!([
+            {"t":0.2,"type":"tap","key":format!("cancel-pending-{}",schedule.id)},
+            {"t":0.5,"type":"tap","key":format!("confirm-pending-{}",schedule.id)}
+        ]),
+        root.id,
+        "0.8",
+    );
+    assert!(
+        !t.0.iter()
+            .any(|e| e["key"] == format!("scheduled-reply-{}", schedule.id))
+    );
+    assert_eq!(
+        board_local::automation::get_schedule(&b, schedule.id)
+            .unwrap()
+            .state,
+        "canceled"
+    );
+}
+
+#[test]
+fn recurring_composer_persists_stop_date_and_rejects_two_competing_stops() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let until = stamp_in(7200);
+    let steps = json!([
+        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"message-body"},{"t":0.6,"paste":"Until a date"},
+        {"t":0.8,"type":"tap","key":"delivery-options"},{"t":1.0,"type":"tap","key":"compose-later"},
+        {"t":1.2,"type":"tap","key":"compose-due"},{"t":1.4,"paste":stamp_in(3600)},
+        {"t":1.6,"type":"tap","key":"compose-every"},{"t":1.8,"paste":"60"},
+        {"t":2.0,"type":"tap","key":"compose-times"},{"t":2.2,"paste":"8"},
+        {"t":2.4,"type":"tap","key":"compose-until"},{"t":2.6,"paste":until},
+        {"t":2.8,"type":"tap","key":"done-delivery"},{"t":3.0,"type":"tap","key":"send"}
+    ]);
+    let t = f.render(steps, "940x830", "3.3");
+    assert!(t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|s| s.contains("only one repeat stop"))
+    }));
+    assert!(
+        board_local::automation::schedules(&b, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        b.load_composer("reader", "new")
+            .unwrap()
+            .unwrap()
+            .settings
+            .until,
+        until
+    );
+    let t=f.render(json!([
+        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"delivery-options"},
+        {"t":0.7,"type":"tap","key":"compose-times"},{"t":0.9,"type":"key","cmd":true,"name":"a"},
+        {"t":1.1,"type":"key","name":"Backspace"},{"t":1.3,"type":"tap","key":"done-delivery"},
+        {"t":1.6,"type":"tap","key":"send"}
+    ]),"940x830","2.0");
+    t.expect_text("Schedules");
+    let rows = board_local::automation::schedules(&b, true).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].max_sends, None);
+    assert_eq!(
+        rows[0].until,
+        Some(
+            chrono::DateTime::parse_from_rfc3339(&until)
+                .unwrap()
+                .timestamp()
+        )
+    );
+    assert!(b.load_composer("reader", "new").unwrap().is_none());
+}
+
+#[test]
+fn stale_composer_cannot_publish_after_privacy_change_or_downgrade_an_overdue_schedule() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let original = board_local::Draft {
+        body: "Keep the classification".into(),
+        channel: "ops".into(),
+        reply_to: None,
+    };
+    let plain = board_local::ComposerSettings::default();
+    let stamp = b
+        .save_composer("reader", "new", None, Some((&original, &plain)), None)
+        .unwrap()
+        .unwrap();
+    let mut cmd = f.command(
+        json!([
+            {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.5,"type":"mark","name":"loaded"},
+            {"t":1.5,"type":"tap","key":"send"}
+        ]),
+        "860x720",
+        "2.1",
+    );
+    let private = board_local::ComposerSettings {
+        no_sync: true,
+        later: true,
+        due: stamp_in(-600),
+        ..Default::default()
+    };
+    let t = f.at_mark(&mut cmd, "loaded", || {
+        b.save_composer(
+            "reader",
+            "new",
+            Some(&stamp),
+            Some((&original, &private)),
+            None,
+        )
+        .unwrap();
+    });
+    assert!(t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("Draft changed"))
+    }));
+    assert!(b.messages(&Filter::default(), 5).unwrap().is_empty());
+    let t = f.render(
+        json!([{"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"send"}]),
+        "860x720",
+        "0.7",
+    );
+    assert!(t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|t| t.contains("send time has passed"))
+    }));
+    assert!(b.messages(&Filter::default(), 5).unwrap().is_empty());
+    assert!(
+        board_local::automation::schedules(&b, true)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        b.load_composer("reader", "new").unwrap().unwrap().settings,
+        private
+    );
+    let t=f.render(json!([
+        {"t":0.1,"type":"key","cmd":true,"name":"n"},{"t":0.4,"type":"tap","key":"delivery-options"},
+        {"t":0.7,"type":"tap","key":"compose-later"},{"t":1.0,"type":"tap","key":"done-delivery"},
+        {"t":1.3,"type":"tap","key":"send"}
+    ]),"860x720","1.6");
+    t.expect_text("Local only");
+    let messages = b.messages(&Filter::default(), 5).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert!(messages[0].no_sync);
+}
+
+#[test]
+fn exact_message_delivery_failures_are_scoped_and_local_only_replies_are_not_queued() {
+    use board_local::sources::{DeliveryResult, Direction, FailureReport, Provider};
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let root = b
+        .post("dev", "reader", "Mirrored root", &Default::default())
+        .unwrap();
+    b.create_source("reader", "mirror", Provider::Local, "mirror-room", "dev")
+        .unwrap();
+    b.set_outbound("reader", "mirror", true).unwrap();
+    let confirmed = b.start_source_thread("reader", "mirror", root.id).unwrap();
+    let first = b
+        .take_source_delivery("reader", "mirror", Direction::Out, 60)
+        .unwrap()
+        .unwrap();
+    b.finish_source(
+        "reader",
+        "mirror",
+        first.job.id,
+        &first.receipt,
+        Some(&DeliveryResult {
+            external: "copy-1".into(),
+            url: Some("https://mirror.invalid/items/1".into()),
+            thread: Some("one".into()),
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        b.source_copies("reader", "mirror", root.id).unwrap().len(),
+        1
+    );
+    let t = run_at(
+        &f,
+        json!([
+            {"t":0.2,"type":"tap","key":"message-body"},{"t":0.4,"paste":"Private reply"},
+            {"t":0.6,"type":"tap","key":"delivery-options"},{"t":0.8,"type":"tap","key":"compose-no-sync"},
+            {"t":1.0,"type":"tap","key":"done-delivery"},{"t":1.2,"type":"tap","key":"send"}
+        ]),
+        root.id,
+        "1.6",
+    );
+    t.expect_text("Local only");
+    let private = b.thread(root.id).unwrap().pop().unwrap();
+    assert!(private.no_sync);
+    assert!(
+        b.message_deliveries("reader", private.id)
+            .unwrap()
+            .is_empty()
+    );
+    b.edit(
+        root.id,
+        "reader",
+        "Mirrored root updated",
+        Some(root.revision),
+    )
+    .unwrap();
+    let edit = b
+        .take_source_delivery("reader", "mirror", Direction::Out, 60)
+        .unwrap()
+        .unwrap();
+    b.fail_source(
+        "reader",
+        "mirror",
+        edit.job.id,
+        &edit.receipt,
+        FailureReport {
+            reason: "PRIVATE RAW FAILURE SECRET",
+            uncertain: true,
+            retry_after: None,
+        },
+    )
+    .unwrap();
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":format!("inspect-{}",root.id)}]),
+        root.id,
+        "0.6",
+    );
+    for id in [confirmed.id, edit.job.id] {
+        t.expect_key(&format!("delivery-notice-{id}"));
+    }
+    assert!(t.0.iter().any(|e| {
+        e["text"]
+            .as_str()
+            .is_some_and(|s| s.contains("uncertain") && s.contains("Attempts: 1"))
+    }));
+    assert!(
+        !t.0.iter().any(|e| e.to_string().contains(&edit.receipt)
+            || e.to_string().contains("PRIVATE RAW FAILURE"))
+    );
+    let t = run_at(
+        &f,
+        json!([{"t":0.2,"type":"tap","key":format!("inspect-{}",private.id)}]),
+        private.id,
+        "0.6",
+    );
+    assert!(!t.0.iter().any(|e| {
+        e["key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("delivery-notice-"))
+    }));
+    b.set_grant(
+        "reader",
+        None,
+        "viewer",
+        &board_local::access::Rules::parse("dev=read").unwrap(),
+    )
+    .unwrap();
+    let token = b.issue_credential("reader", "viewer", None, None).unwrap();
+    let mut cmd = f.command(
+        json!([{"t":0.2,"type":"tap","key":format!("inspect-{}",root.id)}]),
+        "860x700",
+        "0.6",
+    );
+    assert!(
+        cmd.env("BOARD_TOKEN", token.token)
+            .arg("--thread")
+            .arg(root.id.to_string())
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    assert!(!f.tree().0.iter().any(|e| {
+        e["key"]
+            .as_str()
+            .is_some_and(|k| k.starts_with("delivery-notice-"))
+    }));
+    let quote = b
+        .post(
+            "dev",
+            "reader",
+            "Reference https://mirror.invalid/items/1",
+            &Default::default(),
+        )
+        .unwrap();
+    let t = run_at(&f, json!([]), quote.id, "0.5");
+    t.expect_key(&format!("quote-{}-0", quote.id));
+    t.expect_text(&format!("Quoted message #{}", root.id));
+    t.expect_text("Mirrored root updated");
+}
+
+#[test]
+fn opt_in_h264_sample_steps_real_frames_and_degrades_without_the_decoder() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let m = b
+        .post(
+            "video",
+            "reader",
+            "Color swatches",
+            &PostOptions {
+                files: vec![(
+                    "motion.mp4".into(),
+                    include_bytes!("fixtures/swatches.mp4").to_vec(),
+                )],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let open =
+        json!({"t":0.1,"type":"tap","key":format!("preview-{}-{}",m.id,m.attachments[0].id)});
+    let mut missing = f.command(json!([open]), "820x640", "1.0");
+    let output = missing
+        .env("PATH", f.dir.path())
+        .arg("--thread")
+        .arg(m.id.to_string())
+        .arg("--realtime")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    f.tree()
+        .expect_text("Video preview needs a local FFmpeg executable");
+    if !Command::new("ffmpeg")
+        .arg("-version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+    {
+        return;
+    }
+    let shot = f.dir.path().join("frame.png");
+    let mut cmd = f.command(
+        json!([open,{"t":1.0,"type":"tap","key":"clip-next"},
+        {"t":1.4,"type":"tap","key":"clip-play"}]),
+        "820x640",
+        "2.8",
+    );
+    let o = cmd
+        .arg("--thread")
+        .arg(m.id.to_string())
+        .arg("--realtime")
+        .arg("--snap")
+        .arg(&shot)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    let t = f.tree();
+    t.expect_key("clip-frame");
+    t.expect_text("Silent sample   Frame 4 of 4");
+    let painted = image::open(&shot).unwrap().into_rgb8();
+    assert!(
+        painted
+            .pixels()
+            .filter(|p| p.0[0] > 220 && p.0[1] < 30 && p.0[2] > 220)
+            .count()
+            > 7000,
+        "the last decoded magenta frame must actually reach the Rune framebuffer"
+    );
 }

@@ -1,6 +1,6 @@
 mod cache;
 mod runner;
-use anyhow::{Result, anyhow, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use board_local::{Board, Filter, PostOptions, automation::*};
 use cache::Cache;
 use chrono::{DateTime, Utc};
@@ -50,6 +50,9 @@ pub struct TaskArgs {
 
 #[derive(Debug, Args)]
 struct TaskList {
+    /// Return the most recently active tasks, in chronological order.
+    #[arg(long, conflicts_with = "after")]
+    latest: bool,
     /// Exact channel, or a subtree ending in /.
     channel: Option<String>,
     #[arg(long)]
@@ -78,7 +81,12 @@ struct Held {
     #[arg(long, env = "BOARD_CLAIM_EPOCH")]
     epoch: Option<i64>,
     /// Private receipt returned only to the successful claimant
-    #[arg(long, env = "BOARD_CLAIM_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "BOARD_CLAIM_TOKEN",
+        hide_env_values = true,
+        allow_hyphen_values = true
+    )]
     token: Option<String>,
 }
 
@@ -97,7 +105,12 @@ struct ClaimArgs {
     #[arg(long = "from", requires = "ready")]
     owners: Vec<String>,
     /// Caller-minted secret for retries after a lost response
-    #[arg(long, env = "BOARD_REQUEST_TOKEN", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "BOARD_REQUEST_TOKEN",
+        hide_env_values = true,
+        allow_hyphen_values = true
+    )]
     token: Option<String>,
 }
 
@@ -122,6 +135,8 @@ enum TaskCmd {
         file: Option<String>,
         #[arg(long)]
         idempotency_key: Option<String>,
+        #[arg(long, conflicts_with = "file")]
+        no_sync: bool,
         /// Claim the newly created task atomically
         #[arg(long, conflicts_with = "file")]
         claim: bool,
@@ -131,7 +146,8 @@ enum TaskCmd {
             long,
             requires = "claim",
             env = "BOARD_REQUEST_TOKEN",
-            hide_env_values = true
+            hide_env_values = true,
+            allow_hyphen_values = true
         )]
         token: Option<String>,
     },
@@ -152,7 +168,12 @@ enum TaskCmd {
     Recover {
         #[arg(required_unless_present = "token")]
         id: Option<i64>,
-        #[arg(long, env = "BOARD_REQUEST_TOKEN", hide_env_values = true)]
+        #[arg(
+            long,
+            env = "BOARD_REQUEST_TOKEN",
+            hide_env_values = true,
+            allow_hyphen_values = true
+        )]
         token: Option<String>,
     },
     Renew {
@@ -179,7 +200,12 @@ enum TaskCmd {
         kind: Option<String>,
         #[arg(long, env = "BOARD_CLAIM_EPOCH")]
         epoch: Option<i64>,
-        #[arg(long, env = "BOARD_CLAIM_TOKEN", hide_env_values = true)]
+        #[arg(
+            long,
+            env = "BOARD_CLAIM_TOKEN",
+            hide_env_values = true,
+            allow_hyphen_values = true
+        )]
         token: Option<String>,
     },
     Unblock {
@@ -210,6 +236,8 @@ enum TaskCmd {
 
 #[derive(Debug, Args)]
 pub struct ScheduleArgs {
+    #[arg(long)]
+    no_sync: bool,
     /// Channel, message ID, or cancel.
     target: String,
     #[arg(conflicts_with = "file")]
@@ -238,6 +266,17 @@ pub struct ScheduleArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum WatchCmd {
+    /// Lease independent thread heads from all registrations visible to this actor.
+    Matches {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        #[arg(long, default_value = "5m")]
+        lease: String,
+    },
+    /// Atomically replace this actor's subscriptions from a JSON array; - reads stdin.
+    Replace {
+        file: PathBuf,
+    },
     /// Run an explicit local handler. It receives the event JSON on stdin.
     Run {
         name: String,
@@ -251,7 +290,11 @@ pub enum WatchCmd {
     /// Subscribe to future matching events, from the current head.
     Add {
         name: String,
+        #[arg(long)]
+        all: bool,
         channel: Option<String>,
+        #[arg(long)]
+        from: Option<String>,
         #[arg(long)]
         kind: Option<String>,
         #[arg(long)]
@@ -359,6 +402,7 @@ pub(crate) fn summary(t: &Task) -> String {
 fn list(board: &Board, actor: &str, q: &TaskList, json: bool) -> Result<()> {
     ensure!((1..=500).contains(&q.limit), "limit must be 1..500");
     let filter = TaskFilter {
+        latest: q.latest,
         channel: q.channel.clone(),
         state: q.state.clone(),
         needs: q.needs,
@@ -368,7 +412,13 @@ fn list(board: &Board, actor: &str, q: &TaskList, json: bool) -> Result<()> {
         owner: q.owner.clone(),
         assignee: q.assignee.as_deref().map(|p| assignee(actor, p)),
     };
-    let (_, mut ts) = filtered_tasks_page(board, &filter, q.after, q.limit + 1)?;
+    let (_, mut ts) = filtered_tasks_page_as(
+        board,
+        Some(actor),
+        &filter,
+        q.after,
+        q.limit + usize::from(!q.latest),
+    )?;
     let more = ts.len() > q.limit;
     ts.truncate(q.limit);
     print(&ts, json, || {
@@ -378,6 +428,21 @@ fn list(board: &Board, actor: &str, q: &TaskList, json: bool) -> Result<()> {
         }
         lines.join("\n")
     })
+}
+pub(crate) fn output_key(
+    board: &Board,
+    actor: &str,
+    given: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(token) = std::env::var_os("BOARD_CALLBACK_TOKEN") {
+        return Ok(Some(callback_write_key(
+            board,
+            actor,
+            token.to_str().context("invalid callback token")?,
+            given,
+        )?));
+    }
+    Ok(given.map(str::to_owned))
 }
 fn take(board: &Board, actor: &str, args: &ClaimArgs, cache: &Cache) -> Result<Task> {
     let lease = secs(&args.lease)?;
@@ -458,6 +523,7 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
             attachment_ids,
             file,
             idempotency_key: key,
+            no_sync,
             claim,
             lease,
             token,
@@ -468,6 +534,7 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
                 } else {
                     serde_json::from_reader(std::fs::File::open(file)?)?
                 };
+                let key = output_key(board, actor, key.as_deref())?;
                 let plan = create_plan(board, actor, target, &items, key.as_deref())?;
                 return print(&plan, json, || {
                     plan.iter().map(summary).collect::<Vec<_>>().join("\n")
@@ -480,7 +547,12 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
                     .iter()
                     .map(|key| board.file_id(actor, key))
                     .collect::<Result<Vec<_>>>()?,
-                key: key.clone(),
+                key: if text.is_some() || !attachments.is_empty() || !attachment_ids.is_empty() {
+                    output_key(board, actor, key.as_deref())?
+                } else {
+                    None
+                },
+                no_sync: *no_sync,
                 ..Default::default()
             };
             let input = match text.as_deref() {
@@ -497,7 +569,7 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
                 }
                 _ => {
                     ensure!(
-                        ls.is_empty() && key.is_none(),
+                        ls.is_empty() && key.is_none() && !*no_sync,
                         "labels and idempotency apply to new threads only"
                     );
                     TaskTarget::Existing(target.parse()?)
@@ -685,6 +757,7 @@ impl Commands {
                             until,
                         },
                         &PostOptions {
+                            no_sync: a.no_sync,
                             labels: crate::pairs(&a.labels, false)?,
                             files: crate::attachment_files(&a.attachments)?,
                             attachment_ids: a
@@ -705,6 +778,28 @@ impl Commands {
                 })
             }
             Self::Watchers { action } => match action {
+                WatchCmd::Matches { limit, lease } => {
+                    let found = lease_matches(board, limit, secs(&lease)?)?;
+                    print(&found, json, || {
+                        found
+                            .iter()
+                            .map(|d| {
+                                format!("{} #{} receipt {}", d.watcher, d.event.cursor, d.receipt)
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                }
+                WatchCmd::Replace { file } => {
+                    let specs: Vec<WatchSpec> = serde_json::from_str(&crate::load_text(&file)?)?;
+                    let ws = replace_watchers(board, actor, &specs)?;
+                    print(&ws, json, || {
+                        ws.iter()
+                            .map(|w| w.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                }
                 WatchCmd::Run {
                     name,
                     once,
@@ -722,7 +817,9 @@ impl Commands {
                 ),
                 WatchCmd::Add {
                     name,
+                    all,
                     channel,
+                    from,
                     kind,
                     by,
                     re,
@@ -730,20 +827,24 @@ impl Commands {
                     mentions,
                     labels: ls,
                 } => {
-                    let w = add_watcher_as(
+                    let w = add_watcher_spec(
                         board,
                         actor,
-                        &name,
-                        Filter {
-                            channel,
-                            by,
-                            re,
-                            text,
-                            mentions,
-                            label_terms: board_local::LabelTerm::parse(&ls)?,
-                            ..Default::default()
+                        WatchSpec {
+                            name,
+                            all,
+                            kind,
+                            filter: Filter {
+                                channel,
+                                from,
+                                by,
+                                re,
+                                text,
+                                mentions,
+                                label_terms: board_local::LabelTerm::parse(&ls)?,
+                                ..Default::default()
+                            },
                         },
-                        kind.as_deref(),
                     )?;
                     print(&w, json, || format!("{}  after {}", w.name, w.cursor))
                 }

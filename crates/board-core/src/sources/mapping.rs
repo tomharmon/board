@@ -110,6 +110,14 @@ impl Board {
         self.write(|tx| {
             let s = self.authorized_source(tx, name, who)?;
             let m = Self::get_on(tx, local)?;
+            ensure!(
+                !tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM private_messages WHERE id IN (?,?))",
+                    params![m.id, m.re],
+                    |r| r.get::<_, bool>(0)
+                )?,
+                Kind::Conflict.error("no_sync", "this message is local-only")
+            );
             let old = find_on(tx, name, thread, external)?;
             let item = bind(tx, &s, thread, external, &m, false, url)?;
             if old.is_none() {
@@ -204,6 +212,26 @@ pub(super) fn validate(i: &Import) -> Result<()> {
         "invalid external author"
     );
     valid_link(i.url.as_deref())?;
+    ensure!(
+        i.links.len() <= 12
+            && i.links
+                .iter()
+                .all(|l| l.message.is_none() && crate::links::slack_address(&l.url).is_some()),
+        "invalid external link snapshot"
+    );
+    ensure!(i.mentioned.len() <= 100, "too many mentioned profiles");
+    for (id, p) in &i.mentioned {
+        ident(id)?;
+        ensure!(
+            !id.contains('/')
+                && id.len() <= 160
+                && !p.name.trim().is_empty()
+                && p.name.len() <= 256
+                && !p.name.chars().any(char::is_control),
+            "invalid mentioned profile"
+        );
+        valid_link(p.avatar.as_deref())?;
+    }
     if let Some(p) = &i.profile {
         ensure!(
             !p.name.trim().is_empty()
@@ -221,8 +249,26 @@ pub(super) fn validate(i: &Import) -> Result<()> {
 }
 pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Message> {
     validate(i)?;
+    ensure!(
+        !matches!(i.change, Change::Ignore),
+        Kind::Invalid.error("ignored_event", "provider event has no Board effect")
+    );
     let actor = format!("source:{}/{}", s.name, i.author);
     crate::validate_actor(&actor)?;
+    let text = match &i.change {
+        Change::Post { text, .. }
+        | Change::Upsert { text, .. }
+        | Change::Reconcile { text, .. }
+        | Change::Edit { text } => text.as_str(),
+        _ => "",
+    };
+    let terms = crate::prose::tokens(text);
+    for (id, p) in &i.mentioned {
+        let id = format!("source:{}/{}", s.name, id);
+        if terms.iter().any(|t| t.exact && t.value == id) {
+            tx.execute("INSERT INTO sync_profiles VALUES(?,?,?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name,avatar=coalesce(excluded.avatar,sync_profiles.avatar)",params![id,s.name,p.name,p.avatar])?;
+        }
+    }
     if let Some(p) = &i.profile {
         tx.execute("INSERT INTO sync_profiles VALUES(?,?,?,?) ON CONFLICT(actor) DO UPDATE SET name=excluded.name,avatar=excluded.avatar",params![actor,s.name,p.name,p.avatar])?;
     }
@@ -237,12 +283,17 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         if let Some(c) = copy {
             return Board::get_on(tx, c.message);
         }
-        let root = root_on(tx, &s.name, &i.thread)?.context("signal needs a linked root")?;
+        let root = root_on(tx, &s.name, &i.thread)?
+            .with_context(|| Kind::Invalid.error("ignored_event", "signal has no linked thread"))?;
         let m = Board::get_on(tx, root)?;
         if m.deleted || !conditions.iter().all(|(k, v)| m.labels.get(k) == Some(v)) {
             return Ok(m);
         }
-        let updated = Board::labels_tx(tx, root, &actor, set, unset, &BTreeMap::new())?;
+        let updated = if set.is_empty() && unset.is_empty() {
+            m
+        } else {
+            Board::labels_tx(tx, root, &actor, set, unset, &BTreeMap::new())?
+        };
         if let Some(text) = reply {
             let m = Board::reply_tx(tx, root, &actor, text, &Default::default())?;
             bind(tx, s, &i.thread, &i.external, &m, true, i.url.as_deref())?;
@@ -273,20 +324,61 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         }
         match &i.change {
             Change::Post { .. } => return Ok(old),
-            Change::Upsert { text, labels: next } => {
+            Change::Upsert { text, labels: next }
+            | Change::Reconcile {
+                text, labels: next, ..
+            } => {
                 let prior: BTreeMap<String, String> = serde_json::from_str(&labels)?;
-                let unset = prior
+                let mut desired = next.clone();
+                let mut extra = Vec::new();
+                if let Change::Reconcile { owns, reset, .. } = &i.change {
+                    let supplied = |key: &str| {
+                        owns.iter().any(|rule| {
+                            if rule.ends_with('.') {
+                                key.starts_with(rule)
+                            } else {
+                                key == rule
+                            }
+                        })
+                    };
+                    for (k, v) in &prior {
+                        if !desired.contains_key(k) && !supplied(k) {
+                            desired.insert(k.clone(), v.clone());
+                        }
+                    }
+                    extra.extend(
+                        old.labels
+                            .keys()
+                            .filter(|k| supplied(k) && !next.contains_key(*k))
+                            .cloned(),
+                    );
+                    for (k, prefix) in reset {
+                        if next.contains_key(k) && next.get(k) != old.labels.get(k) {
+                            ensure!(!prefix.is_empty(), "empty label reset prefix");
+                            extra.extend(
+                                old.labels
+                                    .keys()
+                                    .filter(|key| key.starts_with(prefix))
+                                    .cloned(),
+                            );
+                        }
+                    }
+                }
+                let mut unset = prior
                     .iter()
-                    .filter(|(k, v)| !next.contains_key(*k) && old.labels.get(*k) == Some(*v))
+                    .filter(|(k, v)| !desired.contains_key(*k) && old.labels.get(*k) == Some(*v))
                     .map(|(k, _)| k.clone())
                     .collect::<Vec<_>>();
+                unset.append(&mut extra);
+                unset.sort();
+                unset.dedup();
                 if text != &old.text {
                     Board::edit_tx(tx, old.id, &old.actor, text, None)?;
                 }
                 if !unset.is_empty() || next.iter().any(|(k, v)| old.labels.get(k) != Some(v)) {
                     Board::labels_tx(tx, old.id, &actor, next, &unset, &BTreeMap::new())?;
                 }
-                managed = Some(serde_json::to_string(next)?);
+                managed = Some(serde_json::to_string(&desired)?);
                 Board::get_on(tx, old.id)?
             }
             Change::Edit { text } => {
@@ -298,14 +390,28 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             }
             Change::Delete => Board::delete_tx(tx, old.id, &old.actor, None)?,
             Change::React { .. } => unreachable!("handled independently of message version"),
-            Change::Signal { .. } => unreachable!("handled on the linked root"),
+            Change::Signal { .. } | Change::Ignore => {
+                unreachable!("handled before looking up the copy")
+            }
             Change::Labels { set, unset } => {
                 Board::labels_tx(tx, old.id, &actor, set, unset, &BTreeMap::new())?
             }
         }
     } else {
+        ensure!(
+            !matches!(
+                i.change,
+                Change::Reconcile {
+                    existing_only: true,
+                    ..
+                }
+            ),
+            Kind::Invalid.error("ignored_event", "update has no linked thread")
+        );
         let (text, labels) = match &i.change {
-            Change::Post { text, labels } | Change::Upsert { text, labels } => (text, labels),
+            Change::Post { text, labels }
+            | Change::Upsert { text, labels }
+            | Change::Reconcile { text, labels, .. } => (text, labels),
             _ => {
                 return Err(Kind::Conflict
                     .error("source_parent", "original message has not arrived")
@@ -313,6 +419,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             }
         };
         let opts = PostOptions {
+            no_sync: i.no_sync,
             labels: labels.clone(),
             ..Default::default()
         };
@@ -324,7 +431,16 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                     })?
                     .message,
             ),
-            None => root_on(tx, &s.name, &i.thread)?,
+            None => {
+                ensure!(
+                    root_on(tx, &s.name, &i.thread)?.is_none(),
+                    Kind::Conflict.error(
+                        "already_synced",
+                        "this external thread already has a different root"
+                    )
+                );
+                None
+            }
         };
         let m = match parent {
             Some(p) => Board::reply_tx(tx, p, &actor, text, &opts)?,

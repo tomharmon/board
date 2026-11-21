@@ -5,6 +5,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+mod formats;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Block {
@@ -23,6 +24,14 @@ pub struct Schema {
     pub built_in: bool,
     pub by: Option<String>,
     pub at: Option<String>,
+}
+
+impl Schema {
+    /// Check an example block against this immutable registered version, without publishing it.
+    pub fn accepts_sample(&self, data: &Value) -> Result<bool> {
+        Ok(data.is_object()
+            && formats::validator(&local_definition(self.schema.clone()))?.is_valid(data))
+    }
 }
 
 pub(crate) fn init(c: &Connection) -> Result<()> {
@@ -71,9 +80,28 @@ fn validate_id(name: &str, version: u32) -> Result<()> {
                 || b.is_ascii_digit()
                 || matches!(b, b'.' | b'_' | b'-'))
             && (1..=99999).contains(&version),
-        "invalid schema ID: {name}@{version}"
+        Invalid.error(
+            "invalid_schema_id",
+            format!("invalid schema ID: {name}@{version}")
+        )
     );
     Ok(())
+}
+const PROJECTION:&str="SELECT s.name,s.version,s.description,s.definition,coalesce(o.builtin,0),o.actor,o.at FROM schemas s
+                         LEFT JOIN schema_origins o USING(name,version)";
+fn schema_row(r: &rusqlite::Row<'_>) -> Result<Schema> {
+    let name: String = r.get(0)?;
+    let version = r.get(1)?;
+    Ok(Schema {
+        id: format!("{name}@{version}"),
+        name,
+        version,
+        description: r.get(2)?,
+        schema: serde_json::from_str(&r.get::<_, String>(3)?)?,
+        built_in: r.get(4)?,
+        by: r.get(5)?,
+        at: r.get(6)?,
+    })
 }
 fn check_shape(v: &Value, depth: usize, count: &mut usize) -> Result<()> {
     if v.is_boolean() {
@@ -178,9 +206,7 @@ fn check_definition(schema: &Value) -> Result<()> {
     );
     check_shape(schema, 0, &mut 0)?;
     let compiled = local_definition(schema.clone());
-    jsonschema::draft202012::options()
-        .should_validate_formats(true)
-        .build(&compiled)?;
+    formats::validator(&compiled)?;
     Ok(())
 }
 fn budget(v: &Value, depth: usize, nodes: &mut usize) -> Result<()> {
@@ -263,7 +289,7 @@ impl Board {
     ) -> Result<bool> {
         self.write(|tx| {
             let a=self.access_on(tx)?;a.actor(actor)?;
-            ensure!(a.everywhere(crate::access::Action::Manage),crate::errors::Kind::Forbidden.error("missing_permission","schema registration requires manage in every channel"));
+            ensure!(a.manage_at("*",false),crate::errors::Kind::Forbidden.error("missing_permission","schema registration requires manage at *"));
             crate::validate_actor(actor)?;
             validate_id(name, version)?;
             ensure!(description.encode_utf16().count() <= 2000,
@@ -304,29 +330,36 @@ impl Board {
         })
     }
     pub fn schemas(&self) -> Result<Vec<Schema>> {
-        self.access_on(&self.conn)?;
-        let mut stmt = self.conn.prepare(
-            "SELECT s.name,s.version,s.description,s.definition,coalesce(o.builtin,0),o.actor,o.at FROM schemas s
-             LEFT JOIN schema_origins o USING(name,version) ORDER BY coalesce(o.builtin,0) DESC,
-             CASE WHEN o.builtin AND s.name='git-commit' THEN 0 ELSE 1 END,s.name,s.version",
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        self.access_on(&tx)?;
+        let mut stmt = tx.prepare(&format!(
+            "{PROJECTION} ORDER BY coalesce(o.builtin,0) DESC,
+             CASE WHEN o.builtin AND s.name='git-commit' THEN 0 ELSE 1 END,s.name,s.version"
+        ))?;
         let mut rs = stmt.query([])?;
         let mut out = vec![];
         while let Some(r) = rs.next()? {
-            let name: String = r.get(0)?;
-            let version = r.get(1)?;
-            out.push(Schema {
-                id: format!("{name}@{version}"),
-                name,
-                version,
-                description: r.get(2)?,
-                schema: serde_json::from_str(&r.get::<_, String>(3)?)?,
-                built_in: r.get(4)?,
-                by: r.get(5)?,
-                at: r.get(6)?,
-            });
+            out.push(schema_row(r)?);
         }
+        drop(rs);
+        drop(stmt);
+        tx.commit()?;
         Ok(out)
+    }
+    pub fn schema(&self, name: &str, version: u32) -> Result<Schema> {
+        validate_id(name, version)?;
+        let tx = self.conn.unchecked_transaction()?;
+        self.access_on(&tx)?;
+        let result = {
+            let mut stmt =
+                tx.prepare_cached(&format!("{PROJECTION} WHERE s.name=? AND s.version=?"))?;
+            let mut rows = stmt.query(params![name, version])?;
+            schema_row(rows.next()?.context(
+                crate::errors::Kind::Missing.error("schema_not_found", "schema not found"),
+            )?)?
+        };
+        tx.commit()?;
+        Ok(result)
     }
     pub(crate) fn blocks_on(c: &Connection, text: &str) -> Result<Vec<Block>> {
         if !text.contains("json#") {
@@ -345,7 +378,8 @@ impl Board {
             let version = num
                 .parse::<u32>()
                 .context(Invalid.error("invalid_block", "invalid schema version"))?;
-            validate_id(schema, version)?;
+            validate_id(schema, version)
+                .context(Invalid.error("invalid_block", "invalid schema ID in data fence"))?;
             let def: String = c
                 .query_row(
                     "SELECT definition FROM schemas WHERE name=? AND version=?",
@@ -355,8 +389,8 @@ impl Board {
                 .optional()?
                 .with_context(|| {
                     Invalid.error(
-                        "unknown_block_schema",
-                        format!("schema_not_found: {schema}@{version}"),
+                        "schema_not_found",
+                        format!("unknown schema: {schema}@{version}"),
                     )
                 })?;
             let data: Value = serde_json::from_str(fence.data)
@@ -365,9 +399,7 @@ impl Board {
                 data.is_object(),
                 Invalid.error("invalid_block", "expected a JSON object")
             );
-            let validator = jsonschema::draft202012::options()
-                .should_validate_formats(true)
-                .build(&local_definition(serde_json::from_str(&def)?))?;
+            let validator = formats::validator(&local_definition(serde_json::from_str(&def)?))?;
             validator.validate(&data).map_err(|e| {
                 Invalid.error(
                     "invalid_block",

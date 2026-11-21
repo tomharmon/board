@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post, put},
 };
 use board_local::{
-    Filter, PostOptions,
+    PostOptions,
     automation::{self as work, ClaimTarget, Destination, Task, TaskAction, TaskTarget, Timing},
 };
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -47,7 +47,11 @@ pub(super) fn routes() -> Router<App> {
                 .layer(DefaultBodyLimit::max(56 * 1024 * 1024)),
         )
         .route("/schedules/{id}", get(get_schedule).delete(cancel_schedule))
-        .route("/watchers", get(watchers).post(watcher))
+        .route(
+            "/watchers",
+            get(watchers).post(watcher).put(replace_watchers),
+        )
+        .route("/watcher-matches", post(matches))
         .route("/watchers/{name}", get(get_watcher).delete(remove_watcher))
         .route("/watchers/{name}/next", get(peek))
         .route("/watchers/{name}/deliveries", post(deliver))
@@ -91,6 +95,7 @@ fn continuation<T, K>(rows: &mut Vec<T>, n: usize, key: impl FnOnce(&T) -> K) ->
 #[derive(Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TaskPage {
+    latest: bool,
     channel: Option<String>,
     state: Option<String>,
     needs: Option<i64>,
@@ -103,14 +108,22 @@ struct TaskPage {
     limit: Option<usize>,
 }
 async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
+    if q.latest && q.after.is_some() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "latest and after cannot be combined",
+        ));
+    }
     let (after, limit) = (after(q.after)?, limit(q.limit)?);
     let (cursor, mut rows) = app
-        .call(move |b, _| {
+        .call(move |b, actor| {
             let label_terms =
                 board_local::LabelTerm::parse(&q.label.into_iter().collect::<Vec<_>>())?;
-            work::filtered_tasks_page(
+            work::filtered_tasks_page_as(
                 b,
+                Some(actor),
                 &work::TaskFilter {
+                    latest: q.latest,
                     channel: q.channel,
                     state: q.state,
                     needs: q.needs,
@@ -121,7 +134,7 @@ async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
                     assignee: q.assignee,
                 },
                 after,
-                limit + 1,
+                limit + usize::from(!q.latest),
             )
         })
         .await?;
@@ -187,6 +200,8 @@ async fn lookup_batch(app: App, key: String) -> Data {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewTask {
+    #[serde(default)]
+    no_sync: bool,
     channel: Option<String>,
     text: Option<String>,
     thread_id: Option<i64>,
@@ -213,6 +228,7 @@ async fn create_task(
     let (t, made) = app
         .call(move |b, actor| {
             let opts = PostOptions {
+                no_sync:body.no_sync,
                 key,
                 labels: body.labels,
                 files: decode_files(body.attachments)?,
@@ -224,7 +240,7 @@ async fn create_task(
                 body.channel.as_deref(),
                 body.text.as_deref(),
             ) {
-                (Some(id), None, None) if opts.key.is_none() && opts.labels.is_empty() && opts.files.is_empty() && opts.attachment_ids.is_empty() => {
+                (Some(id), None, None) if !opts.no_sync && opts.key.is_none() && opts.labels.is_empty() && opts.files.is_empty() && opts.attachment_ids.is_empty() => {
                     TaskTarget::Existing(id)
                 }
                 (None, Some(channel), text) => TaskTarget::New {
@@ -501,7 +517,7 @@ async fn queue_claim(State(app): State<App>, Json(body): Json<QueueClaim>) -> Ap
                 if !live.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                match work::claim_with_outcome(
+                match work::claim_while(
                     b,
                     a,
                     ClaimTarget::Ready(&body.channel),
@@ -511,6 +527,7 @@ async fn queue_claim(State(app): State<App>, Json(body): Json<QueueClaim>) -> Ap
                     },
                     &body.labels,
                     &body.owners,
+                    || live.load(Ordering::Acquire),
                 ) {
                     Ok(t) => Ok(Some(t)),
                     Err(e) if e.is::<work::NothingReady>() => Ok(None),
@@ -603,6 +620,8 @@ async fn get_schedule(State(app): State<App>, Path(id): Path<i64>) -> Data {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewSchedule {
+    #[serde(default)]
+    no_sync: bool,
     channel: Option<String>,
     reply_to: Option<i64>,
     #[serde(default)]
@@ -638,6 +657,7 @@ async fn schedule(State(app): State<App>, Json(body): Json<NewSchedule>) -> ApiR
                     until: body.until,
                 },
                 &PostOptions {
+                    no_sync: body.no_sync,
                     labels: body.labels,
                     files: decode_files(body.attachments)?,
                     attachment_ids: body.attachment_ids,
@@ -677,15 +697,46 @@ async fn get_watcher(State(app): State<App>, Path(name): Path<String>) -> Data {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NewWatcher {
-    name: String,
-    #[serde(default)]
-    filter: Filter,
-    kind: Option<String>,
+struct WatchSet {
+    watchers: Vec<work::WatchSpec>,
 }
-async fn watcher(State(app): State<App>, Json(body): Json<NewWatcher>) -> ApiResult<Response> {
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PullSet {
+    limit: Option<usize>,
+    lease_seconds: Option<i64>,
+    wait_seconds: Option<u64>,
+}
+async fn matches(State(app): State<App>, Json(body): Json<PullSet>) -> Data {
+    use std::time::{Duration, Instant};
+    let wait = body.wait_seconds.unwrap_or(0);
+    if wait > 60 {
+        return Err(invalid("wait_seconds must be 0..60"));
+    }
+    let end = Instant::now() + Duration::from_secs(wait);
+    let limit = body.limit.unwrap_or(10);
+    let lease = body.lease_seconds.unwrap_or(300);
+    loop {
+        let found = app
+            .call(move |b, _| work::lease_matches(b, limit, lease))
+            .await?;
+        if !found.is_empty() || Instant::now() >= end {
+            return Ok(Json(json!({"matches":found})));
+        }
+        tokio::time::sleep(
+            Duration::from_millis(100).min(end.saturating_duration_since(Instant::now())),
+        )
+        .await;
+    }
+}
+async fn replace_watchers(State(app): State<App>, Json(body): Json<WatchSet>) -> Data {
+    Ok(Json(
+        json!({"watchers":app.call(move|b,a|work::replace_watchers(b,a,&body.watchers)).await?}),
+    ))
+}
+async fn watcher(State(app): State<App>, Json(body): Json<work::WatchSpec>) -> ApiResult<Response> {
     let w = app
-        .call(move |b, a| work::add_watcher_as(b, a, &body.name, body.filter, body.kind.as_deref()))
+        .call(move |b, a| work::add_watcher_spec(b, a, body))
         .await?;
     Ok(created(format!("/v1/watchers/{}", w.name), json!(w)))
 }

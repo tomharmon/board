@@ -28,6 +28,7 @@ board whoami
 id=$(board post studio/build "Ready for review")
 board --as reviewer reply "$id" "Checked locally"
 board read "$id"
+board post studio/build "Local working notes" --no-sync
 board inspect                              # launches board-ui directly
 board inspect --thread "$id"                # jump to this conversation
 ```
@@ -101,6 +102,11 @@ board post releases/client --schema check@1 '{"ok":true}'
 Blocks also work inside Markdown fences beginning with `json#name@version`.
 Schemas are immutable per version, use a bounded local JSON Schema subset and
 cannot fetch references. Invalid posts and edits leave no partial message.
+
+`--no-sync` on a post or reply is permanent. A private root also keeps
+subsequent replies off external services. The inspector can save files,
+labels, timing and privacy together in a draft. Optional [write rules](docs/RULES.md)
+can enforce local policy across every entry point; none are installed by default.
 
 `board read` lists thread summaries. Use `--flat` for messages and `read ID`
 for the entire thread. Filters include channel, subtree, author, text, mention
@@ -197,7 +203,8 @@ board --db "$HOME/board-backup.sqlite3" read # read the backup as a separate, wr
 
 Backup uses SQLite's online backup interface. It includes attached bytes,
 schemas, tasks, receipts, schedules and event history, including committed WAL
-changes, as well as local grants, external copies and queued deliveries. It
+changes, as well as local grants, composer drafts and files, write rules,
+external copies and queued deliveries. It
 does not include provider environment credentials or the CLI claim cache.
 Don't copy just a live database file. To restore, stop clients, copy
 the snapshot to a **new** path, then point all processes at that path. Do not
@@ -209,9 +216,8 @@ cargo fmt --all -- --check
 cargo clippy --offline --locked --workspace --all-targets -- -D warnings
 cargo test --offline --locked --workspace -- --include-ignored  # includes a real 30s lease expiry
 cargo build --offline --locked --workspace --bins
+board conformance                            # quick check on a NEW temporary DB
 python3 scripts/roundtrip.py                 # CLI -> REST -> already-open Rune -> restart
-# Optional; uses a separate read-only reference checkout and Node 26:
-# node scripts/compare-reference.mjs /path/to/reference target/debug/board
 ```
 
 The last command uses Python's standard library and an ephemeral loopback port.
@@ -219,6 +225,8 @@ Pass `--artifacts NEW_DIRECTORY` to keep the two PNGs, element trees, database
 and backup. Run headless tests with a working Vulkan ICD. On this test machine
 `VK_DRIVER_FILES=/usr/lib/chromium/vk_swiftshader_icd.json` selects one; use
 your installed ICD path instead. No display, hosted service or Internet is used.
+The [reference check instructions](docs/REFERENCE-CHECKS.md) also run matching
+operations against the original SQLite backend and the built Rust CLI.
 
 **Source map:** [storage and domain](crates/board-core), [CLI and worker](crates/board-cli),
 [REST adapter](crates/board-api), [optional provider clients](crates/board-sync),

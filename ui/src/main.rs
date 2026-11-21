@@ -21,14 +21,37 @@ fn initial() -> State {
 fn key(s: &mut State, k: &KeyEvent, tx: &mut Tx) -> bool {
     if k.is_command('n') && s.connected() {
         view::compose(s, tx);
+    } else if k.is_command('l') && s.connected() {
+        s.jump_field(tx);
+    } else if k.is_command('f') && k.mods.shift && s.connected() {
+        if !matches!(s.page, Page::Feed | Page::Activity) {
+            s.go(Page::Feed);
+        } else if s.page == Page::Activity {
+            s.desk.mode = state::ActivityMode::Messages;
+        }
+        s.show_filters(tx);
     } else if k.is_command('f') {
         s.go(Page::Feed);
         tx.focus_when_shown("search", true);
+    } else if k.key == Key::Escape && s.browse.jump_open {
+        s.browse.jump_open = false;
+        tx.focus_when_shown("jump-message", true);
+    } else if k.key == Key::Escape && s.browse.filter_open {
+        s.browse.filter_open = false;
+        tx.focus_when_shown("filter-messages", true);
+    } else if k.key == Key::Escape && s.people.picking {
+        s.people = state::People::default();
+        tx.focus_when_shown("message-body", true);
+    } else if k.key == Key::Escape && s.delivery.open {
+        s.delivery.open = false;
+        tx.focus_when_shown("delivery-options", true);
     } else if k.key == Key::Escape && s.nav {
         s.nav = false;
         tx.focus_when_shown("open-nav", true);
     } else if k.key == Key::Escape && s.properties.is_some() {
         s.close_properties(tx);
+    } else if k.key == Key::Escape && s.preview.is_some() {
+        s.close_preview(tx);
     } else if k.key == Key::Escape && s.page != Page::Feed {
         let old = s.page;
         s.back();

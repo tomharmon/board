@@ -15,6 +15,15 @@ pub struct Task {
     pub channel: String,
     pub text: String,
     pub owner: String,
+    /// Exact actor that adopted or created the task; the owner is its person.
+    #[serde(default)]
+    pub by: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::MentionResolution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replies: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last: Option<TaskReply>,
     pub assignee: Option<String>,
     pub state: String,
     pub holder: Option<String>,
@@ -28,6 +37,12 @@ pub struct Task {
     pub hold_kind: Option<String>,
     pub needs: Vec<i64>,
 }
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskReply {
+    pub id: i64,
+    pub actor: String,
+    pub text: String,
+}
 
 fn ids(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<i64>> {
     Ok(conn
@@ -39,7 +54,7 @@ fn ids(conn: &Connection, sql: &str, p: impl rusqlite::Params) -> Result<Vec<i64
 pub(crate) fn task_optional(conn: &Connection, id: i64) -> Result<Option<Task>> {
     let needs = ids(
         conn,
-        "SELECT need FROM task_needs WHERE task=? ORDER BY need",
+        "SELECT need FROM task_needs WHERE task=? ORDER BY rowid",
         [id],
     )?;
     Ok(conn
@@ -49,11 +64,16 @@ pub(crate) fn task_optional(conn: &Connection, id: i64) -> Result<Option<Task>> 
         FROM tasks JOIN messages USING(id) WHERE id=?",
             [id],
             |r| {
+                let by: String = r.get(2)?;
                 Ok(Task {
                     id,
                     channel: r.get(0)?,
                     text: r.get(1)?,
-                    owner: r.get(2)?,
+                    owner: person(&by).to_owned(),
+                    by,
+                    mentions: vec![],
+                    replies: None,
+                    last: None,
                     assignee: r.get(3)?,
                     state: r.get(4)?,
                     holder: r.get(5)?,
@@ -98,11 +118,42 @@ fn visible_needs(a: &Access, c: &Connection, needs: &[i64]) -> Result<()> {
     Ok(())
 }
 
+fn remember_creation(c: &Connection, a: &Access, actor: &str, t: &Task) -> Result<()> {
+    if !a.allows(Action::Read, &t.channel) {
+        c.execute(
+            "INSERT INTO blind_tasks VALUES(?,?,?)",
+            params![t.id, actor, serde_json::to_string(t)?],
+        )?;
+        c.execute("INSERT OR IGNORE INTO blind_posts(id) VALUES(?)", [t.id])?;
+    }
+    Ok(())
+}
+
+// A post-only writer gets its own immutable acknowledgement, never a later claim or edit.
+fn creation_view(c: &Connection, a: &Access, actor: &str, t: Task) -> Result<Task> {
+    if a.allows(Action::Read, &t.channel) {
+        return visible(a, c, t);
+    }
+    a.require(Action::Post, &t.channel)?;
+    let data: String = c
+        .query_row(
+            "SELECT original FROM blind_tasks WHERE task=? AND actor=?",
+            params![t.id, actor],
+            |r| r.get(0),
+        )
+        .optional()?
+        .context(Conflict.error(
+            "duplicate_id",
+            "key is not a blind task receipt of this actor",
+        ))?;
+    Ok(serde_json::from_str(&data)?)
+}
+
 pub fn get_task(board: &Board, id: i64) -> Result<Task> {
     let tx = write(&board.conn)?;
     let a = board.access_on(&tx)?;
     a.message(&tx, id, Action::Read)?;
-    expire(&tx, now(), &a)?;
+    expire_one(&tx, id, now())?;
     let current = visible(&a, &tx, task(&tx, id)?)?;
     tx.commit()?;
     Ok(current)
@@ -192,20 +243,29 @@ fn expire(tx: &Transaction<'_>, at: i64, a: &Access) -> Result<usize> {
     Ok(rows.len())
 }
 
-fn replace_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
+fn expire_one(tx: &Transaction<'_>, id: i64, at: i64) -> Result<()> {
+    let elapsed: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM tasks WHERE id=? AND state='claimed' AND lease_until<=?)",
+        [id, at],
+        |r| r.get(0),
+    )?;
+    if elapsed {
+        set_state(tx, id, ready_state(tx, id)?, None)?;
+        publish(tx, id, "board", "expired")?;
+    }
+    Ok(())
+}
+
+fn distinct_needs(needs: &[i64]) -> Result<Vec<i64>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let out: Vec<_> = needs.iter().copied().filter(|n| seen.insert(*n)).collect();
     ensure!(
-        needs.len() <= 500,
-        Invalid.error("invalid_needs", "invalid prerequisite: at most 500 tasks")
+        out.len() <= 20,
+        Invalid.error("invalid_needs", "at most 20 direct prerequisites")
     );
-    ensure!(
-        needs
-            .iter()
-            .collect::<std::collections::BTreeSet<_>>()
-            .len()
-            == needs.len(),
-        Invalid.error("invalid_needs", "invalid prerequisite: duplicate task")
-    );
-    tx.execute("DELETE FROM task_needs WHERE task=?", [id])?;
+    Ok(out)
+}
+fn validate_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
     for &need in needs {
         let state: Option<String> = tx
             .query_row("SELECT state FROM tasks WHERE id=?", [need], |r| r.get(0))
@@ -217,15 +277,47 @@ fn replace_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
                 format!("invalid prerequisite: task #{need} is missing or canceled")
             )
         );
-        let cycle:bool=tx.query_row("WITH RECURSIVE reach(id) AS (SELECT ?1 UNION SELECT n.need
-            FROM task_needs n JOIN reach r ON r.id=n.task) SELECT EXISTS(SELECT 1 FROM reach WHERE id=?2)",
-            [need,id], |r| r.get(0))?;
         ensure!(
-            !cycle,
+            need != id,
             Invalid.error("invalid_needs", "task dependency cycle")
         );
-        tx.execute("INSERT INTO task_needs(task,need) VALUES(?,?)", [id, need])?;
     }
+    Ok(())
+}
+fn replace_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
+    validate_needs(tx, id, needs)?;
+    tx.execute("DELETE FROM task_needs WHERE task=?", [id])?;
+    for need in needs {
+        tx.execute("INSERT INTO task_needs(task,need) VALUES(?,?)", [id, *need])?;
+    }
+    Ok(())
+}
+
+fn check_added(c: &Connection, a: &Access, t: &Task, needs: &[i64]) -> Result<()> {
+    let added: Vec<_> = needs.iter().filter(|id| !t.needs.contains(id)).collect();
+    if added.is_empty() {
+        return Ok(());
+    }
+    let channels = a
+        .channels(c, Action::Read)?
+        .map(|v| serde_json::to_string(&v))
+        .transpose()?;
+    let (n,cycle):(i64,bool)=c.query_row("WITH RECURSIVE seen(id) AS (
+        SELECT value FROM json_each(?1) UNION SELECT n.need FROM seen s JOIN tasks t ON t.id=s.id
+        JOIN messages m ON m.id=s.id JOIN task_needs n ON n.task=s.id WHERE
+        t.state!='completed' OR (?2 IS NOT NULL AND m.channel NOT IN (SELECT value FROM json_each(?2))) LIMIT 501)
+        SELECT count(*),coalesce(max(id=?3),0) FROM seen",params![serde_json::to_string(&added)?,channels,t.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        n <= 500,
+        Invalid.error(
+            "invalid_needs",
+            "more than 500 tasks behind new prerequisites; too many to check"
+        )
+    );
+    ensure!(
+        !cycle,
+        Invalid.error("invalid_needs", "task dependency cycle")
+    );
     Ok(())
 }
 
@@ -311,7 +403,6 @@ pub fn create_task_and_claim(
             channel, options, ..
         } => {
             access.files(&tx, actor, &options.attachment_ids)?;
-            access.require(Action::Read, channel)?;
             access.require(Action::Post, channel)?;
             if !options.labels.is_empty() {
                 access.require(Action::Label, channel)?;
@@ -321,19 +412,26 @@ pub fn create_task_and_claim(
         TaskTarget::Existing(id) => access.message(&tx, *id, Action::Label)?,
     };
     if claim.is_some() {
+        access.require(Action::Read, &channel)?;
         access.require(Action::Label, &channel)?;
     }
+    let distinct = distinct_needs(needs)?;
+    let needs = distinct.as_slice();
     visible_needs(&access, &tx, needs)?;
     if let Some(request) = &claim {
         validate_claim(request)?;
     }
+    let mut mentions = vec![];
     let id = match target {
         TaskTarget::New {
             channel,
             text,
             options,
         } => {
-            let (root, created) = Board::post_tx_with_outcome(&tx, channel, actor, text, options)?;
+            let settled = crate::actors::settle(&tx, &access, actor, None, text)?;
+            mentions = settled.1;
+            let (root, created) =
+                Board::post_tx_with_outcome(&tx, channel, actor, &settled.0, options)?;
             if !created {
                 let mut t = root.task.context(
                     Conflict.error("duplicate_id", "key belongs to a thread without a task"),
@@ -346,7 +444,7 @@ pub fn create_task_and_claim(
                         t = recovered;
                     }
                 }
-                let t = visible(&access, &tx, t)?;
+                let t = creation_view(&tx, &access, actor, t)?;
                 tx.commit()?;
                 return Ok((t, false));
             }
@@ -388,7 +486,9 @@ pub fn create_task_and_claim(
     if let Some(request) = claim {
         t = acquire(&tx, actor, &t, &request, &fingerprint(("created", id))?, at)?;
     }
-    let t = visible(&access, &tx, t)?;
+    remember_creation(&tx, &access, actor, &t)?;
+    let mut t = creation_view(&tx, &access, actor, t)?;
+    t.mentions = mentions;
     tx.commit()?;
     Ok((t, true))
 }
@@ -437,7 +537,7 @@ pub fn lookup_plan(board: &Board, actor: &str, key: &str) -> Result<Vec<Task>> {
         .context(Missing.error("batch_not_found", "no batch of yours has that key"))?;
     let tasks = batch_tasks(&tx, &receipt)?
         .into_iter()
-        .map(|t| visible(&a, &tx, t))
+        .map(|t| creation_view(&tx, &a, actor, t))
         .collect::<Result<Vec<_>>>()?;
     tx.commit()?;
     Ok(tasks)
@@ -456,6 +556,8 @@ pub struct PlanItem {
     pub assignee: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_ids: Vec<i64>,
+    #[serde(default, alias = "noSync", skip_serializing_if = "std::ops::Not::not")]
+    pub no_sync: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged, deny_unknown_fields)]
@@ -496,8 +598,10 @@ pub fn create_plan_with_outcome(
     let tx = write(&board.conn)?;
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
+    if let Some(k) = key {
+        super::authorize_callback_key(&tx, actor, k)?;
+    }
     access.require(Action::Post, channel)?;
-    access.require(Action::Read, channel)?;
     if items.iter().any(|i| !i.labels.is_empty()) {
         access.require(Action::Label, channel)?;
     }
@@ -516,12 +620,13 @@ pub fn create_plan_with_outcome(
         );
         let out = batch_tasks(&tx, &receipt)?
             .into_iter()
-            .map(|t| visible(&access, &tx, t))
+            .map(|t| creation_view(&tx, &access, actor, t))
             .collect::<Result<Vec<_>>>()?;
         tx.commit()?;
         return Ok((out, false));
     }
-    let out = plan_chunk(&tx, &access, actor, channel, items)?;
+    long_plans::validate(channel, items)?;
+    let out = plan_chunk(&tx, &access, actor, channel, items, BTreeMap::new())?;
     if let Some(key) = key {
         let ids: Vec<_> = out.iter().map(|t| t.id).collect();
         tx.execute(
@@ -541,26 +646,30 @@ fn plan_chunk(
     actor: &str,
     channel: &str,
     items: &[PlanItem],
+    mut names: BTreeMap<String, i64>,
 ) -> Result<Vec<Task>> {
-    let mut names = BTreeMap::new();
     let mut ids = Vec::new();
+    let mut mentions = vec![];
     for item in items {
         access.files(tx, actor, &item.attachment_ids)?;
+        let (text, resolutions) = crate::actors::settle(tx, access, actor, None, &item.text)?;
+        mentions.push(resolutions);
         let id = Board::post_tx(
             tx,
             channel,
             actor,
-            &item.text,
+            &text,
             &PostOptions {
                 labels: item.labels.clone(),
                 attachment_ids: item.attachment_ids.clone(),
+                no_sync: item.no_sync,
                 ..Default::default()
             },
         )?
         .id;
         if let Some(k) = &item.key {
             ensure!(
-                !k.is_empty() && names.insert(k, id).is_none(),
+                !k.is_empty() && names.insert(k.clone(), id).is_none(),
                 "empty or duplicate task key: {k}"
             );
         }
@@ -581,7 +690,8 @@ fn plan_chunk(
         ids.push(id);
     }
     let mut out = Vec::new();
-    for (&id, item) in ids.iter().zip(items) {
+    for ((&id, item), resolutions) in ids.iter().zip(items).zip(mentions) {
+        let mut external = Vec::new();
         let needs = item
             .needs
             .iter()
@@ -589,26 +699,48 @@ fn plan_chunk(
                 Ok(match need {
                     Prerequisite::Name(name) => match names.get(name) {
                         Some(&id) => id,
-                        None => name.parse()?,
+                        None => {
+                            let n = name.parse()?;
+                            external.push(n);
+                            n
+                        }
                     },
-                    Prerequisite::Number(n) => *n,
+                    Prerequisite::Number(n) => {
+                        external.push(*n);
+                        *n
+                    }
                     Prerequisite::Key { key } => *names
                         .get(key)
                         .ok_or_else(|| anyhow::anyhow!("unknown plan key: {key}"))?,
-                    Prerequisite::Id { id } => match id.as_i64() {
-                        Some(n) => n,
-                        None => id
-                            .as_str()
-                            .ok_or_else(|| anyhow::anyhow!("invalid task id"))?
-                            .parse()?,
-                    },
+                    Prerequisite::Id { id } => {
+                        let id = match id.as_i64() {
+                            Some(n) => n,
+                            None => id
+                                .as_str()
+                                .ok_or_else(|| anyhow::anyhow!("invalid task id"))?
+                                .parse()?,
+                        };
+                        external.push(id);
+                        id
+                    }
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        visible_needs(access, tx, &needs)?;
+        ensure!(
+            !external.iter().any(|n| ids.contains(n)),
+            Invalid.error(
+                "invalid_needs",
+                "new plan items must be named by their plan keys"
+            )
+        );
+        let needs = distinct_needs(&needs)?;
+        visible_needs(access, tx, &external)?;
         replace_needs(tx, id, &needs)?;
         set_state(tx, id, queued(&needs), None)?;
-        out.push(publish_queue_state(tx, id, actor, "created")?);
+        let mut t = publish_queue_state(tx, id, actor, "created")?;
+        remember_creation(tx, access, actor, &t)?;
+        t.mentions = resolutions;
+        out.push(t);
     }
     Ok(out)
 }
@@ -639,6 +771,7 @@ pub fn tasks_page(
 
 #[derive(Debug, Default)]
 pub struct TaskFilter {
+    pub latest: bool,
     pub channel: Option<String>,
     pub state: Option<String>,
     pub needs: Option<i64>,
@@ -655,7 +788,22 @@ pub fn filtered_tasks_page(
     after: i64,
     limit: usize,
 ) -> Result<(i64, Vec<Task>)> {
+    filtered_tasks_page_as(board, None, filter, after, limit)
+}
+
+/// Supply the active actor for viewer-relative selectors when reading a trusted local board.
+pub fn filtered_tasks_page_as(
+    board: &Board,
+    actor: Option<&str>,
+    filter: &TaskFilter,
+    after: i64,
+    limit: usize,
+) -> Result<(i64, Vec<Task>)> {
     ensure!(after >= 0 && limit > 0, "invalid task page");
+    ensure!(
+        !filter.latest || after == 0,
+        "latest and after cannot be combined"
+    );
     ensure!(
         filter.needs.is_none_or(|id| id > 0),
         "needs must be a positive task id"
@@ -691,20 +839,21 @@ pub fn filtered_tasks_page(
     expire(&tx, now(), &access)?;
     let mut out = Vec::new();
     let cursor = crate::read::cursor_on(&tx)?;
-    let (predicate, mut bind) = crate::read::predicate(&crate::Filter {
+    let mut query = crate::Filter {
         channel: filter.channel.clone(),
         by: filter.by.clone(),
         labels: filter.labels.clone(),
         label_terms: filter.label_terms.clone(),
         after: Some(after),
         ..Default::default()
-    });
+    };
+    if let Some(actor) = actor.or(access.bound_actor()) {
+        access.actor(actor)?;
+        query.bind_actor(actor);
+    }
+    let (predicate, mut bind) = crate::read::visible_predicate(&tx, &access, &query)?;
     let mut sql =
         format!("SELECT t.id FROM tasks t JOIN messages m ON m.id=t.id WHERE {predicate}");
-    if let Some(ch) = access.channels(&tx, Action::Read)? {
-        sql.push_str(" AND m.channel IN (SELECT value FROM json_each(?))");
-        bind.push(serde_json::to_string(&ch)?.into());
-    }
     match state {
         None | Some("open") => {
             sql.push_str(" AND t.state NOT IN ('completed','failed','canceled')")
@@ -728,10 +877,20 @@ pub fn filtered_tasks_page(
         bind.push(owner.clone().into());
         bind.push(format!("{owner}/").into());
     }
-    sql.push_str(" ORDER BY t.id LIMIT ?");
+    sql.push_str(if filter.latest{" ORDER BY coalesce((SELECT max(id) FROM messages r WHERE r.re=t.id AND r.deleted=0),t.id) DESC LIMIT ?"}else{" ORDER BY t.id LIMIT ?"});
     bind.push(i64::try_from(limit).unwrap_or(i64::MAX).into());
     for id in ids(&tx, &sql, rusqlite::params_from_iter(bind))? {
-        out.push(visible(&access, &tx, task(&tx, id)?)?);
+        let mut t = visible(&access, &tx, task(&tx, id)?)?;
+        t.replies = Some(tx.query_row(
+            "SELECT count(*) FROM messages WHERE re=? AND deleted=0",
+            [id],
+            |r| r.get(0),
+        )?);
+        t.last=tx.query_row("SELECT id,actor,text FROM messages WHERE re=? AND deleted=0 ORDER BY id DESC LIMIT 1",[id],|r|Ok(TaskReply{id:r.get(0)?,actor:r.get(1)?,text:r.get(2)?})).optional()?;
+        out.push(t);
+    }
+    if filter.latest {
+        out.reverse()
     }
     tx.commit()?;
     Ok((cursor, out))
@@ -875,6 +1034,17 @@ pub fn claim_with_outcome(
     labels: &BTreeMap<String, String>,
     other_owners: &[String],
 ) -> Result<(Task, bool)> {
+    claim_while(board, actor, target, request, labels, other_owners, || true)
+}
+pub fn claim_while(
+    board: &Board,
+    actor: &str,
+    target: ClaimTarget<'_>,
+    request: ClaimRequest<'_>,
+    labels: &BTreeMap<String, String>,
+    other_owners: &[String],
+    listening: impl Fn() -> bool,
+) -> Result<(Task, bool)> {
     crate::validate_actor(actor)?;
     validate_claim(&request)?;
     match target {
@@ -883,6 +1053,10 @@ pub fn claim_with_outcome(
             "queue filters require a channel"
         ),
         ClaimTarget::Ready(scope) => {
+            ensure!(
+                other_owners.len() <= 32,
+                "at most 32 other owners can be named"
+            );
             crate::validate_channel(scope.strip_suffix('/').unwrap_or(scope))?;
             for (key, value) in labels {
                 ensure!(
@@ -900,6 +1074,9 @@ pub fn claim_with_outcome(
         }
     }
     let tx = write(&board.conn)?;
+    if !listening() {
+        return Err(NothingReady.into());
+    }
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
@@ -907,12 +1084,11 @@ pub fn claim_with_outcome(
         ClaimTarget::Id(id) => {
             access.message(&tx, id, Action::Label)?;
         }
-        ClaimTarget::Ready(s) if !s.ends_with('/') => {
-            access.require(Action::Label, s)?;
-        }
-        _ => (),
+        ClaimTarget::Ready(s) => ensure!(
+            access.anywhere(Action::Label, Some(s)),
+            Forbidden.error("missing_permission", "no claim permission in this scope")
+        ),
     }
-    expire(&tx, at, &access)?;
     let proof_target = match target {
         ClaimTarget::Id(id) => fingerprint(("id", id))?,
         ClaimTarget::Ready(scope) => fingerprint(("queue", scope, labels, other_owners))?,
@@ -926,9 +1102,14 @@ pub fn claim_with_outcome(
     let id = match target {
         ClaimTarget::Id(id) => id,
         ClaimTarget::Ready(scope) => {
+            if labels.get("board.task").is_some_and(|s| s != "ready") {
+                return Err(NothingReady.into());
+            }
+            let mut eligible_labels = labels.clone();
+            eligible_labels.remove("board.task");
             let (mut predicate, mut bind) = crate::read::predicate(&crate::Filter {
                 channel: Some(scope.to_owned()),
-                labels: labels.clone(),
+                labels: eligible_labels,
                 ..Default::default()
             });
             if let Some(ch) = access.channels(&tx, Action::Label)? {
@@ -938,11 +1119,12 @@ pub fn claim_with_outcome(
             // Only the owner's own profiles may receive a directed task, including rows
             // left by older databases. Foreign pool work always needs the worker's opt-in.
             let sql = format!("WITH ready AS (
-                SELECT id,assignee,substr(owner,1,instr(owner||'/','/')-1) AS person FROM tasks WHERE state='ready'
+                SELECT id,assignee,substr(owner,1,instr(owner||'/','/')-1) AS person FROM tasks WHERE state='ready' OR (state='claimed' AND lease_until<=?)
               ) SELECT q.id FROM ready q JOIN messages m ON m.id=q.id WHERE {predicate} AND (
                 (q.person=? AND (q.assignee IS NULL OR q.assignee=?)) OR
                 (q.assignee IS NULL AND q.person IN (SELECT value FROM json_each(?))))
               ORDER BY (q.assignee IS NOT NULL) DESC,q.id LIMIT 1");
+            bind.insert(0, at.into());
             bind.push(person(actor).to_owned().into());
             bind.push(actor.to_owned().into());
             bind.push(serde_json::to_string(other_owners)?.into());
@@ -956,12 +1138,16 @@ pub fn claim_with_outcome(
             found
         }
     };
+    expire_one(&tx, id, at)?;
     let t = task(&tx, id)?;
     let t = visible(
         &access,
         &tx,
         acquire(&tx, actor, &t, &request, &proof_target, at)?,
     )?;
+    if !listening() {
+        return Err(NothingReady.into());
+    }
     tx.commit()?;
     Ok((t, true))
 }
@@ -978,10 +1164,11 @@ fn acquire(
     ensure!(
         t.state == "ready",
         Conflict.error(
-            if t.state == "claimed" {
-                "task_claimed"
-            } else {
-                "task_state"
+            match t.state.as_str() {
+                "claimed" => "task_claimed",
+                "waiting" => "task_waiting",
+                "blocked" => "task_blocked",
+                _ => "task_finished",
             },
             format!("task is {}, not ready", t.state)
         )
@@ -1038,8 +1225,8 @@ pub fn change_task(
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
-    let channel = access.message(&tx, id, Action::Label)?;
-    expire(&tx, at, &access)?;
+    let channel = access.message(&tx, id, Action::Read)?;
+    expire_one(&tx, id, at)?;
     let t = task(&tx, id)?;
     let live = t.state == "claimed"
         && t.holder.as_deref() == Some(actor)
@@ -1056,13 +1243,16 @@ pub fn change_task(
         || matches!(action, Block(_) | BlockWithKind(_, _))
             && (t.state == "claimed" || epoch.is_some() || token.is_some())
     {
+        access.require(Action::Label, &channel)?;
         ensure!(
             live,
             Conflict.error("claim_lost","claim lost or missing: a live claim by this profile, its epoch and token are required")
         );
     } else {
         ensure!(
-            crate::core::owned_by(&t.owner, actor)
+            crate::core::owned_by(&t.by, actor)
+                && (access.allows(Action::Post, &channel)
+                    || access.allows(Action::Label, &channel))
                 || (!access.is_trusted() && access.allows(Action::Manage, &channel)),
             Forbidden.error("not_owned", format!("task is owned by {}", t.owner))
         );
@@ -1070,12 +1260,12 @@ pub fn change_task(
     let idle = matches!(t.state.as_str(), "waiting" | "ready" | "blocked");
     match &action {
         Block(reason) | BlockWithKind(reason, _) | Fail(reason) | Cancel(reason) => ensure!(
-            !reason.trim().is_empty() && reason.chars().count() <= 10000,
-            "task reason must be 1..10000 characters"
+            !reason.trim().is_empty() && reason.chars().count() <= 1000,
+            "task reason must be 1..1000 characters"
         ),
         Complete(Some(result)) => ensure!(
-            result.chars().count() <= 10000,
-            "task result exceeds 10000 characters"
+            result.chars().count() <= 1000,
+            "task result exceeds 1000 characters"
         ),
         _ => (),
     }
@@ -1114,7 +1304,9 @@ pub fn change_task(
                     !kind.is_empty()
                         && kind.len() <= 64
                         && kind != "edited"
-                        && !kind.chars().any(char::is_control),
+                        && kind.bytes().all(|c| c.is_ascii_lowercase()
+                            || c.is_ascii_digit()
+                            || matches!(c, b'.' | b'_' | b'-')),
                     "hold kind must have 1..64 bytes; edited is reserved"
                 );
                 tx.execute("INSERT INTO task_holds VALUES(?,?)", params![id, kind])?;
@@ -1166,6 +1358,8 @@ pub fn change_task(
             "assigned"
         }
         Needs(needs) => {
+            let distinct = distinct_needs(needs)?;
+            let needs = distinct.as_slice();
             visible_needs(&access, &tx, needs)?;
             ensure!(
                 idle,
@@ -1174,13 +1368,13 @@ pub fn change_task(
                     "cannot change prerequisites of a held or terminal task"
                 )
             );
-            let mut sorted = needs.to_vec();
-            sorted.sort_unstable();
-            if sorted == t.needs {
+            validate_needs(&tx, id, needs)?;
+            if needs.len() == t.needs.len() && needs.iter().all(|n| t.needs.contains(n)) {
                 let t = visible(&access, &tx, t)?;
                 tx.commit()?;
                 return Ok(t);
             }
+            check_added(&tx, &access, &t, needs)?;
             replace_needs(&tx, id, needs)?;
             if t.state != "blocked" {
                 set_state(&tx, id, queued(needs), None)?;
@@ -1221,7 +1415,7 @@ pub(crate) fn on_root_delete(tx: &Transaction<'_>, id: i64, actor: &str) -> Resu
 pub(crate) fn on_root_edit(tx: &Transaction<'_>, id: i64, actor: &str) -> Result<()> {
     if let Some(t) = task_optional(tx, id)?
         && matches!(t.state.as_str(), "ready" | "waiting" | "claimed")
-        && !crate::core::owned_by(&t.owner, actor)
+        && !crate::core::owned_by(&t.by, actor)
     {
         set_state(tx, id, "blocked", Some("root edited by another actor"))?;
         tx.execute("INSERT INTO task_holds VALUES(?,'edited')", [id])?;

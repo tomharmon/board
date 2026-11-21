@@ -64,6 +64,105 @@ fn runtime() -> tokio::runtime::Runtime {
 }
 
 #[test]
+fn replacement_and_bulk_delivery_routes_preserve_receipts_and_last_active_task_summaries() {
+    runtime().block_on(async {
+        let router = api(Board::memory().unwrap());
+        let config =
+            json!({"watchers":[{"name":"ops","filter":{"channel":"ops"},"kind":"message.posted"}]});
+        assert_eq!(
+            request(&router, "PUT", "/watchers", config.clone(), &[])
+                .await
+                .status,
+            StatusCode::OK
+        );
+        let made = request(
+            &router,
+            "POST",
+            "/tasks",
+            json!({"channel":"ops","text":"first","no_sync":true}),
+            &[],
+        )
+        .await;
+        let id = made.body["id"].as_i64().unwrap();
+        request(
+            &router,
+            "POST",
+            "/tasks",
+            json!({"channel":"ops","text":"second"}),
+            &[],
+        )
+        .await;
+        request(
+            &router,
+            "POST",
+            "/messages",
+            json!({"reply_to":id,"text":"recent"}),
+            &[],
+        )
+        .await;
+        let latest = request(
+            &router,
+            "GET",
+            "/tasks?latest=true&limit=1",
+            Value::Null,
+            &[],
+        )
+        .await;
+        assert_eq!(latest.body["tasks"][0]["id"], id);
+        assert_eq!(latest.body["tasks"][0]["last"]["text"], "recent");
+        assert_eq!(latest.body["tasks"][0]["replies"], 1);
+        assert!(latest.body["next_after"].is_null());
+        assert_eq!(
+            request(
+                &router,
+                "GET",
+                "/tasks?latest=true&after=0",
+                Value::Null,
+                &[]
+            )
+            .await
+            .status,
+            StatusCode::BAD_REQUEST
+        );
+        let pulled = request(&router, "POST", "/watcher-matches", json!({"limit":5}), &[]).await;
+        let matches = pulled.body["matches"].as_array().unwrap();
+        assert_eq!(matches.len(), 2);
+        assert_eq!(
+            request(&router, "PUT", "/watchers", config, &[])
+                .await
+                .status,
+            StatusCode::OK
+        );
+        assert_eq!(
+            request(&router, "POST", "/watcher-matches", json!({}), &[])
+                .await
+                .body["matches"],
+            json!([])
+        );
+        let head = &matches[0];
+        let receipt = format!("\"{}\"", head["receipt"].as_str().unwrap());
+        assert_eq!(
+            request(
+                &router,
+                "PUT",
+                &format!("/watchers/ops/acknowledgements/{}", head["event"]["cursor"]),
+                json!({}),
+                &[("If-Match", &receipt)]
+            )
+            .await
+            .status,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            request(&router, "POST", "/watcher-matches", json!({}), &[])
+                .await
+                .body["matches"][0]["event"]["message"]["text"],
+            "recent"
+        );
+    })
+}
+
+#[test]
 fn work_collections_validate_page_and_return_structured_failures() {
     runtime().block_on(work_pages());
 }
@@ -97,6 +196,18 @@ fn task_collection_finds_reverse_dependencies_and_filters_before_pagination() {
         make("ops-old", "review", &[pre]);
         make("ops/ci", "review", &[]);
         let router = api(db);
+        let mine = request(
+            &router,
+            "POST",
+            "/tasks",
+            json!({"channel":"worker","text":"mine"}),
+            &[],
+        )
+        .await;
+        assert_eq!(mine.status, StatusCode::CREATED);
+        let exact_actor = request(&router, "GET", "/tasks?by=me&limit=1", Value::Null, &[]).await;
+        assert_eq!(exact_actor.body["tasks"][0]["id"], mine.body["id"]);
+        assert!(exact_actor.body["next_after"].is_null());
         let query = format!(
             "/tasks?channel=ops%2F&needs={pre}&state=waiting&label=role%3Dreview%7Cverify&limit=1"
         );

@@ -11,7 +11,8 @@ source keys and upload handles may be strings.
 `GET /discovery`, `GET /me` and `GET /openapi.json` provide local capability
 discovery, the effective actor, and the OpenAPI 3.1 **route inventory**. The
 inventory is checked against actual router methods; consult this guide and
-the linked resource guides for field-level payload contracts.
+the linked resource guides for field-level payload contracts. Common message,
+task, schedule, source and write-rule write bodies also have machine-readable schemas.
 
 ## Messages and events
 
@@ -20,7 +21,7 @@ the linked resource guides for field-level payload contracts.
 | `GET /channels` | Optional `scope=studio`, lexical `after`, `limit`; returns channel counts, snapshot `cursor` and `next_after`. |
 | `POST /channels` | `{"name":"studio/build"}`; 201 with Location, or 200 with `created:false`. First post creates its channel without a separate request. |
 | `GET /channels/studio/build` | One channel summary. `GET /actors` lists observed handles. |
-| `POST /messages` | Exactly one of `channel` or `reply_to`, plus `text`, optional `labels`, `attachments`, and (replies only) `after`. 201 with message and Location. Same key, author and target: 200 with the recorded message, not an edit. Reuse by another author or target: 409. |
+| `POST /messages` | Exactly one of `channel` or `reply_to`, plus `text`, optional `labels`, `attachments`, `attachment_ids`, `no_sync`, and (replies only) `after`. 201 with message and Location. Same key, author and target: 200 with the recorded message, not an edit. Reuse by another author or target: 409. |
 | `GET /posts/{key}` | Recover the current message for the local server author's client key; 404 for missing keys and other authors' keys. URL-encode the key. |
 | `GET /messages/{id}` | One current message. `re` is the root ID for a reply; `reply_to` is the individual parent when different from the root. |
 | `PATCH /messages/{id}` | `{"text":"Replacement","if_revision":5}`; revision condition is optional. Returns the updated message. |
@@ -28,7 +29,9 @@ the linked resource guides for field-level payload contracts.
 | `PATCH /messages/{id}/labels` | `{"set":{"state":"done"},"unset":["pending"],"conditions":{"state":"open","holder":null}}`. All conditions must hold together. `board.*` labels are reserved. |
 | `PUT`, `DELETE /messages/{id}/reactions/{name}` | Add/remove the server actor's reaction. 204, including unchanged requests. |
 | `GET /attachments/{id}` | Original bytes as `application/octet-stream`; never a filesystem path. |
-| `GET /messages`, `GET /threads` | A page of flat messages or summaries. Filters: `channel` (trailing slash for subtree), `text`, `by`, `re`, `mentions`, `label=key` or `label=key=value`. |
+| `GET /messages`, `GET /threads` | A page of flat messages or summaries. Filters: `channel` (trailing slash for subtree), `text`, `by`, `re`, `mentions`, `from=SOURCE` (`board` for native posts), repeated `label=key` or `label=key=value`. |
+| `GET /messages/{id}/deliveries` | Up to 100 most recent outbound jobs for this exact message at sources the caller may administer; statuses and reasons, not raw payloads or lease secrets. |
+| `GET /rules`, `GET/PUT/DELETE /rules/{name}` | Trusted owner only. Install/update `{priority,script}`; 201 with Location when new. [Offline write rules](RULES.md). |
 | `GET /threads/{id}` | Accepts any message in the thread. One snapshot: `{message,replies,schedules,cursor}`; replies in creation order and pending reminders. With `after`, supply a message ID from this thread. Optional `limit` bounds replies; omit it to read the whole thread. |
 | `GET /events` | Ordered event-time views. Without a cursor start at the live head; use `after=0` for all history or resume from your last cursor. Same filters as lists, plus optional `kind` and `wait_ms` (0..30000). Returns `{events,cursor}`; timeout returns an empty page, not an error. |
 | `GET /events` with `Accept: text/event-stream` | SSE with event type, numeric ID and JSON data. Supports `Last-Event-ID`; an explicit `after` takes precedence. Credentials are checked again during delivery. For a current-view seed use `last=1..100` instead of a cursor/kind. |
@@ -92,6 +95,7 @@ create-and-claim, plans, queue waits, schedule authorization and handler contrac
 | `DELETE /schedules/{id}` | Cancel pending sends, 204. Does not delete the schedule's history. A worker fires messages; the API alone does not. |
 | `POST /watchers` | `{"name":"qa","kind":"message.posted","filter":{"channel":"work/","labels":{"step":"check"}}}`. A new subscription begins at the current head. |
 | `GET /watchers`, `GET`, `DELETE /watchers/{name}` | List, inspect or remove a subscription. |
+| `PUT /watchers`, `POST /watcher-matches` | Atomically replace this actor's registrations with `{watchers:[...]}`, retaining cursors for unchanged filters; lease a bounded group with `{limit,lease_seconds,wait_seconds}`. |
 | `GET /watchers/{name}/next` | Oldest unacknowledged match as an event, 204 if none available. Repeatable before ack; no exclusive lease in this mode. |
 | `POST /watchers/{name}/deliveries` | `{"lease_seconds":30}` (1..3600); returns event, receipt, deadline and ETag, or 204 if unavailable. |
 | `PUT /watchers/{name}/acknowledgements/{cursor}` | Ack precisely this delivery. Include its quoted ETag in `If-Match` for leased deliveries. No body for success, `{"skip":true}` to skip, or `{"error":"reason"}` to retry with backoff. |
@@ -109,7 +113,8 @@ belongs in an HTTP request to Board. See [connector examples and envelopes](SYNC
 
 | Method and resource | Input / response |
 | --- | --- |
-| `GET/POST /sources`, `GET/PATCH /sources/{name}` | List/create `{name,provider,remote,channel}` or change `{"outbound":true}`; create returns 201 + Location (200 on identical replay). |
+| `GET/POST /sources`, `GET/PATCH /sources/{name}` | List/create `{name,provider,remote,channel}`. PATCH accepts `outbound`, `mirror_roots`, `mirror_files` (Slack only), `display_authors`, `github_items` (all/issues/pulls); omitted settings retain their values. Create returns 201 + Location (200 on identical replay). |
+| `GET/PUT/DELETE /sources/{name}/renderer` | Trusted owner only. Read, install `{"script":"message.text"}` or clear a bounded Rhai renderer. A newly created renderer returns 201 with Location. |
 | `POST /sources/{name}/imports` | Apply one normalized envelope and return the local message. |
 | `PUT/GET /sources/{name}/links` | Attach `{thread,external,message,url?}`; find via `?thread=T&external=K`, just a thread, or `?url=...`. |
 | `GET /sources/{name}/copies/{id}` | All confirmed external copies for a local message at that source. |

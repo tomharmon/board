@@ -4,7 +4,7 @@ use crate::errors::Kind::{Conflict, Forbidden, Missing};
 use crate::{Board, Event, Filter};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
@@ -15,6 +15,7 @@ pub struct Watcher {
     key: String,
     pub filter: Filter,
     pub kind: Option<String>,
+    pub all: bool,
     pub cursor: i64,
     /// Writes made as this watcher's profile don't feed back into it, except scheduled posts.
     pub run_as: Option<String>,
@@ -23,6 +24,7 @@ pub struct Watcher {
 /// A pull consumer can lease a delivery instead of peeking. Only this receipt can ack the lease.
 #[derive(Debug, Serialize)]
 pub struct Delivery {
+    pub watcher: String,
     pub event: Event,
     /// Stable across attempts and unique to the board, registration and event.
     pub trigger: String,
@@ -47,6 +49,9 @@ pub enum DeliveryOutcome<'a> {
 
 const MAX_ATTEMPTS: i64 = 5;
 const MAX_INTERRUPTED_ATTEMPTS: i64 = 10;
+mod outputs;
+pub(crate) use outputs::authorize_callback_key;
+pub use outputs::{callback_key, callback_write_key, start_callback};
 
 pub(super) fn init(conn: &Connection) -> Result<()> {
     conn.execute_batch(
@@ -65,8 +70,13 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS watcher_registry(
             internal TEXT PRIMARY KEY REFERENCES watchers(name) ON DELETE CASCADE,
             actor TEXT NOT NULL,name TEXT NOT NULL,credential TEXT NOT NULL, UNIQUE(actor,name));
+        CREATE TABLE IF NOT EXISTS watcher_callback_runs(
+            name TEXT NOT NULL REFERENCES watchers(name) ON DELETE CASCADE, cursor INTEGER NOT NULL, receipt TEXT NOT NULL,
+            capability BLOB NOT NULL UNIQUE, actor TEXT NOT NULL, seq INTEGER NOT NULL,PRIMARY KEY(name,cursor));
+        CREATE TABLE IF NOT EXISTS watcher_outputs(key TEXT PRIMARY KEY,actor TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS watcher_lane ON watcher_queue(name,lane,cursor) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS watcher_pending ON watcher_queue(name,cursor) WHERE state='pending';
+        CREATE TABLE IF NOT EXISTS watcher_verbose(name TEXT PRIMARY KEY REFERENCES watchers(name) ON DELETE CASCADE);
         INSERT OR IGNORE INTO watcher_scan(name,scanned)
             SELECT name,cursor FROM watchers;",
     )?;
@@ -110,6 +120,11 @@ fn get(conn: &Connection, name: &str) -> Result<Watcher> {
             .optional()?
             .unwrap_or_else(|| name.to_owned()),
         key: name.to_owned(),
+        all: conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM watcher_verbose WHERE name=?)",
+            [name],
+            |r| r.get(0),
+        )?,
         filter: serde_json::from_str(&filter)?,
         kind,
         cursor,
@@ -140,6 +155,13 @@ struct Policies {
 impl Policies {
     fn open(b: &Board, tx: &Transaction<'_>, name: &str) -> Result<(Watcher, Self)> {
         let caller = b.access_on(tx)?;
+        ensure!(
+            !caller.request_narrowed(),
+            Forbidden.error(
+                "scope_not_durable",
+                "temporary scopes cannot consume or change a durable watcher"
+            )
+        );
         let w = get(tx, &key(tx, &caller, name)?)?;
         let id: Option<String> = tx
             .query_row(
@@ -189,6 +211,32 @@ pub fn add_watcher_as(
     filter: Filter,
     kind: Option<&str>,
 ) -> Result<Watcher> {
+    add_watcher_spec(
+        board,
+        actor,
+        WatchSpec {
+            name: name.into(),
+            filter,
+            kind: kind.map(str::to_owned),
+            all: false,
+        },
+    )
+}
+pub fn add_watcher_spec(board: &Board, actor: &str, s: WatchSpec) -> Result<Watcher> {
+    let tx = write(&board.conn)?;
+    let a = board.access_on(&tx)?;
+    let w = subscribe(&tx, &a, actor, &s.name, s.filter, s.kind.as_deref(), s.all)?;
+    tx.commit()?;
+    Ok(w)
+}
+
+fn validate_spec(
+    a: &Access,
+    actor: &str,
+    name: &str,
+    filter: &Filter,
+    kind: Option<&str>,
+) -> Result<()> {
     crate::validate_actor(actor)?;
     ensure!(
         name.as_bytes()
@@ -201,6 +249,14 @@ pub fn add_watcher_as(
         "invalid watcher name"
     );
     ensure!(filter.after.is_none(), "watchers always start at the head");
+    ensure!(
+        filter.re.is_none_or(|id| id > 0),
+        "watcher thread filter must be a positive message ID"
+    );
+    ensure!(
+        !matches!(filter.mentions.as_deref(), Some("" | "me")),
+        "a durable watcher has no me: give an explicit mention handle"
+    );
     if let Some(channel) = &filter.channel {
         crate::validate_channel(channel.strip_suffix('/').unwrap_or(channel))?;
     }
@@ -212,8 +268,6 @@ pub fn add_watcher_as(
                 || matches!(c, b'.' | b'_' | b'-'))),
         "invalid event kind"
     );
-    let tx = write(&board.conn)?;
-    let a = board.access_on(&tx)?;
     a.actor(actor)?;
     ensure!(
         !a.request_narrowed(),
@@ -222,36 +276,33 @@ pub fn add_watcher_as(
             "cannot register a watcher from a temporarily narrowed request"
         )
     );
-    if let Some(scope) = &filter.channel {
-        let scope = scope.strip_suffix('/').unwrap_or(scope);
-        ensure!(
-            a.allows(Action::Read, scope)
-                || filter.channel.as_deref().is_some_and(|s| s.ends_with('/'))
-                    && a.channels(&tx, Action::Read)?.is_some_and(|paths| paths
-                        .iter()
-                        .any(|p| p.starts_with(&format!("{scope}/")))),
-            Forbidden.error("missing_permission", "watcher scope is not readable")
-        );
-    } else {
-        ensure!(
-            a.channels(&tx, Action::Read)?.is_none_or(|v| !v.is_empty()),
-            Forbidden.error(
-                "missing_permission",
-                "watcher needs at least one readable channel"
-            )
-        );
-    }
+    ensure!(
+        a.anywhere(Action::Read, filter.channel.as_deref()),
+        Forbidden.error("missing_permission", "watcher scope is not readable")
+    );
+    Ok(())
+}
+fn subscribe(
+    tx: &Transaction<'_>,
+    a: &Access,
+    actor: &str,
+    name: &str,
+    filter: Filter,
+    kind: Option<&str>,
+    all: bool,
+) -> Result<Watcher> {
+    validate_spec(a, actor, name, &filter, kind)?;
     let internal = if a.is_trusted() {
         name.to_owned()
     } else {
         format!("@{}", uuid::Uuid::new_v4())
     };
     Board::event_tx(
-        &tx,
+        tx,
         "watcher.created",
         actor,
         None,
-        json!({"name":name,"filter":filter,"kind":kind}),
+        json!({"name":name,"filter":filter,"kind":kind,"all":all}),
     )?;
     let inserted = tx.execute(
         "INSERT INTO watchers(name,filter,kind,cursor) VALUES(?,?,?,(SELECT COALESCE(MAX(cursor),0) FROM events))
@@ -278,9 +329,130 @@ pub fn add_watcher_as(
         "INSERT INTO watcher_scan(name,scanned,run_as) SELECT name,cursor,? FROM watchers WHERE name=?",
         params![run_as, internal],
     )?;
-    let w = get(&tx, &internal)?;
+    if all {
+        tx.execute("INSERT INTO watcher_verbose VALUES(?)", [&internal])?;
+    }
+    get(tx, &internal)
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchSpec {
+    pub name: String,
+    #[serde(default)]
+    pub filter: Filter,
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Replace the calling actor's subscriptions as one configuration write. Unchanged
+/// subscriptions keep their cursor, leases and queued matches. Empty means unsubscribe.
+pub fn replace_watchers(b: &Board, actor: &str, specs: &[WatchSpec]) -> Result<Vec<Watcher>> {
+    let tx = write(&b.conn)?;
+    let a = b.access_on(&tx)?;
+    a.actor(actor)?;
+    ensure!(
+        !a.request_narrowed(),
+        Forbidden.error(
+            "scope_not_durable",
+            "temporary scopes cannot replace a registration"
+        )
+    );
+    ensure!(
+        a.anywhere(Action::Read, None),
+        Forbidden.error("missing_permission", "watcher needs readable channels")
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for s in specs {
+        validate_spec(&a, actor, &s.name, &s.filter, s.kind.as_deref())?;
+        ensure!(names.insert(&s.name), "duplicate watcher name");
+    }
+    let rows=tx.prepare("SELECT w.name FROM watchers w JOIN watcher_scan s USING(name) LEFT JOIN watcher_registry r ON r.internal=w.name
+       WHERE (?1 AND r.actor IS NULL AND (s.run_as=?2||'/'||w.name OR (s.run_as IS NULL AND ?2='local'))) OR (NOT ?1 AND r.actor=?3)")?
+       .query_map(params![a.is_trusted(),actor.split('/').next().unwrap_or(actor),actor],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut existing = std::collections::BTreeMap::new();
+    for internal in rows {
+        let w = get(&tx, &internal)?;
+        if !names.contains(&w.name) {
+            tx.execute("DELETE FROM watchers WHERE name=?", [&internal])?;
+            Board::event_tx(&tx, "watcher.removed", actor, None, json!({"name":w.name}))?;
+        } else {
+            existing.insert(w.name.clone(), w);
+        }
+    }
+    let mut out = Vec::new();
+    for s in specs {
+        if let Some(old) = existing.remove(&s.name) {
+            let credential: Option<String> = tx
+                .query_row(
+                    "SELECT credential FROM watcher_registry WHERE internal=?",
+                    [&old.key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let old_filter = serde_json::to_value(&old.filter)?;
+            if old_filter != serde_json::to_value(&s.filter)?
+                || old.kind != s.kind
+                || old.all != s.all
+                || credential.as_deref() != a.credential_id()
+            {
+                // Any event before reconfiguration is evaluated against the OLD scope/filter.
+                let head = crate::read::cursor_on(&tx)?;
+                if let Some(id) = credential.as_deref()
+                    && Board::credential_access_on(&tx, id)?.is_none()
+                {
+                    tx.execute("DELETE FROM watcher_queue WHERE name=?", [&old.key])?;
+                    tx.execute(
+                        "UPDATE watcher_scan SET scanned=? WHERE name=?",
+                        params![head, old.key],
+                    )?;
+                    checkpoint(&tx, &old.key)?;
+                } else {
+                    let (_, p) = Policies::open(b, &tx, &s.name)?;
+                    while scan(&tx, &old, &p)? {}
+                }
+                tx.execute(
+                    "UPDATE watchers SET filter=?,kind=? WHERE name=?",
+                    params![serde_json::to_string(&s.filter)?, s.kind, old.key],
+                )?;
+                if s.all {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO watcher_verbose VALUES(?)",
+                        [&old.key],
+                    )?;
+                } else {
+                    tx.execute("DELETE FROM watcher_verbose WHERE name=?", [&old.key])?;
+                }
+                if let Some(id) = a.credential_id() {
+                    tx.execute(
+                        "UPDATE watcher_registry SET credential=? WHERE internal=?",
+                        params![id, old.key],
+                    )?;
+                }
+                Board::event_tx(
+                    &tx,
+                    "watcher.updated",
+                    actor,
+                    None,
+                    json!({"name":s.name,"filter":s.filter,"kind":s.kind,"all":s.all}),
+                )?;
+            }
+            out.push(get(&tx, &old.key)?);
+        } else {
+            out.push(subscribe(
+                &tx,
+                &a,
+                actor,
+                &s.name,
+                s.filter.clone(),
+                s.kind.as_deref(),
+                s.all,
+            )?);
+        }
+    }
     tx.commit()?;
-    Ok(w)
+    Ok(out)
 }
 pub fn get_watcher(board: &Board, name: &str) -> Result<Watcher> {
     let tx = board.conn.unchecked_transaction()?;
@@ -371,6 +543,16 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
         {
             continue;
         }
+        if watcher.kind.is_none()
+            && (event.message.is_none()
+                || (!watcher.all
+                    && matches!(
+                        event.kind.as_str(),
+                        "task.renewed" | "message.synced" | "message.files_synced"
+                    )))
+        {
+            continue;
+        }
         let scheduled = event.kind == "message.posted"
             && event.message.as_ref().is_some_and(|m| m.schedule.is_some());
         if watcher.run_as.as_ref() == Some(&event.actor) && !scheduled {
@@ -393,10 +575,10 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
 fn expire(tx: &Transaction<'_>, name: &str, at: i64) -> Result<()> {
     let n = tx.execute(
         "UPDATE watcher_queue SET
-            state=CASE WHEN attempts>=?3 THEN 'failed' ELSE 'pending' END,
+            state=CASE WHEN attempts>=CASE WHEN EXISTS(SELECT 1 FROM watcher_registry WHERE internal=?1) THEN ?4 ELSE ?3 END THEN 'failed' ELSE 'pending' END,
             error='delivery lease expired',receipt=NULL,lease_until=NULL,offered=0
             WHERE name=?1 AND state='pending' AND lease_until<=?2",
-        params![name, at, MAX_INTERRUPTED_ATTEMPTS],
+        params![name, at, MAX_INTERRUPTED_ATTEMPTS,MAX_ATTEMPTS],
     )?;
     if n > 0 {
         checkpoint(tx, name)?;
@@ -467,10 +649,21 @@ pub fn lease_event(board: &Board, name: &str, lease_seconds: i64) -> Result<Opti
     );
     let tx = write(&board.conn)?;
     let (w, policy) = Policies::open(board, &tx, name)?;
+    let d = lease_one(board, &tx, &w, &policy, lease_seconds)?;
+    tx.commit()?;
+    Ok(d)
+}
+fn lease_one(
+    board: &Board,
+    tx: &Transaction<'_>,
+    w: &Watcher,
+    policy: &Policies,
+    lease_seconds: i64,
+) -> Result<Option<Delivery>> {
     let name = &w.key;
     let at = now();
-    expire(&tx, name, at)?;
-    let out = if let Some(event) = available(&tx, &w, at, &policy)? {
+    expire(tx, name, at)?;
+    let out = if let Some(event) = available(tx, w, at, policy)? {
         // A deadline stored in whole seconds must not truncate a one-second lease to milliseconds.
         let lease_until = at + lease_seconds + 1;
         let (receipt, attempt) = tx.query_row(
@@ -480,6 +673,7 @@ pub fn lease_event(board: &Board, name: &str, lease_seconds: i64) -> Result<Opti
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?;
         Some(Delivery {
+            watcher: w.name.clone(),
             trigger: format!(
                 "watch:{:x}",
                 Sha256::digest(serde_json::to_vec(&(
@@ -496,8 +690,55 @@ pub fn lease_event(board: &Board, name: &str, lease_seconds: i64) -> Result<Opti
     } else {
         None
     };
-    tx.commit()?;
     Ok(out)
+}
+
+/// Lease a batch of independent thread heads across the caller's watch set.
+pub fn lease_matches(b: &Board, limit: usize, seconds: i64) -> Result<Vec<Delivery>> {
+    ensure!(
+        (1..=100).contains(&limit) && (1..=3600).contains(&seconds),
+        "limit must be 1..100 and lease_seconds 1..3600"
+    );
+    let tx = write(&b.conn)?;
+    let a = b.access_on(&tx)?;
+    ensure!(
+        !a.request_narrowed(),
+        Forbidden.error(
+            "scope_not_durable",
+            "temporary scopes cannot consume a durable watcher"
+        )
+    );
+    let names=tx.prepare("SELECT coalesce(r.name,w.name) FROM watchers w LEFT JOIN watcher_registry r ON r.internal=w.name
+        WHERE (?1 AND r.actor IS NULL) OR r.actor=?2 ORDER BY 1")?.query_map(params![a.is_trusted(),a.bound_actor()],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    ensure!(
+        !names.is_empty(),
+        Missing.error("watcher_not_found", "no registered watchers")
+    );
+    let mut open = Vec::new();
+    for n in names {
+        match Policies::open(b, &tx, &n) {
+            Ok(w) => open.push(w),
+            Err(e) if crate::errors::classify(&e).1 == "registration_revoked" => (),
+            Err(e) => return Err(e),
+        }
+    }
+    let mut found = Vec::new();
+    while found.len() < limit {
+        let before = found.len();
+        for (w, p) in &open {
+            if let Some(d) = lease_one(b, &tx, w, p, seconds)? {
+                found.push(d);
+                if found.len() == limit {
+                    break;
+                }
+            }
+        }
+        if found.len() == before {
+            break;
+        }
+    }
+    tx.commit()?;
+    Ok(found)
 }
 
 pub fn ack_event(board: &Board, name: &str, cursor: i64) -> Result<()> {

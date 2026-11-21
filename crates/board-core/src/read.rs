@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 #[serde(default, deny_unknown_fields)]
 pub struct Filter {
     pub channel: Option<String>,
+    pub from: Option<String>,
     pub by: Option<String>,
     pub text: Option<String>,
     pub labels: BTreeMap<String, String>,
@@ -35,13 +36,7 @@ impl LabelTerm {
                 let (k, v) = term
                     .split_once('=')
                     .map_or((term.as_str(), None), |(k, v)| (k, Some(v)));
-                ensure!(
-                    !k.is_empty()
-                        && k.len() <= 64
-                        && k.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')),
-                    "invalid label filter key"
-                );
+                crate::core::validate_label_key(k)?;
                 ensure!(
                     v.is_none_or(|s| s.len() <= 2048),
                     "label filter is too long"
@@ -59,6 +54,51 @@ impl LabelTerm {
                 .as_ref()
                 .is_none_or(|options| options.contains(v))
         })
+    }
+}
+impl Filter {
+    /// Resolve viewer-relative selectors before persisting or reusing a filter.
+    /// An exact actor is distinct from a person (who also covers their profiles).
+    pub fn bind_actor(&mut self, actor: &str) {
+        if self.by.as_deref() == Some("me") {
+            self.by = Some(format!("@[{actor}]"));
+        }
+        if matches!(self.mentions.as_deref(), Some("" | "me")) {
+            self.mentions = Some(format!("@[{actor}]"));
+        }
+    }
+    pub fn validate(&self) -> Result<()> {
+        if let Some(channel) = &self.channel {
+            crate::validate_channel(channel.strip_suffix('/').unwrap_or(channel))?;
+        }
+        ensure!(
+            self.after.is_none_or(|x| x >= 0) && self.re.is_none_or(|x| x > 0),
+            "invalid filter cursor or thread ID"
+        );
+        ensure!(
+            self.text.as_ref().is_none_or(|s| !s.is_empty()
+                && s.encode_utf16().count() <= 200
+                && !s.contains('\0')),
+            "text filter must contain 1-200 characters"
+        );
+        ensure!(
+            self.from.as_ref().is_none_or(|s| !s.is_empty()
+                && s.encode_utf16().count() <= 165
+                && !s.chars().any(char::is_control)),
+            "invalid source filter"
+        );
+        ensure!(
+            self.labels.len() + self.label_terms.len() <= 32,
+            "at most 32 label filters"
+        );
+        for k in self
+            .labels
+            .keys()
+            .chain(self.label_terms.iter().map(|t| &t.key))
+        {
+            crate::core::validate_label_key(k)?;
+        }
+        Ok(())
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,7 +178,17 @@ impl Event {
             f.channel
                 .as_ref()
                 .is_none_or(|c| channel_match(c, &m.channel))
+                && f.from.as_ref().is_none_or(|s| {
+                    s == m
+                        .from
+                        .as_deref()
+                        .or_else(|| m.origin.as_ref().map(|o| o.source.as_str()))
+                        .unwrap_or("board")
+                })
                 && f.by.as_ref().is_none_or(|who| {
+                    if let Some(id) = crate::prose::exact_selector(who) {
+                        return m.actor == id;
+                    }
                     let who = who.trim_start_matches('@');
                     m.actor == who
                         || m.actor
@@ -150,8 +200,7 @@ impl Event {
                     .as_ref()
                     .is_none_or(|t| m.text.to_lowercase().contains(&t.to_lowercase()))
                 && f.mentions.as_ref().is_none_or(|who| {
-                    let who = crate::prose::query(who);
-                    crate::core::mentions(&m.text).any(|h| crate::prose::matches(&h, &who))
+                    crate::core::mentions(&m.text).any(|h| crate::prose::matches(&h, who))
                 })
                 && f.label_terms.iter().all(|t| {
                     t.matches(m.labels.get(&t.key)) || t.matches(self.root_labels.get(&t.key))
@@ -164,6 +213,7 @@ impl Event {
             || self.previous.as_ref().is_some_and(matches)
             || (self.message.is_none()
                 && f.channel.is_none()
+                && f.from.is_none()
                 && f.by.is_none()
                 && f.re.is_none()
                 && f.text.is_none()
@@ -187,10 +237,25 @@ pub(crate) fn predicate(f: &Filter) -> (String, Vec<Bind>) {
         bind.push(c.clone().into());
     }
     if let Some(t) = &f.by {
-        let who = t.trim_start_matches('@');
-        sql.push_str(" AND (m.actor=? OR instr(m.actor,?)=1)");
-        bind.push(who.to_owned().into());
-        bind.push(format!("{who}/").into());
+        if let Some(exact) = crate::prose::exact_selector(t) {
+            sql.push_str(" AND m.actor=?");
+            bind.push(exact.to_owned().into());
+        } else {
+            let who = t.trim_start_matches('@');
+            sql.push_str(" AND (m.actor=? OR instr(m.actor,?)=1)");
+            bind.push(who.to_owned().into());
+            bind.push(format!("{who}/").into());
+        }
+    }
+    if let Some(source) = &f.from {
+        if source == "board" {
+            sql.push_str(
+                " AND NOT EXISTS(SELECT 1 FROM sync_copies sc WHERE sc.message=m.id AND sc.origin)",
+            );
+        } else {
+            sql.push_str(" AND EXISTS(SELECT 1 FROM sync_copies sc WHERE sc.message=m.id AND sc.origin AND sc.source=?)");
+            bind.push(source.clone().into());
+        }
     }
     if let Some(t) = &f.text {
         sql.push_str(" AND instr(board_lower(m.text),?)>0");
@@ -206,9 +271,17 @@ pub(crate) fn predicate(f: &Filter) -> (String, Vec<Bind>) {
     }
     if let Some(t) = &f.mentions {
         let h = crate::prose::query(t);
-        sql.push_str(" AND EXISTS(SELECT 1 FROM mentions u WHERE u.message_id=m.id AND (u.handle=? OR instr(u.handle,?)=1))");
-        bind.push(h.to_owned().into());
-        bind.push(format!("{h}/").into());
+        if crate::prose::exact_selector(t).is_some() {
+            sql.push_str(
+                " AND EXISTS(SELECT 1 FROM mentions u WHERE u.message_id=m.id AND u.handle=?)",
+            );
+            bind.push(h.into());
+        } else {
+            sql.push_str(" AND EXISTS(SELECT 1 FROM mentions u WHERE u.message_id=m.id AND (u.handle=? OR instr(u.handle,?)=1))");
+            let sep = crate::prose::family_separator(&h);
+            bind.push(h.clone().into());
+            bind.push(format!("{h}{sep}").into());
+        }
     }
     for (k, v) in &f.labels {
         sql.push_str(" AND EXISTS(SELECT 1 FROM labels l WHERE (l.message_id=m.id OR l.message_id=m.re) AND l.key=?");
@@ -249,13 +322,41 @@ fn check_channel(c: &Connection, access: &Access, filter: &Filter) -> Result<()>
     }
     Ok(())
 }
-fn visible_predicate(c: &Connection, a: &Access, f: &Filter) -> Result<(String, Vec<Bind>)> {
+pub(crate) fn visible_predicate(
+    c: &Connection,
+    a: &Access,
+    f: &Filter,
+) -> Result<(String, Vec<Bind>)> {
+    f.validate()?;
     let mut base = f.clone();
     let mention = base.mentions.take();
+    let author = base.by.take();
     let (mut pred, mut bind) = predicate(&base);
+    if let Some(q) = author {
+        let authors = crate::actors::author_filter(c, a, &q)?;
+        pred.push_str(" AND (m.actor IN (SELECT value FROM json_each(?)) OR
+            (instr(m.actor,'/')>0 AND substr(m.actor,1,instr(m.actor,'/')-1) IN (SELECT value FROM json_each(?))))");
+        bind.push(serde_json::to_string(&authors.ids)?.into());
+        bind.push(serde_json::to_string(&authors.families)?.into());
+    }
     if let Some(q) = mention {
-        pred.push_str(" AND EXISTS(SELECT 1 FROM mentions u JOIN json_each(?) wanted ON (u.handle=wanted.value OR instr(u.handle,wanted.value||'/')=1) WHERE u.message_id=m.id)");
-        bind.push(serde_json::to_string(&crate::actors::mention_terms(c, a, &q)?)?.into());
+        let terms = crate::actors::mention_terms(c, a, &q)?;
+        let names = terms
+            .iter()
+            .map(|t| crate::prose::query(t))
+            .collect::<Vec<_>>();
+        let prefixes = if crate::prose::exact_selector(&q).is_some() {
+            vec![]
+        } else {
+            names
+                .iter()
+                .map(|t| format!("{t}{}", crate::prose::family_separator(t)))
+                .collect()
+        };
+        pred.push_str(" AND EXISTS(SELECT 1 FROM mentions u WHERE u.message_id=m.id AND
+            (u.handle IN (SELECT value FROM json_each(?)) OR EXISTS(SELECT 1 FROM json_each(?) prefix WHERE instr(u.handle,prefix.value)=1)))");
+        bind.push(serde_json::to_string(&names)?.into());
+        bind.push(serde_json::to_string(&prefixes)?.into());
     }
     if let Some(channels) = a.channels(c, Action::Read)? {
         pred.push_str(" AND m.channel IN (SELECT value FROM json_each(?))");

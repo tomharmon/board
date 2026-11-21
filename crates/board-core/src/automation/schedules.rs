@@ -15,15 +15,28 @@ pub struct Schedule {
     pub text: String,
     pub actor: String,
     pub due: i64,
+    /// An older database may not have recorded a creation event.
+    pub first: Option<i64>,
+    pub next: Option<i64>,
+    pub last: Option<i64>,
+    pub canceled: Option<ScheduleEnd>,
     pub every: Option<i64>,
     pub max_sends: Option<i64>,
     pub until: Option<i64>,
     pub sent: i64,
     pub state: String,
+    pub no_sync: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<crate::MentionResolution>,
     pub labels: BTreeMap<String, String>,
     pub attachments: Vec<ScheduledFile>,
     #[serde(skip)]
     blind: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct ScheduleEnd {
+    pub by: String,
+    pub reason: String,
 }
 #[derive(Debug, Serialize)]
 pub struct ScheduledFile {
@@ -63,6 +76,10 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS schedule_auth(schedule INTEGER PRIMARY KEY REFERENCES schedules(id),credential TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS schedule_caps(schedule INTEGER PRIMARY KEY REFERENCES schedules(id),rules TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS blind_schedules(schedule INTEGER PRIMARY KEY REFERENCES schedules(id));
+        CREATE TABLE IF NOT EXISTS local_only_schedules(schedule INTEGER PRIMARY KEY REFERENCES schedules(id));
+        CREATE TABLE IF NOT EXISTS schedule_details(schedule INTEGER PRIMARY KEY REFERENCES schedules(id),first INTEGER,ended_by TEXT,reason TEXT);
+        INSERT OR IGNORE INTO schedule_details(schedule,first)
+            SELECT s.id,(SELECT json_extract(e.payload,'$.due') FROM events e WHERE e.kind='schedule.created' AND json_extract(e.payload,'$.id')=s.id ORDER BY e.cursor LIMIT 1) FROM schedules s;
         CREATE TABLE IF NOT EXISTS schedule_refs(schedule INTEGER NOT NULL REFERENCES schedules(id),ordinal INTEGER NOT NULL,file INTEGER NOT NULL,name TEXT NOT NULL,size INTEGER NOT NULL,PRIMARY KEY(schedule,ordinal));
         INSERT OR IGNORE INTO schedule_sends(message_id,schedule_id,ordinal)
             SELECT m.id,s.id,json_extract(e.payload,'$.n') FROM events e
@@ -103,11 +120,17 @@ fn get(conn: &Connection, id: i64) -> Result<Schedule> {
                         text: r.get(2)?,
                         actor: r.get(3)?,
                         due: r.get(4)?,
+                        first: None,
+                        next: None,
+                        last: None,
+                        canceled: None,
                         every: r.get(5)?,
                         max_sends: r.get(6)?,
                         until: r.get(7)?,
                         sent: r.get(8)?,
                         state: r.get(9)?,
+                        no_sync: false,
+                        mentions: vec![],
                         labels: BTreeMap::new(),
                         attachments: Vec::new(),
                         blind: false,
@@ -119,6 +142,28 @@ fn get(conn: &Connection, id: i64) -> Result<Schedule> {
         .optional()?
         .context(crate::errors::Kind::Missing.error("schedule_not_found", "schedule not found"))?;
     s.labels = serde_json::from_str(&labels)?;
+    (s.first, s.canceled) = conn
+        .query_row(
+            "SELECT first,ended_by,reason FROM schedule_details WHERE schedule=?",
+            [id],
+            |r| {
+                let by: Option<String> = r.get(1)?;
+                let why: Option<String> = r.get(2)?;
+                Ok((
+                    r.get(0)?,
+                    by.zip(why).map(|(by, reason)| ScheduleEnd { by, reason }),
+                ))
+            },
+        )
+        .optional()?
+        .unwrap_or((None, None));
+    s.next = (s.state == "pending").then_some(s.due);
+    s.last=conn.query_row("SELECT message_id FROM schedule_sends WHERE schedule_id=? ORDER BY ordinal DESC LIMIT 1",[id],|r|r.get(0)).optional()?;
+    s.no_sync = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_only_schedules WHERE schedule=?)",
+        [id],
+        |r| r.get(0),
+    )?;
     s.blind = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM blind_schedules WHERE schedule=?)",
         [id],
@@ -166,6 +211,30 @@ pub fn schedule_post(
     text: &str,
     t: Timing,
     options: &PostOptions,
+) -> Result<Schedule> {
+    schedule_inner(board, actor, target, text, t, options, None)
+}
+
+/// Retire the exact saved composer draft in the transaction that accepts its schedule.
+pub fn schedule_draft(
+    board: &Board,
+    actor: &str,
+    target: Destination<'_>,
+    text: &str,
+    t: Timing,
+    options: &PostOptions,
+    guard: (&str, &str),
+) -> Result<Schedule> {
+    schedule_inner(board, actor, target, text, t, options, Some(guard))
+}
+fn schedule_inner(
+    board: &Board,
+    actor: &str,
+    target: Destination<'_>,
+    text: &str,
+    t: Timing,
+    options: &PostOptions,
+    draft: Option<(&str, &str)>,
 ) -> Result<Schedule> {
     ensure!(
         options.after.is_none() && options.key.is_none(),
@@ -215,12 +284,32 @@ pub fn schedule_post(
         }
     };
     access.require(Action::Post, &channel)?;
+    if let Some((scope, revision)) = draft {
+        let root = if let Some(id) = re {
+            Some(Board::get_on(&tx, id)?.re.unwrap_or(id))
+        } else {
+            None
+        };
+        let expected = root.map_or_else(|| "new".to_owned(), |id| format!("thread:{id}"));
+        let mismatch = || {
+            crate::errors::Kind::Conflict
+                .error("draft_changed", "draft was already sent, edited, or moved")
+        };
+        ensure!(scope == expected, mismatch());
+        let saved = board.check_composer_options_on(&tx, actor, scope, text, options, Some(&t))?;
+        ensure!(
+            saved.channel == channel && saved.reply_to.or(root) == re,
+            mismatch()
+        );
+        board.consume_composer_on(&tx, actor, scope, revision)?;
+    }
     if !options.labels.is_empty() {
         access.require(Action::Label, &channel)?;
     }
-    validate_post(&channel, actor, text, options)?;
+    let (text, mentions) = crate::actors::settle(&tx, &access, actor, re, text)?;
+    validate_post(&channel, actor, &text, options)?;
     access.files(&tx, actor, &options.attachment_ids)?;
-    Board::blocks_on(&tx, text)?;
+    Board::blocks_on(&tx, &text)?;
     tx.execute(
         "INSERT INTO schedules(channel,re,text,actor,due,every,max_sends,until_at,labels)
         VALUES(?,?,?,?,?,?,?,?,?)",
@@ -237,6 +326,13 @@ pub fn schedule_post(
         ],
     )?;
     let id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO schedule_details(schedule,first) VALUES(?,?)",
+        [id, t.due],
+    )?;
+    if options.no_sync {
+        tx.execute("INSERT INTO local_only_schedules VALUES(?)", [id])?;
+    }
     if !access.allows(Action::Read, &channel) {
         tx.execute("INSERT INTO blind_schedules VALUES(?)", [id])?;
     }
@@ -265,7 +361,8 @@ pub fn schedule_post(
             params![id, serde_json::to_string(cap)?],
         )?;
     }
-    let s = get(&tx, id)?;
+    let mut s = get(&tx, id)?;
+    s.mentions = mentions;
     Board::event_tx(
         &tx,
         "schedule.created",
@@ -386,6 +483,10 @@ pub fn cancel_schedule(board: &Board, id: i64, actor: &str) -> Result<Schedule> 
         [id],
     )? != 0
     {
+        tx.execute(
+            "UPDATE schedule_details SET ended_by=?,reason='canceled' WHERE schedule=?",
+            params![actor, id],
+        )?;
         Board::event_tx(&tx, "schedule.canceled", actor, None, json!({"id":id}))?;
     }
     let s = get(&tx, id)?;
@@ -406,6 +507,10 @@ pub(crate) fn cancel_for_root(tx: &rusqlite::Transaction<'_>, id: i64, actor: &s
         tx.execute(
             "UPDATE schedules SET state='canceled' WHERE id=?",
             [schedule],
+        )?;
+        tx.execute(
+            "UPDATE schedule_details SET ended_by=?,reason='thread_deleted' WHERE schedule=?",
+            params![actor, schedule],
         )?;
         Board::event_tx(
             tx,
@@ -492,6 +597,10 @@ pub fn dispatch_due(board: &Board) -> Result<usize> {
         };
         if !allowed {
             tx.execute("UPDATE schedules SET state='revoked' WHERE id=?", [id])?;
+            tx.execute(
+                "UPDATE schedule_details SET ended_by='board',reason='revoked' WHERE schedule=?",
+                [id],
+            )?;
             Board::event_tx(
                 &tx,
                 "schedule.ended",
@@ -515,6 +624,7 @@ pub fn dispatch_due(board: &Board) -> Result<usize> {
             continue;
         }
         let opts = PostOptions {
+            no_sync: s.no_sync,
             labels: s.labels,
             attachment_ids: file_ids,
             files: tx
@@ -536,9 +646,31 @@ pub fn dispatch_due(board: &Board) -> Result<usize> {
             tx.commit()?;
             continue;
         }
-        let post = match s.re {
-            Some(re) => Board::reply_tx(&tx, re, &s.actor, &s.text, &opts)?,
-            None => Board::post_tx(&tx, &s.channel, &s.actor, &s.text, &opts)?,
+        tx.execute_batch("SAVEPOINT scheduled_send")?;
+        let attempted = match s.re {
+            Some(re) => Board::reply_tx(&tx, re, &s.actor, &s.text, &opts),
+            None => Board::post_tx(&tx, &s.channel, &s.actor, &s.text, &opts),
+        };
+        let post = match attempted {
+            Ok(post) => {
+                tx.execute_batch("RELEASE scheduled_send")?;
+                post
+            }
+            Err(e) if crate::errors::classify(&e).1 == "dropped" => {
+                tx.execute_batch("ROLLBACK TO scheduled_send; RELEASE scheduled_send")?;
+                tx.execute("UPDATE schedules SET state='dropped' WHERE id=?", [id])?;
+                tx.execute("UPDATE schedule_details SET ended_by='board',reason='dropped' WHERE schedule=?",[id])?;
+                Board::event_tx(
+                    &tx,
+                    "schedule.ended",
+                    &s.actor,
+                    None,
+                    json!({"id":id,"reason":"dropped"}),
+                )?;
+                tx.commit()?;
+                continue;
+            }
+            Err(e) => return Err(e),
         };
         if blind_send {
             tx.execute("INSERT OR IGNORE INTO blind_posts(id) VALUES(?)", [post.id])?;

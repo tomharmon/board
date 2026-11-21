@@ -1,8 +1,12 @@
+mod delivery;
+mod filters;
+mod people;
+mod preview;
 mod properties;
 mod rich;
 mod workspace;
 
-use crate::state::{Page, State};
+use crate::state::{Page, Position, State};
 use board_local::{Message, ThreadSummary, automation::Task, local};
 use rune::{
     Color, Cursor, Cx, El, Icon, Key, ScrollSpec, TextStyle, Tx, col, el, icon, row, text,
@@ -221,6 +225,7 @@ fn sidebar(s: &State, narrow: bool) -> El {
                     | Page::Watchers
                     | Page::Schemas
                     | Page::Profiles
+                    | Page::People
                     | Page::Access
                     | Page::Sources
                     | Page::Inbox
@@ -339,6 +344,39 @@ fn header(s: &State, narrow: bool) -> El {
         .px(if narrow { 14.0 } else { 28.0 })
         .center_y()
         .gap(8.0);
+    if s.browse.jump_open {
+        return bar
+            .child(
+                text_input(&s.browse.jump, TextStyle::new(14.0, 500.0))
+                    .key("jump-id")
+                    .label("Message ID")
+                    .placeholder("Message ID", c(MUTED))
+                    .single_line()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .h(32.0)
+                    .padding(7.0)
+                    .radius(4.0)
+                    .border(1.0, c(EDGE))
+                    .on_edit(|s: &mut State| &mut s.browse.jump)
+                    .on_input_key(|s: &mut State, k, _| {
+                        if k.key == Key::Enter {
+                            s.jump_to_id();
+                            true
+                        } else {
+                            false
+                        }
+                    }),
+            )
+            .child(
+                tool("submit-jump", "Open message", &glyphs::ARROW_RIGHT)
+                    .on_press(State::jump_to_id),
+            )
+            .child(
+                tool("cancel-jump", "Cancel", &glyphs::CLOSE)
+                    .on_press(|s: &mut State| s.browse.jump_open = false),
+            );
+    }
     if narrow {
         bar =
             bar.child(action("open-nav", "Channels", false).on_press(|s: &mut State| s.nav = true));
@@ -365,23 +403,29 @@ fn header(s: &State, narrow: bool) -> El {
             .child(mono("/", MUTED))
             .child(mono(workspace::name(s.page, s), INK));
     }
-    bar.child(el().grow(1.0)).child(
-        click(
-            row()
-                .key("choose-profile")
-                .gap(7.0)
-                .center_y()
-                .help("Local profiles"),
-            "Local profiles",
-        )
-        .child(avatar(&s.actor))
+    bar.child(el().grow(1.0))
         .child(
-            label(&s.actor, 12.0, 550.0, INK)
-                .max_w(if narrow { 65.0 } else { 110.0 })
-                .truncate(),
+            tool("jump-message", "Go to message ID", &glyphs::CURSOR_TEXT)
+                .disabled(!s.connected())
+                .on_press_tx(State::jump_field),
         )
-        .on_press(|s: &mut State| s.go(Page::Profiles)),
-    )
+        .child(
+            click(
+                row()
+                    .key("choose-profile")
+                    .gap(7.0)
+                    .center_y()
+                    .help("Local profiles"),
+                "Local profiles",
+            )
+            .child(avatar(&s.actor))
+            .child(
+                label(&s.actor, 12.0, 550.0, INK)
+                    .max_w(if narrow { 65.0 } else { 110.0 })
+                    .truncate(),
+            )
+            .on_press(|s: &mut State| s.go(Page::Profiles)),
+        )
 }
 
 fn search(s: &State) -> El {
@@ -444,6 +488,9 @@ fn message_text(m: &Message) -> &str {
         &m.text
     }
 }
+fn author(m: &Message) -> &str {
+    m.author.as_ref().map_or(&m.actor, |a| &a.name)
+}
 fn stamp(ts: &str) -> String {
     ts.get(..16).unwrap_or(ts).replace('T', " ")
 }
@@ -454,7 +501,12 @@ fn item(t: &ThreadSummary) -> El {
         .w_full()
         .gap(7.0)
         .center_y()
-        .child(label(&m.actor, 12.0, 600.0, INK).max_w(140.0).truncate())
+        .child(
+            label(author(m), 12.0, 600.0, INK)
+                .max_w(140.0)
+                .truncate()
+                .help(&m.actor),
+        )
         .child(
             mono(format!("#{}", m.channel), MUTED)
                 .grow(1.0)
@@ -499,7 +551,7 @@ fn item(t: &ThreadSummary) -> El {
             .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE)),
         &format!("Open thread {id}"),
     )
-    .child(avatar(&m.actor))
+    .child(avatar(author(m)))
     .child(
         col()
             .min_w(0.0)
@@ -537,7 +589,7 @@ fn item(t: &ThreadSummary) -> El {
     })
 }
 fn feed(s: &State, inset: f32) -> El {
-    let head = col()
+    let mut head = col()
         .w_full()
         .px(inset)
         .pt(19.0)
@@ -561,19 +613,28 @@ fn feed(s: &State, inset: f32) -> El {
                 ),
         )
         .child(
-            row().w_full().center_y().gap(12.0).child(search(s)).child(
-                Checkbox::new(s.tasks_only)
-                    .label("Tasks only")
-                    .disabled(!s.connected())
-                    .on_toggle(|s: &mut State| {
-                        s.tasks_only = !s.tasks_only;
-                        s.starts.clear();
-                        s.refresh();
-                    })
-                    .build(&Kit::neutral(false))
-                    .key("tasks-only"),
-            ),
+            row()
+                .w_full()
+                .center_y()
+                .gap(8.0)
+                .child(search(s))
+                .child(filters::button())
+                .child(
+                    Checkbox::new(s.tasks_only)
+                        .label("Tasks only")
+                        .disabled(!s.connected())
+                        .on_toggle(|s: &mut State| {
+                            s.tasks_only = !s.tasks_only;
+                            s.starts.clear();
+                            s.refresh();
+                        })
+                        .build(&Kit::neutral(false))
+                        .key("tasks-only"),
+                ),
         );
+    if s.browse.has_filters() {
+        head = head.child(filters::summary(s));
+    }
     let mut list = col().w_full().px(inset);
     if !s.connected() {
         list = list.child(label("Board unavailable", 18.0, 600.0, INK).py(24.0));
@@ -583,7 +644,7 @@ fn feed(s: &State, inset: f32) -> El {
                 "No threads on this page"
             } else if s.tasks_only {
                 "No matching tasks"
-            } else if s.query.text.is_empty() {
+            } else if s.query.text.is_empty() && !s.browse.has_filters() {
                 "No threads yet"
             } else {
                 "No matching threads"
@@ -662,6 +723,7 @@ fn body(s: &State, reply: bool) -> El {
             c(MUTED),
         )
         .on_edit(|s: &mut State| &mut s.body)
+        .on_input_paste(|s: &mut State, content, _| s.paste_file(content))
         .on_input_change(move |s: &mut State, _| {
             s.draft_changed();
             if reply {
@@ -688,15 +750,31 @@ fn body(s: &State, reply: bool) -> El {
 }
 fn send(s: &State, name: &str) -> El {
     let empty = s.body.text.trim().is_empty() && s.files.is_empty();
-    action("send", name, true)
-        .disabled(empty)
-        .opacity(if empty { 0.55 } else { 1.0 })
-        .on_press_tx(State::send)
+    action(
+        "send",
+        if s.delivery.later { "Schedule" } else { name },
+        true,
+    )
+    .disabled(empty)
+    .opacity(if empty { 0.55 } else { 1.0 })
+    .on_press_tx(State::send)
 }
 fn attach(s: &State) -> El {
     tool("attach-file", "Attach file", &glyphs::FILE)
         .disabled(s.files.len() >= board_local::MAX_ATTACHMENTS)
         .on_press_tx(State::pick_file)
+}
+fn mention() -> El {
+    click(
+        el().key("mention-person")
+            .size(30.0, 30.0)
+            .center()
+            .radius(5.0)
+            .help("Mention a person or agent"),
+        "Mention a person or agent",
+    )
+    .child(label("@", 17.0, 600.0, MUTED))
+    .on_press_tx(State::pick_person)
 }
 fn draft(s: &State, reply: bool) -> El {
     let mut area = col()
@@ -728,6 +806,7 @@ fn draft(s: &State, reply: bool) -> El {
                         .on_press(move |s: &mut State| {
                             if i < s.files.len() {
                                 s.files.remove(i);
+                                s.files_changed();
                             }
                         }),
                     ),
@@ -785,6 +864,8 @@ fn composer(s: &State, inset: f32) -> El {
                 .center_y()
                 .gap(8.0)
                 .child(attach(s))
+                .child(mention())
+                .child(delivery::options(s))
                 .child(el().grow(1.0))
                 .child(action("cancel", "Cancel", false).on_press(|s: &mut State| s.go(Page::Feed)))
                 .child(send(s, "Post thread")),
@@ -882,7 +963,8 @@ fn message(s: &State, m: &Message) -> El {
                 .center_y()
                 .gap(5.0)
                 .child(
-                    label(&m.actor, 14.0, 600.0, INK)
+                    label(author(m), 14.0, 600.0, INK)
+                        .help(&m.actor)
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate(),
@@ -920,8 +1002,70 @@ fn message(s: &State, m: &Message) -> El {
             )
             .w_full()
             .wrap_anywhere(),
-        )
-        .child(rich::body(s, m));
+        );
+    if author(m) != m.actor {
+        content = content.child(mono(&m.actor, MUTED).w_full().wrap_anywhere());
+    }
+    content = content.child(rich::body(s, m));
+    for (i, l) in m.links.iter().enumerate().take(12) {
+        let title = l.message.map_or_else(
+            || "Quoted message".into(),
+            |n| format!("Quoted message #{n}"),
+        );
+        let mut quote = col()
+            .key(format!("quote-{id}-{i}"))
+            .w_full()
+            .gap(4.0)
+            .pl(9.0)
+            .border_sides([0.0, 0.0, 0.0, 2.0], c(EDGE))
+            .child(mono(title, MUTED));
+        if let Some(a) = &l.author {
+            quote = quote.child(
+                label(a.chars().take(120).collect::<String>(), 12.0, 600.0, INK)
+                    .w_full()
+                    .wrap_anywhere(),
+            );
+        }
+        if let Some(t) = &l.text {
+            quote = quote.child(
+                label(t.chars().take(500).collect::<String>(), 13.0, 450.0, INK)
+                    .w_full()
+                    .wrap_anywhere()
+                    .selectable(true)
+                    .max_lines(8),
+            );
+        } else {
+            quote = quote.child(mono(
+                match l.reason.as_deref() {
+                    Some("not_public") => "Not public",
+                    Some("not_in_channel") => "Not in channel",
+                    _ => "Quote unavailable",
+                },
+                MUTED,
+            ));
+        }
+        content = content.child(quote);
+    }
+    if let Some(at) = m.edited_at.as_deref().filter(|_| !m.deleted) {
+        content = content.child(mono(format!("Edited {} UTC", stamp(at)), MUTED));
+    }
+    if let Some(send) = &m.schedule {
+        content = content.child(
+            mono(format!("Schedule #{}   Send {}", send.id, send.n), MUTED)
+                .w_full()
+                .wrap_anywhere(),
+        );
+    }
+    if let Some(origin) = &m.from {
+        content = content.child(
+            mono(format!("Source: {origin}"), MUTED)
+                .w_full()
+                .wrap_anywhere(),
+        );
+    }
+    if m.no_sync {
+        content = content.child(mono("Local only", MUTED));
+    }
     if m.labels.keys().any(|k| k != "board.task") {
         let labels = m
             .labels
@@ -949,6 +1093,14 @@ fn message(s: &State, m: &Message) -> El {
                     )
                     .child(
                         tool(
+                            &format!("preview-{id}-{file}"),
+                            "Preview attachment",
+                            &glyphs::EYE,
+                        )
+                        .on_press_tx(move |s: &mut State, tx| s.open_attachment(id, file, tx)),
+                    )
+                    .child(
+                        tool(
                             &format!("save-file-{file}"),
                             "Save attachment",
                             &glyphs::FOLDER_OPEN,
@@ -972,14 +1124,28 @@ fn message(s: &State, m: &Message) -> El {
             .wrap_anywhere(),
         );
     }
-    row()
+    for (i, n) in m.file_notices.iter().enumerate() {
+        content = content.child(
+            mono(format!("File not copied: {}   {}", n.name, n.reason), MUTED)
+                .key(format!("file-notice-{id}-{i}"))
+                .w_full()
+                .wrap_anywhere(),
+        );
+    }
+    let mut entry = row()
         .key(format!("message-{id}"))
         .w_full()
         .gap(10.0)
         .py(14.0)
         .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE))
-        .child(avatar(&m.actor))
-        .child(content)
+        .child(avatar(author(m)))
+        .child(content);
+    if s.browse.focused == Some(id) {
+        entry = entry
+            .fill(c("#f5f8ef"))
+            .border_sides([0.0, 0.0, 1.0, 2.0], c("#65845f"));
+    }
+    entry
 }
 fn conversation(s: &State, id: i64, inset: f32) -> El {
     let mut messages = col().w_full().px(inset).pb(8.0);
@@ -1025,7 +1191,100 @@ fn conversation(s: &State, id: i64, inset: f32) -> El {
     } else {
         title
     };
-    let mut actions = row().w_full().gap(8.0).center_y().child(attach(s));
+    let mut content = col().w_full().grow(1.0).min_h(0.0).child(title);
+    if s.browse.older || s.browse.newer || s.browse.position != Position::Latest {
+        let first = s.thread.get(1).map_or(id, |m| m.id);
+        let last = s.thread.last().map_or(id, |m| m.id);
+        let mut paging = row()
+            .w_full()
+            .center_y()
+            .gap(4.0)
+            .px(inset)
+            .child(
+                mono(format!("Replies #{first} to #{last}"), MUTED)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate(),
+            )
+            .child(
+                tool("older-replies", "Older replies", &glyphs::CHEVRON_UP)
+                    .disabled(!s.browse.older)
+                    .on_press_tx(move |s: &mut State, tx| {
+                        s.page_replies(Position::Before(first), tx)
+                    }),
+            )
+            .child(
+                tool("newer-replies", "Newer replies", &glyphs::CHEVRON_DOWN)
+                    .disabled(!s.browse.newer)
+                    .on_press_tx(move |s: &mut State, tx| {
+                        s.page_replies(Position::After(last), tx)
+                    }),
+            );
+        if s.browse.position != Position::Latest {
+            paging = paging.child(
+                action("latest-replies", "Latest", false)
+                    .on_press_tx(|s: &mut State, tx| s.page_replies(Position::Latest, tx)),
+            );
+        }
+        content = content.child(paging);
+    }
+    for pending in &s.browse.schedules {
+        let sid = pending.id;
+        let mut pending_row = row().w_full().center_y().gap(5.0).child(
+            mono(
+                format!(
+                    "Scheduled reply #{}   {}",
+                    pending.id,
+                    workspace::utc(pending.due)
+                ),
+                MUTED,
+            )
+            .key(format!("scheduled-reply-{}", pending.id))
+            .py(6.0)
+            .grow(1.0)
+            .min_w(0.0)
+            .wrap_anywhere(),
+        );
+        if pending.actor == s.actor
+            || pending
+                .actor
+                .strip_prefix(&s.actor)
+                .is_some_and(|v| v.starts_with('/'))
+        {
+            pending_row = if s.browse.cancel == Some(sid) {
+                pending_row
+                    .child(
+                        action(&format!("confirm-pending-{sid}"), "Cancel send", false)
+                            .on_press(move |s: &mut State| s.cancel_pending(sid)),
+                    )
+                    .child(
+                        tool(
+                            &format!("keep-pending-{sid}"),
+                            "Keep schedule",
+                            &glyphs::CLOSE,
+                        )
+                        .on_press(|s: &mut State| s.browse.cancel = None),
+                    )
+            } else {
+                pending_row.child(
+                    tool(
+                        &format!("cancel-pending-{sid}"),
+                        "Cancel scheduled reply",
+                        &glyphs::CLOSE,
+                    )
+                    .on_press(move |s: &mut State| s.browse.cancel = Some(sid)),
+                )
+            };
+        }
+        messages = messages.child(pending_row);
+    }
+    let mut actions = row()
+        .w_full()
+        .gap(6.0)
+        .center_y()
+        .child(attach(s))
+        .child(mention())
+        .child(delivery::options(s));
     if let Some(target) = s.reply_to {
         actions = actions
             .child(
@@ -1044,6 +1303,9 @@ fn conversation(s: &State, id: i64, inset: f32) -> El {
     }
     actions = actions.child(el().grow(1.0)).child(send(s, "Reply"));
     let mut compose = col().w_full().px(inset).py(12.0).gap(8.0);
+    if let Some(id) = s.delivery.after {
+        compose = compose.child(delivery::guard(id));
+    }
     if !s.typing.is_empty() {
         compose = compose.child(
             mono(
@@ -1059,11 +1321,7 @@ fn conversation(s: &State, id: i64, inset: f32) -> El {
             .truncate(),
         );
     }
-    col()
-        .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .child(title)
+    content
         .child(scroll("conversation", messages))
         .child(rule())
         .child(compose.child(draft(s, true)).child(actions))
@@ -1117,10 +1375,17 @@ pub fn view(s: &State, cx: &mut Cx<State>) -> El {
             label("View unavailable", 16.0, 550.0, MUTED)
                 .px(inset)
                 .py(18.0)
+        } else if s.delivery.open && matches!(s.page, Page::Compose | Page::Thread(_)) {
+            delivery::view(s, inset)
+        } else if s.people.picking || s.page == Page::People {
+            people::view(s, inset)
+        } else if s.browse.filter_open {
+            filters::view(s, inset)
         } else {
             match s.page {
                 Page::Feed => feed(s, inset),
                 Page::Compose => composer(s, inset),
+                Page::Thread(_) if let Some(p) = &s.preview => preview::view(p, inset),
                 Page::Thread(id) => match s
                     .properties
                     .as_ref()
