@@ -157,10 +157,32 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
             );
         }
         let mut own = Mcp::open(scoped());
+        let advertised: Vec<_> = own.rpc("tools/list", json!({}))["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_owned())
+            .collect();
+        for hidden in [
+            "swarm_start",
+            "swarm_list",
+            "swarm_add",
+            "swarm_set_limit",
+            "swarm_stop",
+            "roles_list",
+            "roles_show",
+        ] {
+            assert!(
+                !advertised.iter().any(|n| n == hidden),
+                "worker MCP should not advertise {hidden}"
+            );
+        }
         let who = own.tool("board_whoami", json!({}), true);
         assert_eq!(who["actor"], actor);
         assert_eq!(who["worker"]["name"], name);
         own.tool("swarm_start", json!({"goal":"forbidden"}), false);
+        own.tool("swarm_set_limit", json!({"max_notifications":50}), false);
+        own.tool("roles_list", json!({}), false);
         own.tool("swarm_status", json!({"run":"other"}), false);
         own.tool(
             "swarm_post",

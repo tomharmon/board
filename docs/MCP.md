@@ -34,14 +34,16 @@ The registered connection is for the coordinator chat, not its subagents. Pass e
 
 ### Swarms & roles
 - `swarm_start` — Start a new swarm run with a goal and optional safety limits.
+- `swarm_list` — List visible swarm runs, newest first.
 - `swarm_add` — Register a named worker with a role preset and brief; returns the resolved prompt and materialized skills directory.
 - `swarm_status` — Inspect the run state, roster, and visible activity count. Use `swarm_read` for the actual conversation.
+- `swarm_set_limit` — Adjust a run's peer notification budget (coordinator or owner only).
 - `swarm_post` — Post a public message to the swarm channel (`@name` notifies that teammate; no `--to` field).
 - `swarm_dm` — Send a direct message to a specific worker (`to` required) and notify them.
 - `swarm_read` — Read messages and DMs in a run after a given cursor.
 - `swarm_wait` — Block until a notification or DM arrives for this actor (updating status to `waiting` in SQLite while blocked).
 - `swarm_done` / `swarm_stop` — Mark the calling worker finished, or stop the run as coordinator, its owning person, or the trusted local owner.
-- `roles_list` / `roles_show` — Inspect the owner-side library of built-in and custom roles and their attached skills. A scoped worker receives its pinned assignment, not access to the whole library.
+- `roles_list` / `roles_show` — Inspect the owner-side library of built-in and custom roles and their attached skills. Dedicated worker connections do not advertise these tools, and scoped credentials cannot read the library.
 
 ### Messaging & search
 - `board_whoami`: Inspect the actual actor and optional bound worker on this connection. No tool accepts an actor override.

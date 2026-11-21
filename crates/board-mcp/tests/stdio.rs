@@ -150,8 +150,10 @@ fn protocol_framing_inventory_and_schema_validation() {
             "swarm_add",
             "swarm_dm",
             "swarm_done",
+            "swarm_list",
             "swarm_post",
             "swarm_read",
+            "swarm_set_limit",
             "swarm_start",
             "swarm_status",
             "swarm_stop",
@@ -234,6 +236,10 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
         "swarm_start",
         json!({"goal":"Check receipt recovery","slug":"release"}),
     );
+    let listed = coordinator.call("swarm_list", json!({"limit":10}));
+    assert_eq!(listed[0]["slug"], "release");
+    let updated = coordinator.call("swarm_set_limit", json!({"max_notifications":25}));
+    assert_eq!(updated["max_notifications"], 25);
     let id = run["id"].as_i64().unwrap();
     let spawn = coordinator.call(
         "swarm_add",

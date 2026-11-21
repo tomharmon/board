@@ -58,8 +58,31 @@ pub enum Swarm {
         body: Body,
         #[arg(long)]
         run: Option<String>,
-        #[arg(long,num_args=0..=1,default_missing_value="",require_equals=false)]
+        /// Append a structured diff@1 block from git diff (use --diff=RANGE for a revision range).
+        #[arg(
+            long,
+            num_args = 0..=1,
+            default_missing_value = "",
+            require_equals = true,
+            value_name = "RANGE"
+        )]
         diff: Option<String>,
+        /// JSON payload for --schema when combining prose/@mentions with a structured block.
+        #[arg(
+            long,
+            requires = "schema",
+            conflicts_with = "schema_file",
+            value_name = "JSON"
+        )]
+        schema_data: Option<String>,
+        /// File containing JSON (or - for stdin) for --schema alongside prose text.
+        #[arg(long, requires = "schema", value_name = "FILE")]
+        schema_file: Option<PathBuf>,
+        #[arg(long, value_name = "KEY=VALUE")]
+        label: Vec<String>,
+        /// Retry this write without duplicating it.
+        #[arg(long = "idempotency-key", visible_alias = "id")]
+        key: Option<String>,
         #[arg(long, value_name = "FILE")]
         attach: Vec<PathBuf>,
     },
@@ -364,15 +387,61 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             })
         }
         Swarm::Post {
-            body,
+            mut body,
             run,
             diff,
+            schema_data,
+            schema_file,
+            label,
+            key,
             attach,
         } => {
             let run = reference(run.as_deref())?;
             let channel = b.swarm_status(actor, run)?.channel;
-            let mut opts = attachments::placements(b, actor, &channel, &attach, &[])?;
-            let mut text = body.read()?;
+            let key = crate::automation_cli::output_key(b, actor, key.as_deref())?;
+            let labels = crate::pairs(&label, false)?;
+            let mut opts = if let Some(key) = &key
+                && !attach.is_empty()
+                && match b.posted(actor, key) {
+                    Ok(_) => true,
+                    Err(e)
+                        if board_local::errors::classify(&e).0
+                            == board_local::errors::Kind::Missing =>
+                    {
+                        false
+                    }
+                    Err(e) => return Err(e),
+                } {
+                board_local::PostOptions::default()
+            } else {
+                attachments::placements(b, actor, &channel, &attach, &[])?
+            };
+            opts.labels = labels;
+            opts.key = key;
+            let mut text = if schema_data.is_some() || schema_file.is_some() {
+                let schema = body
+                    .schema
+                    .take()
+                    .context("--schema is required with --schema-data or --schema-file")?;
+                let (name, version) = crate::schema_id(&schema)?;
+                let body_uses_stdin = body.text.as_deref() == Some("-")
+                    || body.file.as_deref() == Some(std::path::Path::new("-"));
+                ensure!(
+                    !(body_uses_stdin && schema_file.as_deref() == Some(std::path::Path::new("-"))),
+                    "cannot read both message text and --schema-file from stdin"
+                );
+                let prose = body.read()?;
+                let raw_json = match (schema_data, schema_file) {
+                    (Some(raw), None) => raw,
+                    (None, Some(path)) => crate::load_text(&path)?,
+                    _ => unreachable!(),
+                };
+                let data: Value =
+                    serde_json::from_str(&raw_json).context("invalid JSON for block")?;
+                board_local::append_block(&prose, name, version, &data)?
+            } else {
+                body.read()?
+            };
             if let Some(range) = diff {
                 with_diff(&mut text, &range, &mut opts)?;
             }

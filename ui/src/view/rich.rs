@@ -147,6 +147,72 @@ fn structured(prefix: &str, id: i64, index: usize, display: &Display) -> El {
     panel
 }
 
+fn mention_label<'a>(s: &'a State, prefix: &str, id: &'a str) -> &'a str {
+    if prefix == "swarm-"
+        && let Some(run) = s.desk.swarm.run.as_ref()
+    {
+        if let Some(w) = run.workers.iter().find(|w| w.actor == id) {
+            return &w.name;
+        }
+        if run.coordinator_actor == id {
+            return id.split_once('/').map_or(id, |(_, profile)| profile);
+        }
+    }
+    if let Some(p) = s.people.rows.iter().find(|p| p.id == id) {
+        return &p.handle;
+    }
+    id
+}
+
+fn format_mentions<'a>(s: &State, prefix: &str, text: &'a str) -> std::borrow::Cow<'a, str> {
+    if !text.contains("@[") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut skip = Vec::new();
+    for (event, range) in Parser::new(text).into_offset_iter() {
+        if matches!(event, Event::Start(Tag::CodeBlock(_)) | Event::Code(_)) {
+            skip.push(range);
+        }
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut changed = false;
+    let mut cursor = 0;
+    while let Some(rel) = text[cursor..].find("@[") {
+        let start = cursor + rel;
+        cursor = start + 2;
+        if skip.iter().any(|r| r.start <= start && start < r.end) {
+            continue;
+        }
+        if text[..start]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '@' | '.' | '-'))
+        {
+            continue;
+        }
+        let Some(end_rel) = text[start + 2..].find(']') else {
+            break;
+        };
+        let end = start + 2 + end_rel;
+        let id = &text[start + 2..end];
+        if id.is_empty() || id.chars().any(|c| c.is_whitespace() || c == '[') {
+            continue;
+        }
+        out.push_str(&text[at..start]);
+        out.push('@');
+        out.push_str(mention_label(s, prefix, id));
+        at = end + 1;
+        cursor = at;
+        changed = true;
+    }
+    if !changed {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    out.push_str(&text[at..]);
+    std::borrow::Cow::Owned(out)
+}
+
 pub(super) fn body(s: &State, m: &Message) -> El {
     scoped_body(s, m, "")
 }
@@ -173,9 +239,10 @@ pub(super) fn scoped_body(s: &State, m: &Message, prefix: &'static str) -> El {
         .strong_weight(600.)
         .code_block(c(PANEL), c(EDGE));
     let md = if m.blocks.is_empty() {
-        Markdown::new(&m.text)
+        Markdown::new(format_mentions(s, prefix, &m.text).into_owned())
     } else {
         let (src, tags) = mark_fences(m);
+        let src = format_mentions(s, prefix, &src).into_owned();
         let blocks: Vec<_> = m
             .blocks
             .iter()

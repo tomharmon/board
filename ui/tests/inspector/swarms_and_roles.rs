@@ -169,6 +169,8 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
             "waiting",
             "implementer",
             "verifier",
+            "Brief for ",
+            "@verify",
             "Notified @verify",
             "A private peer exchange",
             "PASS",
@@ -180,6 +182,10 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
         ] {
             assert!(has(&t, text), "missing {text}");
         }
+        assert!(
+            !has(&t, "@[reader/verify]") && !has(&t, "@[reader/impl]"),
+            "resolved mention should render cleanly without raw @[actor] markup"
+        );
         for (x, kind) in [(0, "deletion"), (1, "addition")] {
             let row = t.bounds(&format!("swarm-evidence-{}-1-line-{x}", m.id));
             assert!(row.y > 0. && row.bottom() < 900., "{row:?}");

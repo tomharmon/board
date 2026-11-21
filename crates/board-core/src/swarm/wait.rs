@@ -117,7 +117,26 @@ impl Board {
                     registration.leave(None)?;
                     return Ok(SwarmWaitOutcome::StillWaiting { cursor: after });
                 }
-                _ if !registration.active => {
+                WaitPoll::Ready {
+                    cursor,
+                    notifications,
+                    messages,
+                    dms,
+                } => {
+                    check_cancel()?;
+                    if registration.active {
+                        registration.leave(Some(cursor))?;
+                    } else if !self.swarm_ack_ready(actor, run, &registration.target, cursor)? {
+                        continue;
+                    }
+                    return Ok(SwarmWaitOutcome::Messages {
+                        cursor,
+                        notifications,
+                        messages,
+                        dms,
+                    });
+                }
+                WaitPoll::Pending if !registration.active => {
                     if let Err(e) = registration.enter() {
                         if let WaitPoll::Stopped { cursor } =
                             self.swarm_poll_wait(actor, run, &registration.target, after)?
@@ -127,21 +146,6 @@ impl Board {
                         return Err(e);
                     }
                     // Re-read after registration: a stop or a new notification can win that gap.
-                }
-                WaitPoll::Ready {
-                    cursor,
-                    notifications,
-                    messages,
-                    dms,
-                } => {
-                    check_cancel()?;
-                    registration.leave(Some(cursor))?;
-                    return Ok(SwarmWaitOutcome::Messages {
-                        cursor,
-                        notifications,
-                        messages,
-                        dms,
-                    });
                 }
                 WaitPoll::Pending => {
                     std::thread::sleep(
@@ -270,6 +274,43 @@ impl Board {
                 ensure!(status!="done",Invalid.error("invalid_worker_status","stop the run instead of completing the coordinator"));
                 tx.execute("UPDATE swarm_runs SET coordinator_pid=? WHERE id=? AND coordinator_pid IS NOT ?",params![waiter_pid,r.id,waiter_pid])?;
             }Ok(())
+        })
+    }
+    fn swarm_ack_ready(&self, actor: &str, run: &str, target: &str, through: i64) -> Result<bool> {
+        self.write(|tx| {
+            let (_, r) = self.swarm_on(tx, actor, run, Action::Post)?;
+            let w = wait_for(&r, actor, target)?;
+            if r.status != "active"
+                || w.is_some_and(|w| matches!(w.status.as_str(), "done" | "stopped"))
+            {
+                return Ok(false);
+            }
+            ensure!(
+                tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM swarm_notifications WHERE run_id=? AND target_worker=? AND event_cursor=?)",
+                    params![r.id, target, through],
+                    |s| s.get::<_, bool>(0),
+                )?,
+                Invalid.error("invalid_cursor", "expected a delivered notification cursor")
+            );
+            if let Some(w) = w {
+                let was_waiting = w.status != "working";
+                if was_waiting || w.waiter_pid.is_some() || w.last_read_cursor < through {
+                    tx.execute(
+                        "UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?,last_read_cursor=max(last_read_cursor,?) WHERE id=?",
+                        params![crate::now(), through, w.id],
+                    )?;
+                }
+                if was_waiting {
+                    status_event(tx, &r, actor, target, "working")?;
+                }
+            } else {
+                tx.execute(
+                    "UPDATE swarm_runs SET coordinator_cursor=max(coordinator_cursor,?),coordinator_pid=NULL WHERE id=?",
+                    params![through, r.id],
+                )?;
+            }
+            Ok(true)
         })
     }
     pub fn swarm_leave_wait(

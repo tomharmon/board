@@ -275,11 +275,39 @@ fn actual_git_diff_and_verdict_roundtrip() {
         "base",
     ]);
     fs::write(&f, "new\n").unwrap();
-    let p = b.get("impl", &["swarm", "post", "proof", "--diff", "HEAD"]);
+    let p = b.get("impl", &["swarm", "post", "proof", "--diff=HEAD"]);
     let diff = &p["message"]["blocks"][0];
     assert_eq!(diff["schema"], "diff");
     assert_eq!(diff["data"]["files"][0], "example.txt");
     assert!(diff["data"]["patch"].as_str().unwrap().contains("+new"));
+    // Putting --diff before the positional text must not swallow the prose as a git revision.
+    let diff_first = b.get(
+        "impl",
+        &[
+            "swarm",
+            "post",
+            "--diff",
+            "@verify ready to inspect",
+            "--label",
+            "phase=review",
+            "--idempotency-key",
+            "diff-first-key",
+        ],
+    );
+    assert_eq!(diff_first["notified"], serde_json::json!(["verify"]));
+    assert_eq!(diff_first["message"]["labels"]["phase"], "review");
+    assert_eq!(diff_first["message"]["blocks"][0]["schema"], "diff");
+    let retry = b.get(
+        "impl",
+        &[
+            "swarm",
+            "post",
+            "different body ignored on retry",
+            "--idempotency-key",
+            "diff-first-key",
+        ],
+    );
+    assert_eq!(retry["message"]["id"], diff_first["message"]["id"]);
     let open_code = b.get(
         "impl",
         &["swarm", "post", "Example:\n```rust\nlet x = 1;", "--diff"],
@@ -299,6 +327,23 @@ fn actual_git_diff_and_verdict_roundtrip() {
         ],
     );
     assert_eq!(v["message"]["blocks"][0]["data"]["status"], "pass");
+    let combined = b.get(
+        "verify",
+        &[
+            "swarm",
+            "post",
+            "@impl independent check passed",
+            "--schema",
+            "verdict@1",
+            "--schema-data",
+            r#"{"status":"pass","summary":"verified with prose mention"}"#,
+        ],
+    );
+    assert_eq!(combined["notified"], serde_json::json!(["impl"]));
+    assert_eq!(
+        combined["message"]["blocks"][0]["data"]["summary"],
+        "verified with prose mention"
+    );
 }
 #[cfg(unix)]
 #[test]

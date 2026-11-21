@@ -74,6 +74,7 @@ pub(crate) fn execute(
                 max_notifications: p["max_notifications"].as_i64(),
             },
         )?),
+        "swarm_list" => value(b.swarm_list(actor, p["before"].as_i64(), size)?),
         "swarm_add" => value(b.swarm_add_worker(
             actor,
             &run()?,
@@ -86,6 +87,15 @@ pub(crate) fn execute(
             },
         )?),
         "swarm_status" => value(b.swarm_status(actor, &run()?)?),
+        "swarm_set_limit" => value(
+            b.swarm_set_limit(
+                actor,
+                &run()?,
+                p["max_notifications"]
+                    .as_i64()
+                    .context("missing max_notifications")?,
+            )?,
+        ),
         "swarm_post" => {
             let mut text = required("text")?.to_owned();
             match (s("schema"), p.get("schema_data")) {

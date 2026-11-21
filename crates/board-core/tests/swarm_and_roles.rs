@@ -534,3 +534,35 @@ fn materializing_a_role_rejects_existing_symlinks_without_publishing_a_worker() 
     assert!(fs::read_dir(out.path())?.next().is_none());
     Ok(())
 }
+
+#[test]
+fn ready_wait_advances_cursor_without_spurious_waiting_status_events() -> Result<()> {
+    let b = Board::memory()?;
+    start(&b, "ada", 20)?;
+    add(&b, "impl")?;
+    add(&b, "verify")?;
+    let dm = b.swarm_dm("ada/impl", "editor", "verify", "ready before wait")?;
+    let before = b.cursor()?;
+    let outcome = b.swarm_wait(
+        "ada/verify",
+        "editor",
+        None,
+        std::time::Duration::from_secs(5),
+        || Ok(()),
+    )?;
+    let SwarmWaitOutcome::Messages { cursor, dms, .. } = outcome else {
+        panic!("expected queued DM immediately");
+    };
+    assert_eq!(cursor, dm.event_cursor);
+    assert_eq!(dms.len(), 1);
+    assert_eq!(
+        b.cursor()?,
+        before,
+        "ready wait for an already-working worker should not emit waiting/working status churn"
+    );
+    assert_eq!(
+        b.swarm_wait_target("ada/verify", "editor")?.1,
+        dm.event_cursor
+    );
+    Ok(())
+}

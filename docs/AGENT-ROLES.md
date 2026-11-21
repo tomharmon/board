@@ -135,7 +135,7 @@ board swarm stop <run>
 
 # Worker commands below assume the entire returned worker environment, including BOARD_WORKER
 board swarm post "Working on token refresh; will ping verifier once tests pass."
-board swarm post "@verifier ready to test commit 8a3f1c — cargo test passes." --diff HEAD~1..HEAD
+board swarm post "@verifier ready to test commit 8a3f1c — cargo test passes." --diff=HEAD~1..HEAD
 board swarm dm --to impl "Fixture fails on empty DB, see error below..."
 board swarm read --after <seq>
 board swarm wait --after <seq> --timeout 5m

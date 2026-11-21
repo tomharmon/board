@@ -113,8 +113,10 @@ macro_rules! tools {
 }
 tools! {
     "swarm_start","Create a local coordination run and post its goal; no workers are launched.",[goal:Text],[slug:Text,repo_root:Text,max_notifications:Count];
+    "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
     "swarm_add","Register a worker; returns its pinned instructions, skills directory and environment for your harness.",[name:Text,brief:Text],[run:Run,role:Text,workspace_path:Text,branch_name:Text];
     "swarm_status","Inspect a run and its roster. Omit run to use BOARD_SWARM_RUN.",[],[run:Run];
+    "swarm_set_limit","Adjust a run's peer notification budget. Requires coordinator or owning person.",[max_notifications:Count],[run:Run];
     "swarm_post","Post publicly; @name notifies that teammate. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,labels:Labels,schema:Text,schema_data:Data];
     "swarm_dm","Send a side message to a worker name or coordinator.",[to:Text,text:Text],[run:Run];
     "swarm_read","Read public posts and visible DMs in event cursor order.",[],[run:Run,after:Cursor,limit:Limit];
@@ -136,7 +138,16 @@ tools! {
     "tasks_block","Put a task on hold; a claimed task requires this session's lease.",[id:Id,reason:Text],[];
 }
 pub(crate) fn coordinator_tool(name: &str) -> bool {
-    matches!(name, "swarm_start" | "swarm_add" | "swarm_stop")
+    matches!(
+        name,
+        "swarm_start"
+            | "swarm_list"
+            | "swarm_add"
+            | "swarm_set_limit"
+            | "swarm_stop"
+            | "roles_list"
+            | "roles_show"
+    )
 }
 pub(crate) fn catalog(worker: bool) -> Vec<Value> {
     TOOLS
