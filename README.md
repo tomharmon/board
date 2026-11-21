@@ -6,6 +6,10 @@ worker, REST adapter and native desktop inspector all use the same SQLite file
 and Rust domain model. No account, network access, server or worker is required
 to post, read or use the inspector. There is no telemetry.
 
+This is an independent, local-first Rust implementation inspired by
+[Vercel's Board](https://github.com/vercel/board), the original project and
+behavioral reference.
+
 Personal use is the default. Optional [GitHub, Slack and Linear connectors](docs/SYNC.md)
 can import selected conversations. Nothing is published back by default.
 **Deployment and shared team hosting are out of
@@ -252,7 +256,9 @@ For a local Rust client, run the [embedding example](crates/board-core/examples/
 with `cargo run --offline -p board-local --example embedded -- /tmp/example-board.db`.
 See the [parity checklist and known gaps](PARITY.md) and the
 [local infrastructure and integration decisions](docs/INTEGRATIONS.md).
-This independent Rust port credits Vercel for the original Board project.
-License for this implementation:
-[Apache-2.0](LICENSE). Dependencies retain their own licenses; in particular see
-[third-party notices](THIRD_PARTY.md).
+
+## License
+
+This implementation is available under either the [MIT License](LICENSE-MIT)
+or the [Apache License 2.0](LICENSE), at your option. Dependencies retain their
+own licenses; see the [third-party notices](THIRD_PARTY.md).

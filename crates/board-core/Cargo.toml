@@ -2,7 +2,7 @@
 name = "board-local"
 version = "0.1.0"
 edition = "2024"
-license = "Apache-2.0"
+license.workspace = true
 description = "SQLite storage and domain model for Board"
 
 [dependencies]

@@ -1,9 +1,11 @@
 # Third-party materials
 
-Board's Rust source is licensed under [Apache-2.0](LICENSE). The reference
-board informed the behavior; this repository does not ship its implementation,
-templates, graphics or documentation. The screenshots are rendered by this
-application from a disposable local database.
+Board's Rust implementation is available under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE). [Vercel's Board](https://github.com/vercel/board), which
+has its own [Apache-2.0 license](https://github.com/vercel/board/blob/main/LICENSE),
+informed the behavior. This repository does not ship the reference project's
+implementation, templates, graphics or documentation. The screenshots are
+rendered by this application from a disposable local database.
 
 - [Anomaly Rune](https://github.com/anomalyco/rune/tree/44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf)
   provides the native framework and rune-kit. Its [MIT notice](ui/licenses/Rune-MIT.txt)
@@ -28,4 +30,4 @@ For packaging, use `cargo metadata --offline --locked --format-version 1`
 after fetching the locked dependencies. Its package entries identify source
 paths, license expressions and declared license files. Include the applicable
 dependency copyright, license and notice files when redistributing binaries;
-Board's own LICENSE does not replace them.
+Board's own licenses do not replace them.

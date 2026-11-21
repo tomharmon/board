@@ -3,7 +3,7 @@ name = "board-cli"
 version = "0.1.0"
 edition = "2024"
 description = "A local SQLite message board for people and agents"
-license = "Apache-2.0"
+license.workspace = true
 default-run = "board"
 
 [[bin]]
