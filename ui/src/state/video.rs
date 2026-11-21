@@ -112,6 +112,20 @@ impl Drop for Pending {
     }
 }
 
+#[derive(Default)]
+struct OpeningSeek {
+    fraction: f32,
+    steps: isize,
+}
+impl OpeningSeek {
+    fn resolve(&self, total: usize) -> usize {
+        let last = total.saturating_sub(1);
+        ((self.fraction * last as f32).round() as usize)
+            .saturating_add_signed(self.steps)
+            .min(last)
+    }
+}
+
 pub struct Clip {
     source: Arc<File>,
     format: Format,
@@ -119,6 +133,7 @@ pub struct Clip {
     first: usize,
     pub current: usize,
     pub total: usize,
+    opening_seek: OpeningSeek,
     pub playing: bool,
     pub error: Option<String>,
     pub sound: bool,
@@ -144,6 +159,7 @@ impl Clip {
             first: 0,
             current: 0,
             total: 0,
+            opening_seek: OpeningSeek::default(),
             playing: false,
             error: None,
             pending: None,
@@ -220,12 +236,17 @@ impl Clip {
                             })
                             .collect();
                         self.first = first;
+                        let opening = self.total == 0;
                         self.total = if self.frames.len() < FRAMES {
                             total.min(first + self.frames.len())
                         } else {
                             total
                         };
-                        self.current = self.current.min(self.total.saturating_sub(1));
+                        self.current = if opening {
+                            self.opening_seek.resolve(self.total)
+                        } else {
+                            self.current.min(self.total.saturating_sub(1))
+                        };
                         self.pcm = None;
                         if self.sound
                             && self.playing
@@ -337,10 +358,27 @@ impl Clip {
     pub fn audio_active(&self) -> bool {
         self.playing && self.sound && self.sink.as_ref().is_some_and(|s| s.written() > 0)
     }
-    pub fn seek(&mut self, frame: usize) {
+    pub fn progress(&self) -> f32 {
         if self.total == 0 {
-            return;
+            self.opening_seek.fraction
+        } else {
+            self.current as f32 / self.total.saturating_sub(1).max(1) as f32
         }
+    }
+    pub fn scrub(&mut self, fraction: f32) {
+        let target = OpeningSeek {
+            fraction: fraction.clamp(0., 1.),
+            steps: 0,
+        };
+        if self.total == 0 {
+            // Keep the relative target until the local decoder knows the duration.
+            self.playing = false;
+            self.opening_seek = target;
+        } else {
+            self.seek(target.resolve(self.total));
+        }
+    }
+    fn seek(&mut self, frame: usize) {
         self.playing = false;
         self.stop_audio();
         self.next = 0.;
@@ -353,15 +391,41 @@ impl Clip {
             job.stop.store(true, Ordering::Relaxed);
         }
     }
+    pub fn can_step(&self, delta: isize) -> bool {
+        if self.total == 0 {
+            let seek = &self.opening_seek;
+            if delta < 0 {
+                seek.fraction > 0. || seek.steps > 0
+            } else {
+                seek.fraction < 1. || seek.steps < 0
+            }
+        } else if delta < 0 {
+            self.current > 0
+        } else {
+            self.current + 1 < self.total
+        }
+    }
     pub fn step(&mut self, delta: isize) {
-        self.seek(self.current.saturating_add_signed(delta));
+        if self.total == 0 {
+            self.playing = false;
+            let seek = &mut self.opening_seek;
+            seek.steps = seek.steps.saturating_add(delta);
+            if seek.fraction == 0. {
+                seek.steps = seek.steps.max(0);
+            }
+            if seek.fraction == 1. {
+                seek.steps = seek.steps.min(0);
+            }
+        } else {
+            self.seek(self.current.saturating_add_signed(delta));
+        }
     }
     pub fn play(&mut self) {
         if self.total == 0 && self.error.is_some() {
             return;
         }
-        if !self.playing && self.total > 0 && self.current + 1 >= self.total {
-            self.seek(0);
+        if !self.playing && !self.can_step(1) {
+            self.scrub(0.);
         }
         self.error = None;
         self.playing = !self.playing;
@@ -415,6 +479,75 @@ impl super::State {
 #[cfg(test)]
 mod tests {
     use super::Format;
+
+    #[test]
+    fn native_end_and_previous_frame_survive_metadata_arriving_after_input() {
+        use super::*;
+        use crate::state::{Page, Preview, State};
+        use board_local::{Board, PostOptions};
+        use rune::{Env, Key, KeyEvent, Runtime};
+
+        let db = Board::memory().unwrap();
+        let m = db
+            .post(
+                "video",
+                "reader",
+                "Clip",
+                &PostOptions {
+                    files: vec![(
+                        "timeline.webm".into(),
+                        include_bytes!("../../tests/fixtures/timeline.webm").to_vec(),
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut s = State::opened(Ok((db, Some("reader".into()))));
+        s.go(Page::Thread(m.id));
+        let mut rt = Runtime::new(s, crate::view::view, (820., 640.), Env::default());
+        rt.update(|s, tx| s.open_attachment(m.id, m.attachments[0].id, tx));
+        rt.frame(0.);
+        let tap = |rt: &mut Runtime<State>, key: &str| {
+            let (x, y) = rt.find(key).unwrap();
+            rt.pointer_down(x, y);
+            rt.pointer_up(x, y);
+        };
+        tap(&mut rt, "clip-seek");
+        rt.key(KeyEvent {
+            key: Key::End,
+            mods: Default::default(),
+        });
+        rt.frame(0.1);
+        tap(&mut rt, "clip-prev");
+        rt.frame(0.2);
+
+        // Deliver the first segment only after all three gestures. No clock or decoder race.
+        let Preview::Clip(clip) = &mut rt.state.preview.as_mut().unwrap().content else {
+            panic!("expected video")
+        };
+        assert_eq!(clip.total, 0);
+        let (send, recv) = mpsc::channel();
+        send.send(Ok(decoder::Segment {
+            total: 4,
+            rgba: vec![0; 4 * BYTES],
+            pcm: None,
+        }))
+        .unwrap();
+        clip.pending = Some(Pending {
+            first: 0,
+            recv,
+            stop: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        });
+        assert_eq!(clip.poll(1., &mut Tx::default(), || true), Some(true));
+        assert_eq!(
+            clip.current + 1,
+            3,
+            "End, then previous should select the penultimate frame"
+        );
+        assert!(clip.frame().is_some() && !clip.playing);
+    }
+
     #[test]
     fn webm_needs_an_ebml_header_with_an_actual_webm_doctype() {
         let bytes = include_bytes!("../../tests/fixtures/timeline.webm");

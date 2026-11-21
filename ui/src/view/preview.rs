@@ -8,7 +8,7 @@ fn transport(c: &crate::state::Clip) -> El {
             s.video_control(tx, |c| if dir == 0 { c.play() } else { c.step(dir) })
         })
     };
-    let progress = c.current as f32 / c.total.saturating_sub(1).max(1) as f32;
+    let progress = c.progress();
     let bar = row()
         .key("clip-seek")
         .role("slider")
@@ -23,10 +23,7 @@ fn transport(c: &crate::state::Clip) -> El {
         .child(el().grow(1. - progress).h(3.).fill(super::c(EDGE)))
         .on_drag(|s: &mut State, d, tx| {
             if d.phase == rune::Phase::Up && !d.cancelled() && d.w > 0. {
-                let fraction = (d.x / d.w).clamp(0., 1.);
-                s.video_control(tx, |c| {
-                    c.seek((c.total.saturating_sub(1) as f32 * fraction).round() as usize)
-                });
+                s.video_control(tx, |c| c.scrub(d.x / d.w));
             }
         })
         .on_key(|s: &mut State, k, tx| {
@@ -36,8 +33,8 @@ fn transport(c: &crate::state::Clip) -> El {
             s.video_control(tx, |c| match k.key {
                 Key::Left => c.step(-crate::state::Clip::FIVE_SECONDS),
                 Key::Right => c.step(crate::state::Clip::FIVE_SECONDS),
-                Key::Home => c.seek(0),
-                Key::End => c.seek(c.total.saturating_sub(1)),
+                Key::Home => c.scrub(0.),
+                Key::End => c.scrub(1.),
                 _ => (),
             });
             true
@@ -72,7 +69,7 @@ fn transport(c: &crate::state::Clip) -> El {
             )
             .child(
                 action("clip-prev", "Previous frame", &icons::PREVIOUS_FRAME, -1)
-                    .disabled(c.current == 0),
+                    .disabled(!c.can_step(-1)),
             )
             .child(action(
                 "clip-play",
@@ -89,8 +86,7 @@ fn transport(c: &crate::state::Clip) -> El {
                 0,
             ))
             .child(
-                action("clip-next", "Next frame", &icons::NEXT_FRAME, 1)
-                    .disabled(c.current + 1 >= c.total),
+                action("clip-next", "Next frame", &icons::NEXT_FRAME, 1).disabled(!c.can_step(1)),
             ),
     );
     if let Some(e) = &c.sound_error {

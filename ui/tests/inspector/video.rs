@@ -385,11 +385,13 @@ fn webm_play_pause_and_end_seek_decode_real_frames_outside_the_first_segment() {
     );
 
     let shot = f.dir.path().join("late-webm.png");
+    // Rune snapshots at a scripted time, not on element readiness. Leave a decoder
+    // deadline (5 seconds) after the last seek for the actual paused frame to paint.
     let mut c = f.command(
         json!([open,{"t":1.15,"type":"tap","key":"clip-seek"},
         {"t":1.55,"type":"key","name":"End"},{"t":2.15,"type":"tap","key":"clip-prev"}]),
         "820x640",
-        "2.65",
+        "8.0",
     );
     let out = c
         .arg("--thread")
@@ -454,8 +456,9 @@ fn vp8_viewer_releases_its_frames_when_a_live_credential_loses_the_channel() {
         .token;
     let open =
         json!({"t":0.1,"type":"tap","key":format!("preview-{}-{}",m.id,m.attachments[0].id)});
+    // Prove that pixels are present before testing redaction, even on a busy software GPU.
     let before = f
-        .command(json!([open]), "820x640", "1.05")
+        .command(json!([open]), "820x640", "6.5")
         .arg("--thread")
         .arg(m.id.to_string())
         .env("BOARD_TOKEN", &token)
