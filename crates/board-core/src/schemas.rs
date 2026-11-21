@@ -13,6 +13,24 @@ pub struct Block {
     pub version: u32,
     pub data: Value,
 }
+
+/// Keep the requested card outside any unclosed Markdown example in the accompanying prose.
+pub fn append_block(text: &str, name: &str, version: u32, data: &Value) -> Result<String> {
+    validate_id(name, version)?;
+    let fence = format!("```json#{name}@{version}\n{data}\n```");
+    if text.is_empty() {
+        return Ok(fence);
+    }
+    let candidate = format!("{text}\n\n{fence}");
+    if crate::prose::fences(&candidate)?
+        .last()
+        .is_some_and(|f| f.start == text.len() + 2)
+    {
+        Ok(candidate)
+    } else {
+        Ok(format!("{fence}\n\n{text}"))
+    }
+}
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Schema {
     pub id: String,
@@ -78,19 +96,43 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
     let deployment = json!({"type":"object","required":["url"],"additionalProperties":false,
         "properties":{"url":{"type":"string","format":"uri","pattern":"^https?://[^/\\s?#]+","maxLength":2048},
         "gitSha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}}});
-    // An older installation could have registered this formerly unreserved name.
+    let verdict_status = json!({"type":"string","enum":["pass","fail","not-run"]});
+    let string = json!({"type":"string"});
+    let verdict = json!({"type":"object","required":["status","summary"],"properties":{
+        "status":verdict_status,"artifact":string,"summary":string,"checks":{"type":"array","items":{"type":"object",
+        "required":["name","status"],"properties":{"name":string,"status":verdict_status,"command":string,"output":string}}}}});
+    let diff = json!({"type":"object","required":["patch"],"properties":{"base":string,"head":string,
+        "files":{"type":"array","items":string},"patch":string}});
+    // An older installation could have registered a formerly unreserved name.
     // Never change what an existing version means, even during an upgrade.
-    if c.execute(
-        "INSERT INTO schemas(name,version,description,definition)
-        SELECT 'deployment',1,'A deployment address and optional source commit.',?
-        WHERE NOT EXISTS(SELECT 1 FROM schemas WHERE name='deployment')",
-        [deployment.to_string()],
-    )? == 1
-    {
-        c.execute(
-            "INSERT INTO schema_origins(name,version,builtin) VALUES('deployment',1,1)",
-            [],
-        )?;
+    for (name, description, definition) in [
+        (
+            "deployment",
+            "A deployment address and optional source commit.",
+            deployment,
+        ),
+        (
+            "verdict",
+            "Evidence for a check against a specific artifact.",
+            verdict,
+        ),
+        (
+            "diff",
+            "A unified patch with optional revisions and file names.",
+            diff,
+        ),
+    ] {
+        if c.execute(
+            "INSERT INTO schemas(name,version,description,definition)
+        SELECT ?1,1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM schemas WHERE name=?1)",
+            params![name, description, definition.to_string()],
+        )? == 1
+        {
+            c.execute(
+                "INSERT INTO schema_origins(name,version,builtin) VALUES(?,1,1)",
+                [name],
+            )?;
+        }
     }
     Ok(())
 }

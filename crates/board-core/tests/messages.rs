@@ -112,13 +112,19 @@ fn local_deployment_schema_validates_without_opening_its_address() -> Result<()>
     let schemas = b.schemas()?;
     assert_eq!(
         schemas.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
-        ["git-commit@1", "deployment@1", "aaa@2"]
+        [
+            "git-commit@1",
+            "deployment@1",
+            "diff@1",
+            "verdict@1",
+            "aaa@2"
+        ]
     );
     assert!(schemas[1].built_in && schemas[1].by.is_none() && schemas[1].at.is_none());
     assert!(
-        !schemas[2].built_in
-            && schemas[2].by.as_deref() == Some("editor")
-            && schemas[2].at.is_some()
+        !schemas[4].built_in
+            && schemas[4].by.as_deref() == Some("editor")
+            && schemas[4].at.is_some()
     );
     assert!(
         b.register_schema("deployment", 2, "", &json!({"type":"object"}))
@@ -162,17 +168,17 @@ fn a_v1_deployment_schema_keeps_its_meaning_and_registrant_after_upgrade() -> Re
     db.register_schema_as("old-name", 7, "legacy", &schema, "old-editor")?;
     drop(db);
     let fixture = rusqlite::Connection::open(&path)?;
-    fixture.execute_batch("DROP TABLE schema_origins; DELETE FROM schemas WHERE name='deployment';
+    fixture.execute_batch("DROP TABLE schema_origins; DELETE FROM schemas WHERE name IN ('deployment','diff','verdict');
         UPDATE schemas SET name='deployment' WHERE name='old-name';
         UPDATE events SET payload=json_set(payload,'$.name','deployment') WHERE kind='schema.registered';
         PRAGMA user_version=1;")?;
     drop(fixture);
     let db = Board::open(&path)?;
     let rows = db.schemas()?;
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[1].id, "deployment@7");
-    assert_eq!(rows[1].schema, schema);
-    assert!(!rows[1].built_in && rows[1].by.as_deref() == Some("old-editor"));
+    assert_eq!(rows.len(), 4);
+    let legacy = rows.iter().find(|row| row.id == "deployment@7").unwrap();
+    assert_eq!(legacy.schema, schema);
+    assert!(!legacy.built_in && legacy.by.as_deref() == Some("old-editor"));
     assert!(!db.register_schema_as("deployment", 7, "legacy", &schema, "other")?);
     assert!(db.register_schema_as("deployment", 8, "legacy", &schema, "old-editor")?);
     Ok(())

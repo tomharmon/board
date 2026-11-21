@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/board-cli", "crates/board-core", "crates/board-api", "crates/board-sync", "ui"]
+members = ["crates/board-cli", "crates/board-core", "crates/board-api", "crates/board-mcp", "crates/board-sync", "ui"]
 default-members = ["crates/board-cli", "crates/board-core", "crates/board-api"]
 resolver = "3"
 

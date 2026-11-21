@@ -12,14 +12,6 @@ use std::{
 #[derive(Subcommand)]
 pub enum Sources {
     List,
-    /// Show a source's local outbound renderer, install a Rhai program, or clear it.
-    Renderer {
-        name: String,
-        #[arg(long, conflicts_with = "clear")]
-        file: Option<PathBuf>,
-        #[arg(long)]
-        clear: bool,
-    },
     /// Map an external repository, Slack channel, Linear team, or local stream to a board channel.
     Add {
         name: String,
@@ -157,6 +149,9 @@ pub enum Sync {
     Pull {
         name: String,
         thread: Option<String>,
+        /// Promote newly imported thread roots to local, claimable tasks.
+        #[arg(long)]
+        as_tasks: bool,
         #[arg(long)]
         watch: bool,
         #[arg(long, default_value = "5m")]
@@ -295,18 +290,6 @@ fn dir(out: bool) -> Direction {
 }
 pub fn sources(b: &Board, a: &str, cmd: Option<Sources>, js: bool) -> Result<()> {
     let source = match cmd.unwrap_or(Sources::List) {
-        Sources::Renderer { name, file, clear } => {
-            if let Some(p) = file {
-                let body = crate::load_text(&p)?;
-                b.set_source_renderer(a, &name, Some(&body))?;
-            } else if clear {
-                b.set_source_renderer(a, &name, None)?;
-            }
-            let value = b.source_renderer(a, &name)?;
-            return print(&json!({"script":value}), js, || {
-                value.unwrap_or_else(|| "default renderer".into())
-            });
-        }
         Sources::List => {
             let list = b.sources(a)?;
             return print(&list, js, || {
@@ -533,6 +516,7 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
         Sync::Pull {
             name,
             thread,
+            as_tasks,
             watch,
             interval,
         } => {
@@ -544,7 +528,7 @@ pub fn sync(b: &Board, a: &str, cmd: Sync, js: bool) -> Result<()> {
                 "watch interval must be at least 5s"
             );
             loop {
-                let r = client.pull(b, a, &name, thread.as_deref())?;
+                let r = client.pull_with_tasks(b, a, &name, thread.as_deref(), as_tasks)?;
                 print(&r, js, || {
                     format!(
                         "{} threads; {} records, {} applied, {} deferred; {} files, {} file transfers deferred",

@@ -11,11 +11,11 @@ chrono = { version = "0.4", features = ["serde"] }
 rusqlite = { version = "0.37", features = ["bundled", "backup", "functions", "blob"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_yaml_ng = "0.10"
 regex = "1"
 icu_normalizer = { version = "2", default-features = false, features = ["compiled_data"] }
 url = "2"
 fluent-uri = "0.3"
-rhai = {version="1.25.1",default-features=false,features=["std","serde","no_module","no_time"]}
 jsonschema = { version = "0.30", default-features = false }
 sha2 = "0.10"
 uuid = { version = "1", features = ["v4"] }
@@ -23,7 +23,7 @@ pulldown-cmark = {version="0.13",default-features=false}
 
 tempfile = "3"
 
-[target.'cfg(unix)'.dev-dependencies]
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]

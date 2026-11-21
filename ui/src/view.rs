@@ -6,8 +6,10 @@ mod people;
 mod preview;
 mod properties;
 mod rich;
+mod roles;
 mod shell;
 mod suggestions;
+mod swarms;
 mod workspace;
 
 use crate::state::{Page, Position, State};
@@ -29,6 +31,10 @@ const EDGE: &str = "#cdd0d3";
 const TINT: &str = "#eff0f1";
 const AVATAR: &str = "#e0e2e4";
 const CONTROL: &str = "#81858a";
+const ADD_BG: &str = "#e3f3e9";
+const ADD_INK: &str = "#235f3a";
+const DEL_BG: &str = "#fae8e9";
+const DEL_INK: &str = "#903640";
 const ERROR: &str = "#c70000";
 const ACCENT: &str = INK;
 const PANEL: &str = TINT;
@@ -50,6 +56,10 @@ fn c(token: &str) -> Color {
             TINT => "#25272a",
             AVATAR => "#323539",
             CONTROL => "#747a81",
+            ADD_BG => "#20382b",
+            ADD_INK => "#a5d9b4",
+            DEL_BG => "#402a30",
+            DEL_INK => "#f2b3ba",
             ERROR => "#ff7b72",
             v => v,
         }

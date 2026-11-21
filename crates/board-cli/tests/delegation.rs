@@ -529,35 +529,11 @@ fn read_only_sync_lookups_and_schedule_scopes_observe_live_cli_and_rest_data() {
 }
 
 #[test]
-fn real_rest_installs_a_rule_cli_obeys_and_restart_keeps_source_privacy() {
+fn real_rest_source_settings_and_cli_keep_source_privacy_after_restart() {
     let temp = tempfile::tempdir().unwrap();
     let db = temp.path().join("board");
     let master = "local-only-contract-master";
     let (server, addr) = launch(&db, master);
-    let rule = json!({"script":r#"if write.channel == "review" && write.operation == "post" { #{text:write.text+" (review)",labels:#{phase:"review"}} }"#});
-    let (status, _, loc) = http_with_key(
-        &addr,
-        "PUT",
-        "rules/review",
-        master,
-        None,
-        None,
-        rule.clone(),
-    );
-    assert_eq!(status, 201);
-    assert_eq!(loc.as_deref(), Some("/v1/rules/review"));
-    assert_eq!(
-        http(
-            &addr,
-            "PUT",
-            "rules/review",
-            master,
-            Some("review=read,post"),
-            rule
-        )
-        .0,
-        403
-    );
     cli(
         &db,
         &["sources", "add", "mirror", "local", "other", "review"],
@@ -595,8 +571,7 @@ fn real_rest_installs_a_rule_cli_obeys_and_restart_keeps_source_privacy() {
         None,
     )["message"]
         .clone();
-    assert_eq!(private["text"], "private (review)");
-    assert_eq!(private["labels"]["phase"], "review");
+    assert_eq!(private["text"], "private");
     assert_eq!(private["no_sync"], true);
     assert!(
         cli(&db, &["inbox", "list", "mirror", "--outgoing"], None)
@@ -644,10 +619,6 @@ fn real_rest_installs_a_rule_cli_obeys_and_restart_keeps_source_privacy() {
             None
         )["message"]["id"],
         private["id"]
-    );
-    assert_eq!(
-        http(&addr, "GET", "rules", master, None, Value::Null).1["rules"][0]["name"],
-        "review"
     );
     let isolated = temp.path().join("must-not-exist");
     assert_eq!(cli(&isolated, &["conformance"], None)["ok"], true);

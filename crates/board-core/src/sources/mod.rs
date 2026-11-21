@@ -3,7 +3,6 @@ mod lookup;
 mod mapping;
 mod media;
 mod queue;
-mod render;
 mod targets;
 pub use targets::{ThreadLink, validate_slack_timestamp};
 
@@ -208,6 +207,8 @@ pub enum Change {
 
 pub(crate) fn init(c: &Connection) -> Result<()> {
     c.execute_batch("
+    CREATE TABLE IF NOT EXISTS sync_task_intake(
+      item INTEGER PRIMARY KEY REFERENCES sync_queue(id) ON DELETE CASCADE, actor TEXT NOT NULL, credential TEXT);
     CREATE TABLE IF NOT EXISTS sync_sources(
       name TEXT PRIMARY KEY, provider TEXT NOT NULL, remote TEXT NOT NULL, channel TEXT NOT NULL,
       owner TEXT NOT NULL, outbound INTEGER NOT NULL DEFAULT 0);
@@ -249,7 +250,6 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
     CREATE TABLE IF NOT EXISTS sync_settings(source TEXT PRIMARY KEY REFERENCES sync_sources(name),value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sync_import_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sync_rendered(source TEXT NOT NULL,thread TEXT NOT NULL,message INTEGER NOT NULL,text TEXT NOT NULL,PRIMARY KEY(source,thread,message));
-    CREATE TABLE IF NOT EXISTS sync_renderers(source TEXT PRIMARY KEY REFERENCES sync_sources(name),script TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sync_responses(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,item INTEGER NOT NULL REFERENCES sync_queue(id),PRIMARY KEY(source,thread,external));
     CREATE TABLE IF NOT EXISTS sync_media_fetch(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,file TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,error TEXT,PRIMARY KEY(source,thread,external,file));
     CREATE TABLE IF NOT EXISTS sync_file_notes(source TEXT NOT NULL,thread TEXT NOT NULL,message INTEGER NOT NULL,asset INTEGER NOT NULL,PRIMARY KEY(source,thread,message,asset));

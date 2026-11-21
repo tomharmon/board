@@ -590,8 +590,7 @@ fn watcher_set_replacement_preserves_leases_and_checkpoints_and_temporary_caps_c
 }
 
 #[test]
-fn scheduled_text_and_sync_policy_are_fixed_at_registration_and_dropped_send_does_not_stall_queue()
--> Result<()> {
+fn scheduled_text_and_sync_policy_are_fixed_at_registration() -> Result<()> {
     let b = Board::memory()?;
     b.post("ops", "ada", "here", &Default::default())?;
     let s = schedule_post(
@@ -611,31 +610,9 @@ fn scheduled_text_and_sync_policy_are_fixed_at_registration_and_dropped_send_doe
             .any(|m| m.written == "@nobody" && m.actor.is_none())
     );
     assert!(s.text.contains("@[ada]"));
-    let reject = schedule(
-        &b,
-        "ada",
-        Destination::Channel("ops"),
-        "REJECT",
-        due(),
-        Default::default(),
-    )?;
-    b.set_write_rule(
-        "owner",
-        &board_local::policy::Rule {
-            name: "skip".into(),
-            priority: 0,
-            script: r#"if write.text == "REJECT" { #{drop: "example reason"} } else { #{} }"#
-                .into(),
-        },
-    )?;
     b.post("ops", "nobody", "here later", &Default::default())?;
     assert_eq!(dispatch_due(&b)?, 1);
     assert_eq!(dispatch_due(&b)?, 0);
-    let rejected = get_schedule(&b, reject.id)?;
-    assert_eq!(rejected.state, "dropped");
-    assert_eq!(rejected.sent, 0);
-    assert_eq!(rejected.canceled.unwrap().reason, "dropped");
-    assert!(rejected.next.is_none() && rejected.last.is_none());
     let posted = b
         .events(0, 100)?
         .into_iter()

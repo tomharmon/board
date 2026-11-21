@@ -4,7 +4,6 @@ mod catalog;
 mod files_api;
 mod messages;
 mod openapi;
-mod policy_api;
 pub use catalog::document as discovery_document;
 mod sources;
 mod sse;
@@ -250,7 +249,6 @@ fn routes(app: App) -> Router {
         )
         .merge(access_api::routes())
         .merge(catalog::routes())
-        .merge(policy_api::routes())
         .merge(files_api::routes())
         .merge(sources::routes())
         .merge(work::routes());

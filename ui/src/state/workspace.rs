@@ -140,6 +140,8 @@ pub struct Desk {
     pub grants: Vec<board_local::access::Grant>,
     pub credentials: Vec<board_local::access::Credential>,
     pub source: super::sources::Review,
+    pub swarm: super::swarms::Observer,
+    pub roles: super::roles::Library,
     pub profiles: Vec<String>,
     pub schema_open: Option<super::templates::SchemaPage>,
     pub confirm: Option<String>,
@@ -184,6 +186,8 @@ impl Desk {
         self.grants.clear();
         self.credentials.clear();
         self.source.clear_data();
+        self.swarm = Default::default();
+        self.roles = Default::default();
         self.profiles.clear();
         self.unread = 0;
         self.next = None;
@@ -399,6 +403,10 @@ impl Desk {
                     .transpose()?;
             }
             Page::Sources => self.source.listing(db, actor)?,
+            Page::Swarms | Page::Swarm(_) => {
+                self.swarm.load(db, actor, page)?;
+            }
+            Page::Roles if !delegated => self.roles.load(db)?,
             Page::Inbox => self.next = self.source.load(db, actor, after, PAGE)?,
             Page::Profiles => {
                 let person = local::person_name();
@@ -492,7 +500,7 @@ impl State {
             self.refresh();
         }
     }
-    fn result<T>(&mut self, result: Result<T>) -> Option<T> {
+    pub(super) fn result<T>(&mut self, result: Result<T>) -> Option<T> {
         match result {
             Ok(value) => {
                 self.error = None;

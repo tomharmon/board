@@ -2,7 +2,6 @@ use anyhow::Result;
 use board_local::{
     Board, Filter,
     errors::classify,
-    policy::Rule,
     sources::{Envelope, Provider},
 };
 use serde_json::{Value, json};
@@ -73,24 +72,20 @@ fn platform_prose_is_not_a_local_schema_assertion_even_on_edits_and_replays() ->
 }
 
 #[test]
-fn native_blocks_are_checked_before_middleware_and_again_after_a_rewrite() -> Result<()> {
+fn native_blocks_reject_unknown_schema_without_partial_writes() -> Result<()> {
     let b = Board::memory()?;
     shape(&b)?;
     let root = b.post("dev", "person", VALID, &Default::default())?;
-    b.set_write_rule("admin",&Rule{name:"replace".into(),priority:0,
-        script:r#"if write.text.contains("unregistered") { #{text:"plain",emit:[#{channel:"audit",text:"side effect"}]} } else if write.text == "make invalid" { #{text:"```json#unknown@1\n{}\n```"} }"#.into()})?;
     let at = b.cursor()?;
-    for text in [UNKNOWN, "make invalid"] {
-        for err in [
-            b.post("dev", "person", text, &Default::default())
-                .unwrap_err(),
-            b.reply(root.id, "person", text, &Default::default())
-                .unwrap_err(),
-            b.edit(root.id, "person", text, Some(root.revision))
-                .unwrap_err(),
-        ] {
-            assert_eq!(classify(&err).1, "schema_not_found");
-        }
+    for err in [
+        b.post("dev", "person", UNKNOWN, &Default::default())
+            .unwrap_err(),
+        b.reply(root.id, "person", UNKNOWN, &Default::default())
+            .unwrap_err(),
+        b.edit(root.id, "person", UNKNOWN, Some(root.revision))
+            .unwrap_err(),
+    ] {
+        assert_eq!(classify(&err).1, "schema_not_found");
     }
     assert_eq!(b.cursor()?, at);
     assert_eq!(b.get(root.id)?.text, VALID);

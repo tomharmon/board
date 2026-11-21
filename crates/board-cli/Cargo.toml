@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 board-local = { path = "../board-core" }
 board-api = { path = "../board-api" }
+board-mcp = { path = "../board-mcp" }
 board-sync = { path = "../board-sync" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }

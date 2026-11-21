@@ -30,7 +30,7 @@ fn seg(labels: &[&str], selected: usize, name: &str, key: &str, pick: fn(&mut St
     }
     strip
 }
-fn tab(key: &str, title: &str, active: bool) -> El {
+pub(super) fn tab(key: &str, title: &str, active: bool) -> El {
     click(
         row().key(key).h(34.0).center_y().min_w(0.0).border_sides(
             [0.0, 0.0, 1.0, 0.0],
@@ -50,6 +50,7 @@ fn settings(page: Page) -> bool {
         page,
         Page::Workspace
             | Page::Access
+            | Page::Roles
             | Page::Schemas
             | Page::Schedules
             | Page::Watchers
@@ -77,6 +78,7 @@ fn settings_tabs(s: &State, inset: f32) -> El {
         ("work-watchers", "watchers", Page::Watchers),
         ("work-sources", "sync", Page::Sources),
         ("work-profiles", "profiles", Page::Profiles),
+        ("work-roles", "agent roles", Page::Roles),
         ("work-history", "history", Page::Activity),
     ] {
         let active = s.page == page
@@ -438,6 +440,7 @@ pub(super) fn task_banner(s: &State, inset: f32) -> El {
 pub(super) fn view(s: &State, inset: f32) -> El {
     let inner = match s.page {
         Page::Activity => activity(s),
+        Page::Roles => roles::view(s),
         Page::Sources | Page::Inbox => sources::view(s),
         Page::Tasks => return task_list_for(s, inset, false),
         Page::Task(_) => return task_detail(s, inset),

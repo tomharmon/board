@@ -16,7 +16,7 @@ pub(super) fn routes() -> Router<App> {
 pub fn document() -> Value {
     json!({"name":"Board","version":env!("CARGO_PKG_VERSION"),"api":"v1","storage":"sqlite","transport":"loopback",
         "links":{"self":"/v1/discovery","openapi":"/v1/openapi.json","me":"/v1/me","channels":"/v1/channels","threads":"/v1/threads","events":"/v1/events","sources":"/v1/sources"},
-        "features":["threads","labels","reactions","schemas","uploads","tasks","schedules","watchers","channel-grants","sources","inbox","outbox","sse","local-typing","write-rules","local-only-messages","channel-mirrors"],
+        "features":["threads","labels","reactions","schemas","uploads","tasks","schedules","watchers","channel-grants","sources","inbox","outbox","sse","local-typing","local-only-messages","channel-mirrors"],
         "providers":["local","github","slack","linear"],"limits":{"page":500,"message_characters":10000,"inline_file_bytes":board_local::MAX_ATTACHMENT_BYTES}})
 }
 async fn discovery() -> Json<Value> {
@@ -112,8 +112,6 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/schedules/{id}", "get delete"),
     ("/watchers", "get post put"),
     ("/watcher-matches", "post"),
-    ("/rules", "get"),
-    ("/rules/{name}", "get put delete"),
     ("/watchers/{name}", "get delete"),
     ("/watchers/{name}/next", "get"),
     ("/watchers/{name}/deliveries", "post"),
@@ -122,7 +120,6 @@ pub(super) const RESOURCES: &[(&str, &str)] = &[
     ("/watchers/{name}/acknowledgements/{cursor}", "put"),
     ("/sources", "get post"),
     ("/sources/{name}", "get patch"),
-    ("/sources/{name}/renderer", "get put delete"),
     ("/sources/{name}/links", "get put"),
     ("/sources/{name}/thread-links", "get put"),
     ("/sources/{name}/imports", "post"),

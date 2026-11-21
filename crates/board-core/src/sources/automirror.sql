@@ -27,17 +27,6 @@ BEGIN
       AND q.thread='pending:board:'||NEW.cursor AND q.event_key=CAST(NEW.cursor AS TEXT);
 END;
 
--- Only renderers that use the changed values need to edit a confirmed text copy.
-CREATE TRIGGER IF NOT EXISTS sync_render_labels AFTER UPDATE OF message ON events
-WHEN NEW.message IS NOT NULL AND (NEW.kind='labels.changed' OR NEW.kind LIKE 'task.%')
- AND NOT EXISTS(SELECT 1 FROM private_messages WHERE id IN (NEW.message_id,json_extract(NEW.message,'$.re')))
-BEGIN
- INSERT OR IGNORE INTO sync_queue(source,direction,thread,event_key,payload,raw)
- SELECT c.source,'out',c.thread,CAST(NEW.cursor AS TEXT),json_object('event','message.edited','message',c.message,'cursor',NEW.cursor,'text',json_extract(NEW.message,'$.text'),'parent',null),'null'
- FROM sync_copies c JOIN sync_sources s ON s.name=c.source JOIN sync_renderers r ON r.source=c.source
- WHERE c.message=NEW.message_id AND c.origin=0 AND s.outbound=1 AND NOT EXISTS(SELECT 1 FROM sync_import_context WHERE source=s.name);
-END;
-
 -- Files learned after a text receipt also fan out, never back onto their source.
 CREATE TRIGGER IF NOT EXISTS sync_mirror_asset AFTER UPDATE OF message ON events
 WHEN NEW.kind='attachment.added' AND NEW.message IS NOT NULL

@@ -24,6 +24,8 @@ mod presentation;
 mod reading;
 #[path = "inspector/source_settings.rs"]
 mod source_settings;
+#[path = "inspector/swarms_and_roles.rs"]
+mod swarms_and_roles;
 #[path = "inspector/task_conversation.rs"]
 mod task_conversation;
 #[path = "inspector/video.rs"]

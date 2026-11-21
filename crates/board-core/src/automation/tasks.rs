@@ -530,13 +530,7 @@ fn create_task_inner(
             id
         }
     };
-    tx.execute(
-        "INSERT INTO tasks(id,owner,assignee,state) VALUES(?,?,?,'ready')",
-        params![id, actor, assignee],
-    )?;
-    replace_needs(&tx, id, needs)?;
-    set_state(&tx, id, queued(needs), None)?;
-    let mut t = publish_queue_state(&tx, id, actor, "created")?;
+    let mut t = create_from_root(&tx, id, actor, needs, assignee)?;
     if let Some(request) = claim {
         t = acquire(&tx, actor, &t, &request, &fingerprint(("created", id))?, at)?;
     }
@@ -545,6 +539,22 @@ fn create_task_inner(
     t.mentions = mentions;
     tx.commit()?;
     Ok((t, true))
+}
+
+pub(crate) fn create_from_root(
+    tx: &Transaction<'_>,
+    id: i64,
+    actor: &str,
+    needs: &[i64],
+    assignee: Option<&str>,
+) -> Result<Task> {
+    tx.execute(
+        "INSERT INTO tasks(id,owner,assignee,state) VALUES(?,?,?,'ready')",
+        params![id, actor, assignee],
+    )?;
+    replace_needs(tx, id, needs)?;
+    set_state(tx, id, queued(needs), None)?;
+    publish_queue_state(tx, id, actor, "created")
 }
 
 fn fingerprint(data: impl Serialize) -> Result<Vec<u8>> {

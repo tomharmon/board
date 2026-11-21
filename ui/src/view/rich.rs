@@ -1,4 +1,5 @@
 use super::*;
+mod evidence;
 use board_local::Block;
 use pulldown_cmark::{CodeBlockKind, Event, Parser, Tag};
 use rune_kit::{Markdown, MarkdownStyle};
@@ -59,7 +60,16 @@ fn mark_fences(m: &Message) -> (String, HashMap<String, usize>) {
     (display, tags)
 }
 
-fn structured(prefix: &str, id: i64, index: usize, b: &Block, raw: bool) -> El {
+struct Display {
+    block: Block,
+    raw: bool,
+    builtin_evidence: bool,
+    checks: HashSet<usize>,
+    lines: usize,
+}
+
+fn structured(prefix: &str, id: i64, index: usize, display: &Display) -> El {
+    let Display { block: b, raw, .. } = display;
     let mut panel = col()
         .key(format!("{prefix}block-{id}-{index}"))
         .w_full()
@@ -84,7 +94,7 @@ fn structured(prefix: &str, id: i64, index: usize, b: &Block, raw: bool) -> El {
                 .child(
                     tool(
                         &format!("{prefix}raw-{id}-{index}"),
-                        if raw { "Show fields" } else { "Show JSON" },
+                        if *raw { "Show fields" } else { "Show JSON" },
                         &glyphs::FILE_TEXT,
                     )
                     .on_press(move |s: &mut State| {
@@ -94,7 +104,7 @@ fn structured(prefix: &str, id: i64, index: usize, b: &Block, raw: bool) -> El {
                     }),
                 ),
         );
-    if raw {
+    if *raw {
         panel = panel.child(
             mono(
                 serde_json::to_string_pretty(&b.data).expect("JSON value"),
@@ -105,6 +115,10 @@ fn structured(prefix: &str, id: i64, index: usize, b: &Block, raw: bool) -> El {
             .wrap_anywhere()
             .selectable(true),
         );
+    } else if display.builtin_evidence
+        && let Some(evidence) = evidence::card(prefix, id, index, display)
+    {
+        panel = panel.child(evidence);
     } else if let Some(fields) = b.data.as_object() {
         if fields.is_empty() {
             panel = panel.child(mono("{}", MUTED).px(10.));
@@ -166,14 +180,24 @@ pub(super) fn scoped_body(s: &State, m: &Message, prefix: &'static str) -> El {
             .blocks
             .iter()
             .enumerate()
-            .map(|(i, b)| (b.clone(), s.raw_blocks.contains(&(m.id, i))))
+            .map(|(i, b)| Display {
+                block: b.clone(),
+                raw: s.raw_blocks.contains(&(m.id, i)),
+                builtin_evidence: b.version == 1 && s.builtin_evidence.contains(b.schema.as_str()),
+                checks: s
+                    .expanded_checks
+                    .iter()
+                    .filter_map(|&(id, block, check)| (id == m.id && block == i).then_some(check))
+                    .collect(),
+                lines: *s.patch_lines.get(&(m.id, i)).unwrap_or(&evidence::CHUNK),
+            })
             .collect();
         let id = m.id;
         Markdown::new(src).code_frame(move |code, frame| {
             let Some(i) = frame.language.and_then(|tag| tags.get(tag)).copied() else {
                 return code;
             };
-            structured(prefix, id, i, &blocks[i].0, blocks[i].1)
+            structured(prefix, id, i, &blocks[i])
         })
     };
     // No URL opener or image resolver: message content cannot make network or file requests.

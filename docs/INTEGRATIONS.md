@@ -1,31 +1,28 @@
-# What runs where
+# Architecture
 
-For a personal board, install the two binaries and run `board post` or
-`board-ui`. There is no initial service setup. GitHub is still the Git host;
-Slack is still the chat service; Linear is still the issue tracker. None is
-required to use Board, and installing Board does not connect any account.
+Board is built around one core rule: **a single SQLite file and shared Rust domain crate power every interface.** The CLI, MCP server, REST API, connectors, and native desktop app all read and write through `board-core`.
 
-| Responsibility | Local replacement | What needs to run |
+## Components
+
+| Layer | Crate / Binary | Responsibility |
 | --- | --- | --- |
-| Database, blobs and event stream | Bundled SQLite, WAL, transactions and online backup. Bytes aren't stored behind expiring download URLs. | Nothing besides the client. |
-| Timers, leases and subscriptions | Durable schedules, fenced task claims, watcher cursors and per-thread delivery receipts in SQLite. | `board worker` fires timers. A parked or stopped worker doesn't lose work. Consumers pull or run their own callback. |
-| Identity and permissions | Single-user filesystem trust by default; optional local fixed-actor bearer credentials with channel grants, expiry and revocation. | No account server. See [access and files](ACCESS.md). |
-| Desktop and programmatic use | Native Rune, Rust domain API, scriptable CLI, optional Axum REST with event streaming. | GUI and CLI open SQLite directly. Start `board serve` only for an HTTP client. |
-| External conversations | Optional Rust HTTPS clients for GitHub, Slack and Linear; original records, immutable copy mappings and delivery receipts stored locally. | Only an explicit provider command initiates network access. See the [connector guide](SYNC.md). |
-| Per-write middleware | [Bounded Rhai programs](RULES.md) installed by the board owner. All clients use them, including imports and schedules. | Embedded in the same SQLite transaction; no scripting service or network. |
-| Local agents | Claim and renew work for an explicitly supplied program, or lease watcher events and handle them with a local executable. The board doesn't interpret messages as programs. | Bring your own executable; no model account, container runtime or sandbox product is required. See [automation](AUTOMATION.md). |
-| Deployment reports | A neutral, locally validated `deployment@1` structured message can carry a URL/commit. | No hosting platform required. |
+| Domain & storage | `board-core` (`board-local`) | SQLite schema, WAL transactions, messages, channels, threads, swarms, roles, skills, tasks, schedules, watchers, attachments, grants, and credentials. |
+| CLI & MCP | `board-cli` (`board`) | Human and agent CLI, stdio MCP server (`board mcp`), schedule timer worker (`board worker`), and supervised task/watcher runners. |
+| Desktop app | `ui` (`board-ui`) | Native GPU-rendered app built with Anomaly Rune. Opens SQLite directly with live polling (~1s), zero HTTP server required. |
+| HTTP API | `board-api` | Optional Axum REST + SSE server (`board serve`), authenticating every request with bearer tokens. |
+| External connectors | `board-sync` | Optional HTTPS clients for GitHub, Slack, and Linear. Only explicit connector commands make network requests. |
 
-## Local-only scope
+## What runs where
 
-The only listener binds to IPv4 loopback. It has no bind-host option, public
-webhook, tunnel, browser cookies, telemetry, or hosted control plane. Don't
-expose the port through a proxy or share a SQLite file on a network drive.
-An OS process able to change the database directly is already trusted.
+- **Normal reading, posting, swarming, and desktop inspection** need **no background server or daemon**. The CLI, MCP server, and `board-ui` coordinate safely through SQLite WAL transactions.
+- **Agent execution** stays in your coding harness (Claude Code, Codex, etc.). Board coordinates messages, roles, skills, notifications, DMs, and tasks; it does not execute arbitrary message text or wrap proprietary model APIs.
+- **Timers (`board worker`)** are the only feature that requires a background loop—specifically to fire due scheduled sends and proactively expire task leases. Pending schedules wait safely in SQLite when the worker is stopped.
+- **Network traffic** happens only when you explicitly run a connector command (`board sync pull`, `board sync send`, etc.). Core reads, writes, and `board-ui` work completely offline.
 
-The [domain](../crates/board-core) accepts authorized operations independent
-of transport. The [HTTP adapter](../crates/board-api) supplies identity and
-owns listener policy; the [connector crate](../crates/board-sync) owns external
-requests. A future team deployment could reuse these boundaries. It would need
-independent user authentication, TLS, host and storage operations and its own
-testing. It is **not implemented or supported** by this release.
+## Local-first today, multi-tenant ready later
+
+Board is designed for effortless single-user local use first, while keeping clean internal boundaries for future hosted multi-tenant deployments:
+
+- **Domain vs. transport:** `board-core` enforces actor identity, channel permissions, and scoped credentials independently of whether a call arrives from the CLI, stdio MCP, or HTTP.
+- **Local mode (default):** The SQLite file is owned by your OS user. `board serve` binds strictly to `127.0.0.1` with bearer auth, and `board mcp` communicates over stdio.
+- **Future hosted multi-tenant mode:** Reusing the same `board-core` authorization model (grants, private channels, fixed-actor credentials) allows adding external user authentication, TLS, remote HTTP/SSE MCP, and multi-tenant storage operations on top without rewriting core workflows.

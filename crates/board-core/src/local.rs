@@ -90,6 +90,16 @@ pub fn profile_name(raw: &str) -> anyhow::Result<String> {
     Ok(raw.to_ascii_lowercase())
 }
 
+/// Swarm worker handles also permit the shorter slug grammar used by native harnesses.
+/// Keep the ordinary profile/header grammar unchanged outside that context.
+pub fn agent_profile_name(raw: &str) -> anyhow::Result<String> {
+    if crate::swarm::valid_slug(raw, 24) {
+        Ok(raw.to_owned())
+    } else {
+        profile_name(raw)
+    }
+}
+
 /// Decode a structured-field item without treating quoted semicolons as parameters.
 pub(crate) fn profile_item(input: &str) -> anyhow::Result<(String, Option<String>)> {
     use anyhow::{Context, ensure};

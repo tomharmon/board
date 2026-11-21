@@ -1,0 +1,16 @@
+CREATE TABLE IF NOT EXISTS agent_roles(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+ description TEXT NOT NULL DEFAULT '', is_builtin INTEGER NOT NULL DEFAULT 0,
+ system_prompt TEXT NOT NULL, default_system_prompt TEXT, version INTEGER NOT NULL DEFAULT 1,
+ updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skill_bundles(
+ id INTEGER PRIMARY KEY AUTOINCREMENT, slug TEXT NOT NULL UNIQUE, name TEXT NOT NULL,
+ description TEXT NOT NULL DEFAULT '', is_builtin INTEGER NOT NULL DEFAULT 0,
+ version INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS skill_bundle_files(
+ bundle_id INTEGER NOT NULL REFERENCES skill_bundles(id) ON DELETE CASCADE,
+ rel_path TEXT NOT NULL, content TEXT NOT NULL, PRIMARY KEY(bundle_id,rel_path));
+CREATE TABLE IF NOT EXISTS role_skills(
+ role_id INTEGER NOT NULL REFERENCES agent_roles(id) ON DELETE CASCADE,
+ bundle_id INTEGER NOT NULL REFERENCES skill_bundles(id) ON DELETE CASCADE,
+ PRIMARY KEY(role_id,bundle_id));

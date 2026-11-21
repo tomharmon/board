@@ -20,7 +20,6 @@ pub struct Rejection {
     kind: Kind,
     code: &'static str,
     detail: String,
-    response: Option<String>,
 }
 
 impl Kind {
@@ -29,17 +28,7 @@ impl Kind {
             kind: self,
             code,
             detail: detail.into(),
-            response: None,
         }
-    }
-}
-impl Rejection {
-    pub(crate) fn with_response(mut self, text: Option<String>) -> Self {
-        self.response = text;
-        self
-    }
-    pub(crate) fn response(&self) -> Option<&str> {
-        self.response.as_deref()
     }
 }
 

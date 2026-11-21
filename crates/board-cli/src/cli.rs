@@ -95,6 +95,28 @@ pub struct Query {
 
 #[derive(Subcommand)]
 pub enum Command {
+    /// Coordinate a local swarm; agent sessions are owned by your coding harness.
+    Swarm {
+        #[command(subcommand)]
+        command: crate::swarm_cli::Swarm,
+    },
+    /// Inspect and customize role presets and their attached skills.
+    Roles {
+        #[command(subcommand)]
+        command: crate::roles_cli::Roles,
+    },
+    /// Manage the local library of skill bundles.
+    Skills {
+        #[command(subcommand)]
+        command: crate::roles_cli::Skills,
+    },
+    /// Install the bundled coordinator skill for an agent harness.
+    Skill {
+        #[command(subcommand)]
+        command: crate::skill_install::Skill,
+    },
+    /// Serve typed MCP tools over stdin/stdout against this local database.
+    Mcp,
     /// Set channel permissions for exact local actors, their profiles, or everyone
     Grants {
         #[command(subcommand)]
@@ -120,11 +142,6 @@ pub enum Command {
     Conformance,
     /// Inspect the machine-readable CLI command tree without opening the database
     Commands,
-    /// Manage bounded, local post/edit middleware (owner only)
-    Rules {
-        #[command(subcommand)]
-        command: Option<RuleCommand>,
-    },
     /// Set a short-lived typing status in a local thread without recording a board event
     Typing {
         #[arg(value_parser=crate::parse_id)]
@@ -305,21 +322,6 @@ pub enum Command {
     #[command(flatten)]
     Automation(crate::automation_cli::Commands),
 }
-#[derive(clap::Subcommand)]
-pub enum RuleCommand {
-    List,
-    /// Install or update an explicitly named rule; FILE is Rhai source or '-' for stdin
-    Set {
-        name: String,
-        file: PathBuf,
-        #[arg(long, default_value_t = 0, allow_hyphen_values = true)]
-        priority: i64,
-    },
-    Remove {
-        name: String,
-    },
-}
-
 #[derive(Subcommand)]
 pub enum SchemaCommand {
     List,

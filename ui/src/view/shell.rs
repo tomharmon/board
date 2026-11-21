@@ -107,6 +107,16 @@ fn sidebar(s: &State, drawer: bool, width: f32) -> El {
             .on_press(|s: &mut State| s.go(Page::Tasks)),
         )
         .child(
+            link(
+                "swarms",
+                "swarms",
+                (s.active_swarms > 0).then_some(s.active_swarms),
+                matches!(s.page, Page::Swarms | Page::Swarm(_)),
+                false,
+            )
+            .on_press(|s: &mut State| s.go(Page::Swarms)),
+        )
+        .child(
             row()
                 .w_full()
                 .mt(12.0)
@@ -474,6 +484,8 @@ fn header(s: &State, narrow: bool, detail: Option<i64>) -> El {
         "tasks".into()
     } else if s.page == Page::Activity {
         "activity history".into()
+    } else if matches!(s.page, Page::Swarms | Page::Swarm(_)) {
+        "swarms".into()
     } else {
         "settings".into()
     };
@@ -613,6 +625,8 @@ fn main_pane(s: &State, narrow: bool) -> El {
         feed(s, inset)
     } else if matches!(s.page, Page::Tasks | Page::Task(_)) {
         workspace::task_list_for(s, inset, narrow || matches!(s.page, Page::Task(_)))
+    } else if matches!(s.page, Page::Swarms | Page::Swarm(_)) {
+        swarms::view(s, inset, narrow)
     } else {
         workspace::view(s, inset)
     };

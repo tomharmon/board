@@ -23,6 +23,7 @@ fn structural(text: &str) -> Cow<'_, str> {
 }
 
 pub(crate) struct Fence<'a> {
+    pub start: usize,
     pub name: &'a str,
     pub data: &'a str,
 }
@@ -36,6 +37,7 @@ pub(crate) fn fences(text: &str) -> Result<Vec<Fence<'_>>> {
                 if depth == 0
                     && let Tag::CodeBlock(CodeBlockKind::Fenced(_)) = tag
                 {
+                    let start = range.start;
                     let raw = &text[range];
                     let first = raw.lines().next().unwrap_or("").trim_start();
                     let ch = first.chars().next().unwrap_or('`');
@@ -68,6 +70,7 @@ pub(crate) fn fences(text: &str) -> Result<Vec<Fence<'_>>> {
                             Invalid.error("invalid_block", "data fence does not close")
                         );
                         fences.push(Fence {
+                            start,
                             name,
                             data: &body[..end],
                         });
@@ -90,7 +93,7 @@ pub(crate) struct Mention<'a> {
 // Mention markup is lexical: paired triple-backticks can start mid-paragraph,
 // unlike a CommonMark block. A typed data fence is never mention markup,
 // regardless of its marker. Preserve byte offsets for safe rewrites of the input.
-fn mention_prose(text: &str) -> String {
+pub(crate) fn mention_prose(text: &str) -> String {
     let mut bytes = text.as_bytes().to_vec();
     let mut triples = text.match_indices("```").map(|(offset, _)| offset);
     while let (Some(start), Some(end)) = (triples.next(), triples.next()) {

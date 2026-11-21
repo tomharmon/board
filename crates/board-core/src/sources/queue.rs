@@ -1,6 +1,53 @@
 use super::*;
 use uuid::Uuid;
 
+fn declined_files(c: &Connection, source: &str, thread: &str, id: i64) -> Result<Vec<i64>> {
+    Ok(c.prepare("SELECT asset FROM sync_file_notes WHERE source=? AND thread=? AND message=? ORDER BY asset")?
+        .query_map(params![source,thread,id],|r|r.get(0))?.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Include the provider's text fallbacks in the fenced send body, so a
+/// preflight cannot publish a stale byline or file note after settings change.
+fn outbound_text(
+    tx: &Transaction<'_>,
+    source: &Source,
+    thread: &str,
+    m: &Message,
+) -> Result<String> {
+    let mut text = m.text.clone();
+    if source.provider == Provider::Local {
+        return Ok(text);
+    }
+    if source.settings.display_authors {
+        let name: String = m
+            .author
+            .as_ref()
+            .map_or(m.actor.as_str(), |a| a.name.as_str())
+            .chars()
+            .filter(|c| c.is_alphanumeric() || matches!(c, ' ' | '.' | '_' | '-' | '/'))
+            .take(80)
+            .collect();
+        text.push_str(&format!("\n\nFrom {name} on Board"));
+    }
+    if !m.attachments.is_empty() {
+        let declined = if source.provider == Provider::Slack {
+            declined_files(tx, &source.name, thread, m.id)?
+        } else {
+            Vec::new()
+        };
+        for file in &m.attachments {
+            if source.provider != Provider::Slack || declined.contains(&file.id) {
+                let filename = file.name.replace('`', "'");
+                text.push_str(&format!(
+                    "\n\nFile: `{filename}` ({} bytes; on Board #{})",
+                    file.size, m.id
+                ));
+            }
+        }
+    }
+    Ok(text)
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Direction {
@@ -14,6 +61,31 @@ impl Direction {
             Self::Out => "out",
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LeaseMode {
+    Ordinary,
+    ArmOutbound,
+    PromoteRoots,
+}
+
+/// Keep the first authorized promotion request, including across lease expiry.
+/// An ordinary pull that already committed a root cannot be turned into a task.
+fn remember_promotion(
+    c: &Connection,
+    id: i64,
+    actor: &str,
+    credential: Option<&str>,
+) -> Result<()> {
+    c.execute(
+        "INSERT OR IGNORE INTO sync_task_intake(item,actor,credential)
+        SELECT id,?2,?3 FROM sync_queue WHERE id=?1 AND direction='in'
+        AND state NOT IN ('done','skipped') AND json_extract(payload,'$.parent') IS NULL
+        AND json_extract(payload,'$.change.op') IN ('post','upsert','reconcile')",
+        params![id, actor, credential],
+    )?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -249,28 +321,11 @@ fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bo
             "thread.start" | "message.posted" | "message.edited" | "file.note"
         )
     {
-        match render::outbound(tx, source, &job.thread, &m) {
-            Ok(text) => {
-                if d.event == "message.edited" && last.as_deref() == Some(&text) {
-                    current = false;
-                }
-                d.text = text;
-            }
-            Err(e) => {
-                tx.execute(
-                    "UPDATE sync_queue SET state='failed',error=?,receipt=NULL,deadline=NULL WHERE id=?",
-                    params![e.to_string(), id],
-                )?;
-                Board::event_tx(
-                    tx,
-                    "source.delivery_failed",
-                    &source.owner,
-                    Some(m.id),
-                    json!({"source":source.name,"item":id,"state":"failed"}),
-                )?;
-                return Ok(false);
-            }
+        let text = outbound_text(tx, source, &job.thread, &m)?;
+        if d.event == "message.edited" && last.as_deref() == Some(&text) {
+            current = false;
         }
+        d.text = text;
     }
     if private || !current {
         tx.execute(
@@ -328,7 +383,44 @@ fn complete(
                 "INSERT INTO sync_import_context VALUES(1,?,?,?)",
                 params![s.name, input.thread, input.external],
             )?;
+            let promotion = if input.parent.is_none()
+                && matches!(
+                    input.change,
+                    Change::Post { .. } | Change::Upsert { .. } | Change::Reconcile { .. }
+                )
+                && mapping::root_on(tx, &s.name, &input.thread)?.is_none()
+            {
+                tx.query_row(
+                    "SELECT actor,credential FROM sync_task_intake WHERE item=?",
+                    [j.id],
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+                )
+                .optional()?
+            } else {
+                None
+            };
             let mut m = mapping::apply(tx, s, &input)?;
+            if let Some((actor, credential)) = promotion
+                && m.re.is_none()
+                && !m.deleted
+                && m.origin.as_ref().is_some_and(|o| {
+                    o.source == s.name && o.thread == input.thread && o.external == input.external
+                })
+            {
+                if let Some(id) = credential {
+                    let a = Board::admitted_credential_on(tx, &id)?;
+                    a.actor(&actor)?;
+                    for action in [
+                        crate::access::Action::Read,
+                        crate::access::Action::Sync,
+                        crate::access::Action::Label,
+                    ] {
+                        a.require(action, &s.channel)?;
+                    }
+                }
+                crate::automation::create_from_root(tx, m.id, &actor, &[], None)?;
+                m = Board::get_on(tx, m.id)?;
+            }
             let current_slack_origin=s.provider==Provider::Slack&&!m.deleted&&m.origin.as_ref().is_some_and(|c|c.source==s.name&&c.thread==input.thread&&c.external==input.external)
                 && tx.query_row("SELECT ?4 IS NULL OR modified IS NULL OR modified<=?4 FROM sync_copies WHERE source=?1 AND thread=?2 AND external=?3",params![s.name,input.thread,input.external,input.updated_at.map(|t|t.timestamp_millis())],|r|r.get::<_,bool>(0))?;
             if current_slack_origin
@@ -472,7 +564,7 @@ fn complete(
     )?;
     Ok(m)
 }
-/// Keep a deliberate skip and its optional remote response, but none of the rejected write.
+/// Preserve a source skip without committing a partially applied inbound event.
 fn try_import(tx: &Transaction<'_>, s: &Source, j: &Job) -> Result<Result<Message>> {
     tx.execute_batch("SAVEPOINT inbound_policy")?;
     match complete(tx, s, j, None) {
@@ -483,20 +575,11 @@ fn try_import(tx: &Transaction<'_>, s: &Source, j: &Job) -> Result<Result<Messag
         Err(e)
             if matches!(
                 crate::errors::classify(&e).1,
-                "dropped" | "response_echo" | "ignored_event"
+                "response_echo" | "ignored_event"
             ) =>
         {
             tx.execute_batch("ROLLBACK TO inbound_policy; RELEASE inbound_policy")?;
             tx.execute("UPDATE sync_queue SET state='skipped',receipt=NULL,deadline=NULL,error=? WHERE id=?",params![e.to_string(),j.id])?;
-            if s.outbound
-                && j.payload["no_sync"] != true
-                && let Some(response) = e
-                    .downcast_ref::<crate::errors::Rejection>()
-                    .and_then(|r| r.response())
-            {
-                tx.execute("INSERT OR IGNORE INTO sync_queue(source,direction,thread,event_key,payload,raw) VALUES(?,'out',?,?,?,'null')",
-                    params![s.name,j.thread,format!("response:{}",j.id),json!({"event":"source.response","text":response}).to_string()])?;
-            }
             Board::event_tx(
                 tx,
                 "source.skipped",
@@ -572,7 +655,7 @@ impl Board {
     ) -> Result<Vec<i64>> {
         let tx = self.conn.unchecked_transaction()?;
         self.authorized_source(&tx, name, who)?;
-        let rows = render::declined_files(&tx, name, thread, id)?;
+        let rows = declined_files(&tx, name, thread, id)?;
         tx.commit()?;
         Ok(rows)
     }
@@ -672,9 +755,28 @@ impl Board {
         events: &[Envelope],
         position: Option<&Checkpoint>,
     ) -> Result<Vec<i64>> {
+        self.enqueue_imports_with_tasks(who, name, events, position, false)
+    }
+    /// Remember the puller's intent across restarts, not as a global setting on this source.
+    pub fn enqueue_imports_with_tasks(
+        &self,
+        who: &str,
+        name: &str,
+        events: &[Envelope],
+        position: Option<&Checkpoint>,
+        as_tasks: bool,
+    ) -> Result<Vec<i64>> {
         ensure!(events.len() <= 500, "up to 500 events per inbox batch");
         self.write(|tx|{let s=self.authorized_source(tx,name,who)?;
-            let ids=events.iter().map(|e|push(tx,&s,e).map(|v|v.0)).collect::<Result<Vec<_>>>()?;
+            let access=self.access_on(tx)?;
+            if as_tasks {access.require(crate::access::Action::Label,&s.channel)?;}
+            let ids=events.iter().map(|e|{
+                let (id,_) = push(tx,&s,e)?;
+                if as_tasks {
+                    remember_promotion(tx,id,who,access.credential_id())?;
+                }
+                Ok(id)
+            }).collect::<Result<Vec<_>>>()?;
             if let Some(p)=position{
                 ident(&p.stream)?; ident(&p.next)?;
                 let old:Option<String>=tx.query_row("SELECT value FROM sync_checkpoints WHERE source=? AND stream=?",params![name,p.stream],|r|r.get(0)).optional()?;
@@ -741,7 +843,7 @@ impl Board {
         dir: Direction,
         seconds: i64,
     ) -> Result<Option<Lease>> {
-        self.lease_source_inner(who, name, dir, seconds, false)
+        self.lease_source_inner(who, name, dir, seconds, LeaseMode::Ordinary)
     }
     fn lease_source_inner(
         &self,
@@ -749,13 +851,19 @@ impl Board {
         name: &str,
         dir: Direction,
         seconds: i64,
-        arm_outbound: bool,
+        mode: LeaseMode,
     ) -> Result<Option<Lease>> {
         ensure!(
             (1..=3600).contains(&seconds),
             "lease must be 1..3600 seconds"
         );
-        self.write(|tx|{let s=self.authorized_source(tx,name,who)?;let now=time();expire(tx,name,now)?;
+        self.write(|tx|{let s=self.authorized_source(tx,name,who)?;
+            let promoter=if mode == LeaseMode::PromoteRoots {
+                let access=self.access_on(tx)?;
+                access.require(crate::access::Action::Label,&s.channel)?;
+                Some(access)
+            } else {None};
+            let now=time();expire(tx,name,now)?;
             if dir==Direction::Out && !s.outbound {return Ok(None);}
             loop{let id:Option<i64>=tx.query_row("SELECT q.id FROM sync_queue q WHERE source=? AND direction=? AND state='pending' AND available<=?
                 AND (q.direction!='in' OR NOT EXISTS(SELECT 1 FROM sync_queue o WHERE o.source=q.source AND o.direction='out' AND o.state IN ('sending','uncertain') AND (o.thread=q.thread OR json_extract(o.payload,'$.event')='thread.start')))
@@ -763,8 +871,9 @@ impl Board {
                 params![name,dir.sql(),now],|r|r.get(0)).optional()?;
             let Some(id)=id else{return Ok(None)};
             if dir==Direction::Out && !refresh_outbound(tx,&s,id)?{continue;}
+            if let Some(access)=&promoter {remember_promotion(tx,id,who,access.credential_id())?;}
             let receipt=Uuid::new_v4().to_string();let deadline=now+seconds;
-            let state=if arm_outbound && dir==Direction::Out { "sending" } else { "leased" };
+            let state=if mode==LeaseMode::ArmOutbound && dir==Direction::Out { "sending" } else { "leased" };
             tx.execute("UPDATE sync_queue SET state=?,attempts=attempts+1,receipt=?,deadline=? WHERE id=?",params![state,receipt,deadline,id])?;
             return Ok(Some(Lease{job:get(tx,name,id)?,receipt,deadline}));}})
     }
@@ -808,7 +917,7 @@ impl Board {
         dir: Direction,
         seconds: i64,
     ) -> Result<Option<Lease>> {
-        self.lease_source_inner(who, name, dir, seconds, true)
+        self.lease_source_inner(who, name, dir, seconds, LeaseMode::ArmOutbound)
     }
     pub fn finish_source(
         &self,
@@ -901,10 +1010,26 @@ impl Board {
         Ok((report.applied, report.failed))
     }
     pub fn drain_source_report(&self, who: &str, name: &str, limit: usize) -> Result<DrainReport> {
+        self.drain_source_report_with_tasks(who, name, limit, false)
+    }
+    /// A task pull also promotes roots recovered from an interrupted ordinary poll.
+    /// Mark only input this drain actually leases, never other sources or blocked lanes.
+    pub fn drain_source_report_with_tasks(
+        &self,
+        who: &str,
+        name: &str,
+        limit: usize,
+        as_tasks: bool,
+    ) -> Result<DrainReport> {
         ensure!((1..=10000).contains(&limit), "limit must be 1..10000");
+        let mode = if as_tasks {
+            LeaseMode::PromoteRoots
+        } else {
+            LeaseMode::Ordinary
+        };
         let mut report = DrainReport::default();
         for _ in 0..limit {
-            let Some(l) = self.lease_source(who, name, Direction::In, 60)? else {
+            let Some(l) = self.lease_source_inner(who, name, Direction::In, 60, mode)? else {
                 break;
             };
             match self.ack_source(who, name, l.job.id, &l.receipt, None) {

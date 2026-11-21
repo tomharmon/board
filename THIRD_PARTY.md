@@ -19,9 +19,8 @@ rendered by this application from a disposable local database.
 - A small set of glyphs from [Lucide](https://lucide.dev/) 1.49.0 is compiled
   into the native UI. Its [ISC and Feather MIT notices](ui/licenses/Lucide.txt)
   are included in both the source and `board-ui --ui-notices`.
-- [Rhai](https://github.com/rhaiscript/rhai) is the embedded, operation-limited
-  rules interpreter (MIT or Apache-2.0). [FFmpeg](https://ffmpeg.org/legal.html)
-  supplies optional local AVIF, MP4/MOV and WebM decoding and a local audio
+- [FFmpeg](https://ffmpeg.org/legal.html) supplies optional local AVIF,
+  MP4/MOV and WebM decoding and a local audio
   player. Board does not bundle those executables or their codec libraries;
   the user's installation retains its own license.
 

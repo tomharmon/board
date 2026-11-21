@@ -5,7 +5,9 @@ mod files;
 mod layout;
 mod people;
 mod raster_motion;
+mod roles;
 mod sources;
+mod swarms;
 mod task_drafts;
 mod templates;
 mod video;
@@ -16,6 +18,8 @@ pub use drafts::Delivery;
 pub use files::{AttachmentPreview, Preview};
 pub use layout::Layout;
 pub use people::People;
+pub use roles::{RoleConfirm, RoleMode};
+pub use swarms::{FeedKind, SwarmTarget};
 pub use templates::SchemaPart;
 pub use video::Clip;
 pub use workspace::{ActivityMode, Desk, TaskCommand};
@@ -36,7 +40,10 @@ pub enum Page {
     Tasks,
     Task(i64),
     NewTask,
+    Swarms,
+    Swarm(i64),
     Workspace,
+    Roles,
     Schedules,
     Watchers,
     Schemas,
@@ -119,6 +126,7 @@ pub struct State {
     pub channel: Option<String>,
     pub channels: Vec<Channel>,
     pub open_tasks: i64,
+    pub active_swarms: i64,
     pub unread_channels: HashSet<String>,
     pub threads: Vec<ThreadSummary>,
     pub activity_messages: Vec<Message>,
@@ -138,6 +146,9 @@ pub struct State {
     pub properties: Option<Properties>,
     pub preview: Option<AttachmentPreview>,
     pub raw_blocks: HashSet<(i64, usize)>,
+    pub builtin_evidence: HashSet<&'static str>,
+    pub expanded_checks: HashSet<(i64, usize, usize)>,
+    pub patch_lines: HashMap<(i64, usize), usize>,
     pub delivery: Delivery,
     draft_dirty: bool,
     pub error: Option<String>,
@@ -182,6 +193,7 @@ impl State {
             channel: None,
             channels: Vec::new(),
             open_tasks: 0,
+            active_swarms: 0,
             unread_channels: HashSet::new(),
             threads: Vec::new(),
             activity_messages: Vec::new(),
@@ -201,6 +213,9 @@ impl State {
             properties: None,
             preview: None,
             raw_blocks: HashSet::new(),
+            builtin_evidence: HashSet::new(),
+            expanded_checks: HashSet::new(),
+            patch_lines: HashMap::new(),
             delivery: Delivery::default(),
             draft_dirty: false,
             starts: Vec::new(),
@@ -253,9 +268,23 @@ impl State {
     }
 
     fn load(&mut self) -> Result<()> {
+        use board_local::errors::{Kind, classify};
+
         let db = self.board.as_ref().context("Database is not open")?;
         // Sample before reading: a concurrent writer during the load forces another refresh.
         let version = db.data_version()?;
+        if self.version < 0 {
+            // Schema versions are immutable. An upgraded board can own either name itself.
+            for name in ["verdict", "diff"] {
+                match db.schema(name, 1) {
+                    Ok(s) if s.built_in => {
+                        self.builtin_evidence.insert(name);
+                    }
+                    Err(e) if classify(&e).0 != Kind::Missing => return Err(e),
+                    _ => (),
+                }
+            }
+        }
         let mut hide_draft = false;
         let mut hide_task = false;
         if self.delegated
@@ -263,7 +292,6 @@ impl State {
             && self.desk.task_entry.stamp.is_some()
             && let Err(e) = db.load_draft(&self.actor, "tasks")
         {
-            use board_local::errors::{Kind, classify};
             match classify(&e).0 {
                 Kind::Missing | Kind::Forbidden | Kind::Gone => hide_task = true,
                 _ => return Err(e),
@@ -274,7 +302,6 @@ impl State {
             && let Some(scope) = self.draft_scope()
             && let Err(e) = db.load_draft(&self.actor, &scope)
         {
-            use board_local::errors::{Kind, classify};
             match classify(&e).0 {
                 Kind::Missing | Kind::Forbidden | Kind::Gone => hide_draft = true,
                 _ => return Err(e),
@@ -282,6 +309,7 @@ impl State {
         }
         let channels = db.channels()?;
         let open_tasks = automation::open_task_count(db)?;
+        let active_swarms = db.swarm_active_count(&self.actor)?;
         let mut filter = self.browse.filter.clone();
         let has_feed = self.page.is_feed() || matches!(self.page, Page::Thread(_));
         let marks = db.channel_read_marks(&self.actor)?;
@@ -370,6 +398,7 @@ impl State {
         self.version = version;
         self.channels = channels;
         self.open_tasks = open_tasks;
+        self.active_swarms = active_swarms;
         self.unread_channels = unread;
         self.threads = threads;
         self.activity_messages = activity_messages;
@@ -415,6 +444,7 @@ impl State {
             self.access_blocked = self.delegated;
             self.channels.clear();
             self.open_tasks = 0;
+            self.active_swarms = 0;
             self.unread_channels.clear();
             self.threads.clear();
             self.activity_messages.clear();
@@ -514,6 +544,8 @@ impl State {
                 self.history.remove(0);
             }
             self.raw_blocks.clear();
+            self.expanded_checks.clear();
+            self.patch_lines.clear();
             self.body.clear();
             self.reply_to = None;
             self.files.clear();
@@ -803,7 +835,10 @@ impl State {
         }
         match db.data_version() {
             Ok(version) if version == self.version => {
-                frame_changed || draft_update || length != self.typing.len()
+                self.desk.swarm.refresh_waiters()
+                    || frame_changed
+                    || draft_update
+                    || length != self.typing.len()
             }
             Ok(_) => {
                 self.refresh();

@@ -676,31 +676,9 @@ pub fn dispatch_due(board: &Board) -> Result<usize> {
             tx.commit()?;
             continue;
         }
-        tx.execute_batch("SAVEPOINT scheduled_send")?;
-        let attempted = match s.re {
-            Some(re) => Board::reply_tx(&tx, re, &s.actor, &s.text, &opts),
-            None => Board::post_tx(&tx, &s.channel, &s.actor, &s.text, &opts),
-        };
-        let post = match attempted {
-            Ok(post) => {
-                tx.execute_batch("RELEASE scheduled_send")?;
-                post
-            }
-            Err(e) if crate::errors::classify(&e).1 == "dropped" => {
-                tx.execute_batch("ROLLBACK TO scheduled_send; RELEASE scheduled_send")?;
-                tx.execute("UPDATE schedules SET state='dropped' WHERE id=?", [id])?;
-                tx.execute("UPDATE schedule_details SET ended_by='board',reason='dropped' WHERE schedule=?",[id])?;
-                Board::event_tx(
-                    &tx,
-                    "schedule.ended",
-                    &s.actor,
-                    None,
-                    json!({"id":id,"reason":"dropped"}),
-                )?;
-                tx.commit()?;
-                continue;
-            }
-            Err(e) => return Err(e),
+        let post = match s.re {
+            Some(re) => Board::reply_tx(&tx, re, &s.actor, &s.text, &opts)?,
+            None => Board::post_tx(&tx, &s.channel, &s.actor, &s.text, &opts)?,
         };
         if blind_send {
             tx.execute("INSERT OR IGNORE INTO blind_posts(id) VALUES(?)", [post.id])?;

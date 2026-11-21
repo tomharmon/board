@@ -14,10 +14,6 @@ pub(super) fn routes() -> Router<App> {
         .route("/messages/{id}/deliveries", get(notices))
         .route("/sources", get(list).post(add))
         .route("/sources/{name}", get(one).patch(configure))
-        .route(
-            "/sources/{name}/renderer",
-            get(renderer).put(set_renderer).delete(clear_renderer),
-        )
         .route("/sources/{name}/imports", post(import))
         .route("/sources/{name}/links", put(link).get(find))
         .route(
@@ -56,36 +52,6 @@ async fn notices(State(a): State<App>, Path(id): Path<i64>) -> Data {
 }
 async fn list(State(a): State<App>) -> Data {
     Ok(Json(json!({"sources":a.call(|b,u|b.sources(u)).await?})))
-}
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Renderer {
-    script: String,
-}
-async fn renderer(State(a): State<App>, Path(n): Path<String>) -> Data {
-    Ok(Json(
-        json!({"script":a.call(move|b,u|b.source_renderer(u,&n)).await?}),
-    ))
-}
-async fn set_renderer(
-    State(a): State<App>,
-    Path(n): Path<String>,
-    Json(r): Json<Renderer>,
-) -> ApiResult<Response> {
-    let location = format!("/v1/sources/{n}/renderer");
-    let new = a
-        .call(move |b, u| b.set_source_renderer(u, &n, Some(&r.script)))
-        .await?;
-    Ok(if new {
-        created(location, json!({"created":true}))
-    } else {
-        StatusCode::NO_CONTENT.into_response()
-    })
-}
-async fn clear_renderer(State(a): State<App>, Path(n): Path<String>) -> ApiResult<StatusCode> {
-    a.call(move |b, u| b.set_source_renderer(u, &n, None))
-        .await?;
-    Ok(StatusCode::NO_CONTENT)
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]

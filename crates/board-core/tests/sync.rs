@@ -434,12 +434,6 @@ fn private_lifecycle_reply_is_never_mirrored_or_backfilled_and_sparse_profiles_k
     b.attach_source("owner", "mirror", "second", "r", id, None)
         .unwrap();
     b.set_outbound("owner", "mirror", true).unwrap();
-    b.set_source_renderer(
-        "owner",
-        "mirror",
-        Some("message.text + (message.labels.state ?? \"\")"),
-    )
-    .unwrap();
     let mut evt = input("lifecycle", "a", "closed", Some("r"), "");
     evt.import.profile = Some(AuthorInfo {
         name: "Dana Updated".into(),
@@ -462,9 +456,12 @@ fn private_lifecycle_reply_is_never_mirrored_or_backfilled_and_sparse_profiles_k
         Some("https://profile.invalid/dana.png")
     );
     let jobs = b.inbox("owner", "mirror", Direction::Out, 0, 50).unwrap();
+    assert_eq!(b.get(id).unwrap().labels["state"], "closed");
     assert!(
-        jobs.iter()
-            .any(|j| j.payload["message"] == id && j.payload["event"] == "message.edited")
+        !jobs
+            .iter()
+            .any(|j| j.payload["message"] == id && j.payload["event"] == "message.edited"),
+        "a label-only change did not change the outbound text"
     );
     assert!(!jobs.iter().any(|j| j.payload["message"] == note.id));
     drop(b);
@@ -1004,92 +1001,6 @@ fn stored_link_quotes_are_same_channel_snapshots_and_never_a_blind_read_or_netwo
             .links
             .is_empty()
     );
-}
-#[test]
-fn source_renderer_rereads_current_labels_only_updates_changed_text_and_fences_a_failed_start() {
-    let b = Board::memory().unwrap();
-    b.create_source("p", "s", Provider::Local, "other", "dev")
-        .unwrap();
-    b.patch_source(
-        "p",
-        "s",
-        &SourcePatch {
-            outbound: Some(true),
-            mirror_roots: Some(true),
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    b.set_source_renderer(
-        "p",
-        "s",
-        Some(r#"message.text+" ["+(message.labels.phase ?? "open")+"]""#),
-    )
-    .unwrap();
-    let m = b.post("dev", "p", "ticket", &Default::default()).unwrap();
-    let l = b
-        .take_source_delivery("p", "s", Direction::Out, 10)
-        .unwrap()
-        .unwrap();
-    assert_eq!(l.job.payload["text"], "ticket [open]");
-    b.ack_source(
-        "p",
-        "s",
-        l.job.id,
-        &l.receipt,
-        Some(&DeliveryResult {
-            external: "x".into(),
-            thread: Some("T".into()),
-            url: None,
-        }),
-    )
-    .unwrap();
-    b.label(m.id, "p", "unrelated", Some("x")).unwrap();
-    assert!(
-        b.take_source_delivery("p", "s", Direction::Out, 10)
-            .unwrap()
-            .is_none()
-    );
-    b.label(m.id, "p", "phase", Some("ready")).unwrap();
-    let l = b
-        .take_source_delivery("p", "s", Direction::Out, 10)
-        .unwrap()
-        .unwrap();
-    assert_eq!(l.job.payload["text"], "ticket [ready]");
-    b.ack_source(
-        "p",
-        "s",
-        l.job.id,
-        &l.receipt,
-        Some(&DeliveryResult {
-            external: "x".into(),
-            thread: None,
-            url: None,
-        }),
-    )
-    .unwrap();
-    b.set_source_renderer("p", "s", Some("loop {}")).unwrap();
-    let other = b.post("dev", "p", "new", &Default::default()).unwrap();
-    b.reply(other.id, "p", "queued child", &Default::default())
-        .unwrap();
-    assert!(
-        b.take_source_delivery("p", "s", Direction::Out, 10)
-            .unwrap()
-            .is_none()
-    );
-    let failed = b.message_deliveries("p", other.id).unwrap();
-    assert_eq!(failed[0].state, "failed");
-    assert!(b.message_deliveries("other", other.id).unwrap().is_empty());
-    b.resolve_source("p", "s", failed[0].id, "skip", None)
-        .unwrap();
-    b.set_source_renderer("p", "s", None).unwrap();
-    let retry = b.start_source_thread("p", "s", other.id).unwrap();
-    assert_ne!(failed[0].id, retry.id);
-    let new = b
-        .take_source_delivery("p", "s", Direction::Out, 10)
-        .unwrap()
-        .unwrap();
-    assert_eq!(new.job.id, retry.id);
 }
 #[test]
 fn incoming_replay_origin_edit_delete_and_offline_receipts_survive_restart() {

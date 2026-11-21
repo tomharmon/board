@@ -550,6 +550,15 @@ impl Board {
             extra_cap: false,
         }))
     }
+    pub(crate) fn admitted_credential_on(c: &Connection, id: &str) -> Result<Access> {
+        let a = Self::credential_access_on(c, id)?
+            .context(Forbidden.error("invalid_credential", "credential is revoked or expired"))?;
+        ensure!(
+            a.own.is_some(),
+            Forbidden.error("no_access", "no active grant for this actor")
+        );
+        Ok(a)
+    }
     pub(crate) fn access_on(&self, c: &Connection) -> Result<Access> {
         match &self.session {
             Session::Rejected => Err(Forbidden
@@ -563,13 +572,7 @@ impl Board {
                 ..Access::owner()
             }),
             Session::Credential { id, cap } => {
-                let mut access = Self::credential_access_on(c, id)?.context(
-                    Forbidden.error("invalid_credential", "credential is revoked or expired"),
-                )?;
-                ensure!(
-                    access.own.is_some(),
-                    Forbidden.error("no_access", "no active grant for this actor")
-                );
+                let mut access = Self::admitted_credential_on(c, id)?;
                 if let Some(cap) = cap {
                     access.caps.push(cap.clone());
                     access.extra_cap = true;

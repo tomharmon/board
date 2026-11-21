@@ -46,6 +46,7 @@ INSERT OR IGNORE INTO client_batches(key,actor,fingerprint,ids)
 
 pub struct Board {
     pub(crate) conn: Connection,
+    pub(crate) swarm_scratch: std::cell::OnceCell<tempfile::TempDir>,
     pub(crate) session: crate::access::Session,
     pub(crate) request_avatar: Option<(String, String)>,
 }
@@ -275,7 +276,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 14;
+const DB_VERSION: i64 = 15;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -371,6 +372,7 @@ impl Board {
         if version == DB_VERSION && app == APPLICATION_ID {
             return Ok(Self {
                 conn,
+                swarm_scratch: Default::default(),
                 session: Default::default(),
                 request_avatar: None,
             });
@@ -389,6 +391,7 @@ impl Board {
             tx.commit()?;
             return Ok(Self {
                 conn,
+                swarm_scratch: Default::default(),
                 session: Default::default(),
                 request_avatar: None,
             });
@@ -399,7 +402,14 @@ impl Board {
         tx.execute_batch(REPLAY_KEYS)?;
         crate::access::init(&tx)?;
         crate::sources::init(&tx)?;
-        crate::policy::init(&tx)?;
+        tx.execute_batch(
+            "DROP TABLE IF EXISTS write_rules;
+            DROP TABLE IF EXISTS rule_internal;
+            DROP TABLE IF EXISTS sync_renderers;
+            DROP TABLE IF EXISTS source_renderers;",
+        )?;
+        crate::roles::init(&tx)?;
+        crate::swarm::init(&tx)?;
         crate::presence::init(&tx)?;
         crate::files::init(&tx)?;
         crate::actors::init(&tx)?;
@@ -412,6 +422,7 @@ impl Board {
         tx.commit()?;
         Ok(Self {
             conn,
+            swarm_scratch: Default::default(),
             session: Default::default(),
             request_avatar: None,
         })
@@ -840,38 +851,8 @@ impl Board {
                 )
             );
         }
-        let attached = !opts.files.is_empty() || !opts.attachment_ids.is_empty();
-        let original_text = text;
-        let original_blocks = origin.blocks(tx, text)?;
-        let patch = crate::policy::filter(
-            tx,
-            crate::policy::Write {
-                channel,
-                actor,
-                id: None,
-                root: re,
-                text,
-                labels: &opts.labels,
-                attached,
-                no_sync: opts.no_sync,
-            },
-        )?;
-        let (text, labels) = match &patch {
-            Some((t, l)) => (t.as_str(), l),
-            None => (text, &opts.labels),
-        };
-        if patch.is_some() {
-            validate_text(text, attached)?;
-            for (k, v) in labels {
-                validate_key(k)?;
-                validate_value(v)?;
-            }
-        }
-        let blocks = if text == original_text {
-            original_blocks
-        } else {
-            origin.blocks(tx, text)?
-        };
+        let blocks = origin.blocks(tx, text)?;
+        let labels = &opts.labels;
         tx.execute("INSERT OR IGNORE INTO channels VALUES (?)", [channel])?;
         let ts = now();
         tx.execute(
@@ -1021,29 +1002,8 @@ impl Board {
         let old = Self::get_on(tx, id)?;
         origin.may_change(&old, actor, revision)?;
         ensure!(!old.deleted, Gone.error("deleted", "message removed"));
-        let original_text = text;
         validate_text(text, !old.attachments.is_empty())?;
-        let original_blocks = origin.blocks(tx, text)?;
-        let patch = crate::policy::filter(
-            tx,
-            crate::policy::Write {
-                channel: &old.channel,
-                actor,
-                id: Some(id),
-                root: Some(old.re.unwrap_or(old.id)),
-                text,
-                labels: &old.labels,
-                attached: !old.attachments.is_empty(),
-                no_sync: old.no_sync,
-            },
-        )?;
-        let text = patch.as_ref().map_or(text, |(s, _)| s.as_str());
-        validate_text(text, !old.attachments.is_empty())?;
-        let blocks = if text == original_text {
-            original_blocks
-        } else {
-            origin.blocks(tx, text)?
-        };
+        let blocks = origin.blocks(tx, text)?;
         tx.execute(
             "UPDATE messages SET text=?,blocks=? WHERE id=?",
             params![text, serde_json::to_string(&blocks)?, id],

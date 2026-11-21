@@ -3,6 +3,9 @@ mod attachments;
 mod automation_cli;
 mod cli;
 mod conformance;
+mod roles_cli;
+mod skill_install;
+mod swarm_cli;
 mod sync_cli;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -366,6 +369,9 @@ fn inspector(
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Command::Skill { command } = args.cmd {
+        return skill_install::run(command, args.json);
+    }
     if matches!(args.cmd, Command::Conformance) {
         return conformance::run(args.json);
     }
@@ -390,10 +396,18 @@ fn run(args: Args) -> Result<()> {
         .db
         .or_else(|| args.name.as_deref().map(local::named_database_path))
         .unwrap_or_else(local::database_path);
+    let in_swarm = matches!(args.cmd, Command::Swarm { .. } | Command::Mcp)
+        || env::var_os("BOARD_SWARM_RUN").is_some();
     let profile = args
         .profile
         .as_deref()
-        .map(local::profile_name)
+        .map(|name| {
+            if in_swarm {
+                local::agent_profile_name(name)
+            } else {
+                local::profile_name(name)
+            }
+        })
         .transpose()?;
     let editing_profile = matches!(args.cmd, Command::Profile { .. });
     ensure!(
@@ -425,54 +439,16 @@ fn run(args: Args) -> Result<()> {
     }
     let js = args.json;
     match args.cmd {
+        Command::Skill { .. } => unreachable!(),
+        Command::Swarm { command } => swarm_cli::run(&board, &actor, command, js)?,
+        Command::Roles { command } => roles_cli::roles(&board, &actor, command, js)?,
+        Command::Skills { command } => roles_cli::skills(&board, &actor, command, js)?,
+        Command::Mcp => return board_mcp::serve_stdio(&board, &actor),
         Command::Discovery => println!(
             "{}",
             serde_json::to_string_pretty(&board_api::discovery_document())?
         ),
         Command::Commands | Command::Conformance => unreachable!(),
-        Command::Rules { command } => {
-            use cli::RuleCommand::*;
-            board.require_owner()?;
-            match command.unwrap_or(List) {
-                List => {
-                    let rules = board.write_rules()?;
-                    if js {
-                        println!("{}", json!({"rules":rules}));
-                    } else {
-                        for r in rules {
-                            println!("{}  {}", r.priority, safe(&r.name));
-                        }
-                    }
-                }
-                Set {
-                    name,
-                    file,
-                    priority,
-                } => {
-                    let created = board.set_write_rule(
-                        &actor,
-                        &board_local::policy::Rule {
-                            name: name.clone(),
-                            priority,
-                            script: load_text(&file)?,
-                        },
-                    )?;
-                    if js {
-                        println!("{}", json!({"name":name,"created":created}));
-                    } else {
-                        println!("{}", safe(&name));
-                    }
-                }
-                Remove { name } => {
-                    board.remove_write_rule(&actor, &name)?;
-                    if js {
-                        println!("{}", json!({"removed":name}));
-                    } else {
-                        println!("removed {}", safe(&name));
-                    }
-                }
-            }
-        }
         Command::Typing {
             id,
             status,

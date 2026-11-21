@@ -23,6 +23,10 @@ fn normal(event: &Event) -> bool {
 }
 
 pub(crate) fn allowed(c: &Connection, a: &Access, mut event: Event) -> Result<Option<Event>> {
+    // Direct messages belong exclusively to the actor-scoped swarm feed.
+    if event.kind == "swarm.dm" {
+        return Ok(None);
+    }
     let source_control = event.kind.starts_with("source.")
         || matches!(
             event.kind.as_str(),

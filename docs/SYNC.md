@@ -1,281 +1,68 @@
-# Optional connectors
+# External connectors
 
-Board stores conversations and their history locally. `board serve`,
-`board worker`, the inspector and ordinary reads never call GitHub, Slack or
-Linear. Network use is explicit: `sync pull`, `sync preview`, `sync send`,
-the owner-confirmed Slack channel join, status or file transfer. Remote configuration uses a
-repository, channel ID or team key, not a configurable token destination.
+Board includes optional connectors for **GitHub**, **Slack**, **Linear**, and **Local** event feeds. Everything stays offline by default—only explicit `board sync` commands make network requests.
 
-## In the inspector
+## How connectors work
 
-Open **Settings > Sync > Add source**, even on an empty board. Choose
-GitHub, Slack, Linear or Local, name the mapping, then enter the external
-destination and the board channel. A channel need not exist yet. Creating a
-source saves only its local mapping: no account is connected, no import is
-started, and publishing and automatic mirroring are off. The selected source
-shows its inbox/outbox and a copyable command to run explicitly as the same
-identity. The copied command supplies an absolute, quoted `--db` path to
-this database even if the shell defaults to another board; it never copies
-a delegated credential or provider token. Supply the intended actor and
-credentials in your own shell. Use a POSIX shell on Unix or PowerShell on Windows. No command is
-offered for an in-memory database or an unsafe or unrepresentable filename.
-Local streams accept a normalized event file instead of making a network request.
-
-Choose **Settings** inside a source to change publishing and its applicable
-mirror options. GitHub supports selecting issues or pull requests but never
-automatically creates remote roots. Slack supports file mirroring. A second
-confirmation protects publishing changes and disabling file mirroring:
-disabling publishing skips unsent jobs but cannot recall an in-flight
-request. Changes to an open form are refused if another process has already
-changed that source. Provider, remote and board channel are fixed identities
-for saved receipts; to change routing, disable publishing and create a new
-mapping under a different name. There is no destructive delete operation.
-The inspector has no token field and never runs the copied command.
-
-## Read first
+A **source** maps an external destination (a GitHub `owner/repo`, Slack channel ID, or Linear team key) to a local Board channel:
 
 ```sh
-export BOARD_DB="$HOME/.local/share/board/board.sqlite3"
-board sources add bugs github BurntSushi/ripgrep work/github
-board --json sync preview bugs 1          # fetch without writing to the DB
-board sync pull bugs 1                    # import one public issue and its discussion
-board sync find bugs 1                    # local root ID
-board read work/github
-
-board sources add chat slack C01234567 work/chat
+board sources add bugs github my-org/my-repo work/github
 board sources add tickets linear ENG work/tickets
-# Supply your token privately through the process environment before a remote command.
-board sync pull chat 1727000000.123456
-board sync pull tickets ENG-123
-board sync pull tickets --watch --interval 5m  # foreground; Ctrl-C to stop
+board sources add team slack C01234567 work/slack
 ```
 
-Omit the thread argument to scan the configured repository/channel/team.
-The connector follows provider pagination, persists normalized events before
-advancing its scan position, and drains stored events locally. Re-fetching
-does not repost them. Slack scans root history so replies to older roots can
-be discovered. Huge scans can be slow or rate limited; an interrupted scan
-does not advance the last successful checkpoint. A scoped source belongs to
-its owner and requires read and sync rights in the mapped channel. A
-deliberately narrowed credential cannot administer integrations. On-demand
-remote preview and joining are trusted-owner operations.
+You can also create and inspect sources offline in Rune under **Settings > Sync**.
 
-`sync preview NAME --limit 10 [--cursor NEXT]` reads one provider page and
-returns its continuation without writing locally. On Slack, the owner can
-preview or explicitly join another channel by ID, `'#name'` or permalink. All
-on-demand Slack reads, including the configured channel, require a public,
-non-shared channel that the app **already belongs to**. Previews can address
-a precise reply as `C01234567:1727000000.123456`; read its enclosing thread
-and pass its root and continuation to resume. Reading never joins or changes
-a mapping. Explicit pulls of a configured source are separate from previews.
-[Public channel listing](https://docs.slack.dev/reference/methods/conversations.list/)
-and [channel membership](https://docs.slack.dev/reference/methods/conversations.info/)
-are checked using the configured app, not a local display name.
+Provider tokens are read only from your shell environment (`BOARD_SYNC_<NAME>_TOKEN`, or fallback `BOARD_GITHUB_TOKEN`, `BOARD_SLACK_TOKEN`, `BOARD_LINEAR_TOKEN`). Secrets are never saved to SQLite or backups.
 
-GitHub previews also accept an issue or pull request URL in the configured
-repository. A Linear preview accepts its configured team, an issue ID or URL,
-or a project URL restricted to that team. Team and project pages return readable
-summaries; comment pages return a continuation. Links supply identifiers,
-not new API hosts or token destinations. GitHub and Linear tags keep the
-provider's display value (for example, `tag.good-first-issue=Good First Issue`).
-A sparse update does not delete a label family the provider did not supply.
-To route new issues and pull requests in the same repository to different
-Board channels, create a source for each mapping and set
-`board sources configure bugs --github-items issues` and
-`board sources configure reviews --github-items pulls` (default: `all`).
-This applies to native intake and explicit pulls. Changing the route does
-not disconnect an already linked thread.
+## Pulling work into Board
 
-For each source the environment variable is `BOARD_SYNC_<NAME>_TOKEN`
-(upper case; hyphens become underscores). Alternatives are
-`BOARD_GITHUB_TOKEN`, `BOARD_SLACK_TOKEN` and `BOARD_LINEAR_TOKEN`.
-Public GitHub reads need no token. Slack takes a bearer token appropriate
-to the channel type and read/write method. Linear accepts an API key or a
-full `Bearer ...` value for OAuth. The provider secrets are not written to
-the board, its backups, or config; there is no built-in OAuth or keychain UI.
-Use your shell's secret manager. Do not store tokens in messages or inbox
-payloads.
+### Sync conversations into channels
 
-| Provider | Represented locally |
+```sh
+board sync preview bugs 42          # inspect without writing locally
+board sync pull bugs 42             # import issue/PR #42 and its discussion
+board sync pull tickets ENG-123     # import a Linear issue and its comments
+board sync pull tickets --watch --interval 5m
+```
+
+Omit the thread ID to scan the configured repository, channel, or team. Connectors paginate cleanly, checkpoint their scan position, and deduplicate replays so re-pulling never duplicates messages.
+
+### Pull tickets as claimable tasks (for agent swarms)
+
+To feed a backlog of GitHub or Linear issues directly into a swarm, pull them as tasks:
+
+```sh
+board sync pull tickets --as-tasks
+board sources configure bugs --github-items issues
+board sync pull bugs --as-tasks
+```
+
+Only thread roots newly written during the pull become tasks. That includes queued roots left by an interrupted earlier pull, even when the provider returns nothing new. Their imported labels are preserved, and the local actor who requested promotion owns the task, not the remote issue author. Comments stay replies. Replaying a pull does not promote previously imported ordinary threads, reopen completed tasks, or replace live claims. The request is saved with the inbox item: an offline `board sync drain bugs` after a restart still commits the root, task, and receipt together. A delegated puller needs read, sync, and label permission in the mapped channel; a revoked credential cannot promote queued roots.
+
+Workers can claim tickets exclusively via `board tasks claim --ready work/tickets` and complete them using their lease. Pulling a network source is an explicit provider read, not part of offline drain or Board startup.
+
+## Supported providers
+
+| Provider | What is synced |
 | --- | --- |
-| GitHub | Issues, PRs, ordinary comments, reviews and individual inline replies. External IDs include the repository mapping, issue number and comment/review ID. PR state, review, head, tags and assignees become labels. [Issue API](https://docs.github.com/en/rest/issues/issues), [review comments](https://docs.github.com/en/rest/pulls/comments). |
-| Slack | A configured channel and its timestamp-addressed conversations. Fetches root history and paginated threaded replies. Native saved message edits/deletions and reaction events can also be ingested offline. Joining is never automatic: `board sync join chat --confirm` checks that the mapped channel is public and non-shared before asking Slack to join. [Thread API and token limits](https://docs.slack.dev/reference/methods/conversations.replies/). |
-| Linear | One team's issues by UUID or issue identifier, nested comments, issue state and properties. A canonical UUID remains linked when the human identifier changes. [GraphQL API](https://linear.app/developers/graphql). |
+| **GitHub** | Issues, PRs, comments, reviews, inline review replies, and metadata labels (state, review status, head, tags, assignees). Can filter to `issues`, `pulls`, or `all`. |
+| **Linear** | Team issues (tracked by canonical UUID even if the human key changes), nested comments, issue state, and labels. |
+| **Slack** | Channel history, threaded replies, reactions, rich-text formatting, optional opt-in file mirroring (`--mirror-files`), and assistant thread status. |
+| **Local** | Normalized JSON event envelopes (`board sync import` / `board inbox push`) for integrating custom local scripts or CI pipelines offline. |
 
-## Publish deliberately
+## Publishing back (opt-in)
 
-To create a new Board root and request one or more destinations in **one
-SQLite transaction**, use `board post work/github "Triage note" --sync bugs:123`
-(join issue 123 at the configured `bugs` source), or `--sync bugs` to request a
-new issue. Both require publishing already enabled and a mapped channel you may
-use. Use an issue/PR number for GitHub, a thread timestamp for Slack and the
-issue UUID for Linear. The post fails as a unit for invalid or inaccessible
-local destinations. A link does not prove the remote thread exists. A join overrides an
-automatic new-thread mirror at that same source. It queues **zero** old messages:
-the provider keeps its own original, and only newly posted replies are eligible.
-A retry with the same post key does not add destinations.
-`board sync targets MESSAGE` shows pending versus confirmed state;
-`board read URL` and `board sync locate URL` resolve retained links without
-contacting the provider. Nothing is sent until an operator runs the connector.
+Publishing is **off by default** on every source. Nothing leaves Board until you explicitly enable publishing and run `board sync send`:
 
 ```sh
 board sources publishing bugs on
-board reply "$(board sync find bugs 1)" 'A reply to share'
-board inbox list bugs --outgoing          # still local; nothing sent yet
-# board sync send bugs --limit 10         # actually writes to GitHub
-board sources publishing bugs off
+board reply "$(board sync find bugs 42)" "Fixed and verified in PR #98"
+board sync send bugs
 ```
 
-By default, enabling publishing only queues subsequent changes in **linked**
-threads. Use `sync start NAME LOCAL_ROOT` to deliberately queue a *new*
-provider conversation and its current local replies. For an existing conversation
-use `sync join-thread NAME REMOTE_THREAD LOCAL_ROOT`: older replies and the root
-stay off that destination even on explicit backfill. Use `sync link NAME
-REMOTE_THREAD EXTERNAL_ID LOCAL_ID` only to assert an actual, writable message
-copy. `sync backfill NAME REMOTE_THREAD` queues eligible unshared replies.
-Do not link an object you do not control for editing. Delivered messages
-preserve their confirmed external ID/permalink; `sync linked NAME URL` and
-`sync copies NAME LOCAL_ID` recover them. Inbound posts do not echo back
-to their origin, but can be delivered to independent, explicitly enabled mirrors.
-
-```sh
-board sources configure chat --mirror-roots true   # new roots in the mapped channel
-board sources publishing chat on                   # still requires an explicit sync send
-board post work/chat "Just for the board" --no-sync
-board sources configure chat --mirror-files true --display-authors true
-```
-
-Private roots exclude the entire thread, including edits, reactions, files,
-manual linking and backfill. A private reply excludes just that message. The
-outbox re-reads a live message before leasing: an edit while offline updates
-the pending post, and an unsent tombstone does not get sent. Each switch is
-stored per source. Optional author attribution is a visible line on a message
-from the integration, not a post using a person's credentials.
-
-GitHub never automatically opens issues from local roots. An owner may
-explicitly request a new issue with `sync start`. To customize the body a
-source publishes, put a Rhai string expression such as
-`message.text + " [" + (message.labels.phase ?? "open") + "]"` in a file;
-run `board sources renderer NAME --file PATH`. The input also includes the
-channel, actor, current task state, files, root, message and destination.
-The renderer never edits the Board message. Label changes only edit a
-confirmed external copy when the rendered body actually changes. Clear it
-with `board sources renderer NAME --clear`. See also [write rules](RULES.md)
-for rejecting an import with an explicit, durable external response.
-
-Before arming a remote write the connector checks that the leased job is
-still shareable and still has the same rendered body, including configured
-bylines and file notes. An edit during a read-only provider check releases
-the old proof and prepares again; a deletion of an unsent post skips it.
-A change after send intent commits cannot recall an in-flight request.
-
-After an ambiguous external write (including a crash after intent was
-recorded), later outgoing work on the same thread waits. The board cannot
-tell whether a remote service accepted a request before the reply was lost.
-Inspect the remote service and `board inbox list NAME --outgoing`; then use
-`board inbox resolve NAME ITEM delivered --external ID [--thread REMOTE_THREAD]`.
-Use `retry` **only after verifying nothing was created**, or `skip`.
-Unrelated known threads proceed independently. An uncertain *new* thread
-also fences inbound echoes for the source until its remote ID is known.
-Deleting a published GitHub root redacts its title/body rather than deleting
-the issue and its discussion. A Linear root edit updates the description
-without replacing its external title, and deleting the local root leaves
-the Linear issue intact. Turning publishing off skips queued
-unsent work; it cannot retract a write already in flight.
-Re-enabling publishing does not replay that skipped work automatically.
-Use an explicit backfill to queue unshared live replies again. Turning off
-file mirroring also cancels unsent file uploads; an explicit share can
-restage a selected file. Neither switch retries ambiguous remote writes.
-
-## Offline inputs
-
-**Slack files and reactions.** Default pulls do not copy private bytes. Use
-`sync fetch-file NAME THREAD EXTERNAL_MESSAGE FILE_ID` to attach a specific
-file to its imported message. Slack must confirm that exact channel and
-message share it. Repeating the fetch returns the same immutable local asset.
-`sync share-file NAME THREAD LOCAL_MESSAGE FILE_ID_OR_KEY` explicitly stages
-one attached file for publishing. `sync send` uploads it without forwarding
-your API token to the temporary upload endpoint; `sync files NAME LOCAL_MESSAGE`
-lists confirmed copy IDs in both directions. Bytes and annotations share the
-same local backup. This uses the [Slack upload protocol](https://docs.slack.dev/reference/methods/files.completeUploadExternal/).
-With `mirror_files` explicitly enabled, pulls also copy newly imported files
-(up to 25 MiB per file and ten per message). Unavailable files do not block
-the conversation. Failed downloads retry on later pulls up to three times;
-`sync file-failures NAME` lists them and `file_notices` in the message
-explains what didn't come over. A manual fetch can still recover a file.
-For outbound Slack files, each upload is a separate job after the text
-receipt, and deleting the Board message queues removal of confirmed copies.
-A definite upload-permission refusal adds a file reference to the text copy;
-an uncertain result still requires reconciliation. GitHub and Linear receive
-filenames, sizes and the Board message ID, never attachment bytes.
-
-Slack rich-text conversion supports code, emphasis, links and source-qualified
-mentions; untrusted raw Slack control tags in a local message are escaped.
-With `display_authors`, an explicit Slack read may look up names and avatar
-metadata (`users.info`). It never downloads avatars. Owners may explicitly
-call `sync status NAME THREAD 'Working'` (empty status clears it); this uses
-[Slack's assistant status API](https://docs.slack.dev/reference/methods/assistant.threads.setStatus/)
-and requires the correct provider-side scope and conversation type.
-With publishing enabled, a Slack reaction is added for the first local reactor
-and removed for the last; inbound snapshots import reported users, and saved
-events supply removals. Linear supports outbound adds on linked comments.
-
-The CLI and Rune show stored quotes of recognized message links. A Board copy
-is only quoted inside the same Board channel; a blind writer gets no snapshot.
-Ordinary posts never fetch URLs. A Slack pull may use an unfurl already
-attached to the input or read the target of a Slack permalink in a verified
-public non-shared channel of which the app is already a member. Private and
-unavailable links stay unresolved; later richer input can fill them in.
-
-For a private local tool, make a `local` source and send a normalized envelope:
-
-```sh
-board sources add buildfeed local build-events work/build
-board inbox push buildfeed - <<'JSON'
-{"key":"build-19","import":{"thread":"B19","external":"root","author":"builder","change":{"op":"post","text":"Build 19 passed"}},"raw":{"build":19}}
-JSON
-board sync drain buildfeed
-board sync find buildfeed B19 root
-```
-
-`sync import NAME FILE` performs the same write immediately. Supported
-operations are `post`, `upsert`, `reconcile` (partial label families), `edit`, `delete`, `react`, `labels` and
-`signal` (update a linked root and optionally post a reply only if its
-label preconditions still match).
-Include `parent` for a precise external reply target. A reused key with a
-different normalized operation conflicts. Original payloads are visible to
-the source owner in the inbox, not in ordinary thread reads.
-
-Already-obtained provider event files can be enqueued without network:
-`board sync ingest NAME KIND DELIVERY_ID FILE`, then `board sync drain NAME`.
-Use a stable delivery ID. For GitHub, KIND is `issues`, `pull_request`,
-`issue_comment`, `pull_request_review`, `pull_request_review_comment` or
-`workflow_run`. A completed CI run changes its workflow's label only when
-its commit still matches the linked PR head; a failure also posts a reply.
-For Slack/Linear use `slack`/`linear`. Unsigned files are **trusted local
-input**. To authenticate original bytes, set
-`BOARD_SYNC_<NAME>_SIGNING_SECRET` and pass `--signature SIGNATURE`
-(plus `--timestamp SECONDS` for Slack). Once the secret is set, the native
-intake command refuses unsigned input. [GitHub](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries),
-[Slack](https://docs.slack.dev/authentication/verifying-requests-from-slack/)
-and [Linear](https://linear.app/developers/webhooks) signatures are checked
-before normalization; Slack and Linear also have freshness windows.
-This is verification of locally supplied bytes, **not a public listener**.
-An early GitHub comment can seed an unknown root from its included issue or
-PR snapshot. Unrelated CI runs or a push alone do not create threads. For
-child-only payloads without the parent data, pull/import their parents first.
-Polling a list cannot by
-itself prove a disappeared comment was deleted.
-
-## Verification and limits
-
-An anonymous, read-only pull and replay of [public issue #1](https://github.com/BurntSushi/ripgrep/issues/1)
-was run. [Loopback HTTP fixtures](../crates/board-sync/src/tests.rs) exercise
-real request construction, response parsing, pagination, parent mapping and
-publishing without contacting private accounts. **No live Slack/Linear account
-or external write was tested.** Those tests are not a provider certification.
-The connectors mirror conversations, not repositories or every provider
-feature: there is no public webhook endpoint or remote identity impersonation.
-File sharing, source fan-out, native signatures, and rich text have
-[additional protocol fixtures](../crates/board-sync/src/tests/coverage.rs). See the
-[coverage inventory](PARITY-AUDIT.md).
+- **Keep internal chatter private:** Pass `--no-sync` on any post or reply to keep it strictly local. A `--no-sync` root keeps its entire thread off external services.
+- **Starting vs. joining remote threads:** Use `board post CHANNEL "..." --sync SOURCE` to start a new external thread, or `--sync SOURCE:THREAD` / `board sync join-thread` to attach future replies to an existing remote thread without exporting older local history.
+- **Outbox & safe recovery:** Outbound writes sit in a durable per-thread outbox. If a network error leaves an external write uncertain, Board pauses that thread's outbound lane rather than blindly double-posting, letting you inspect and reconcile via `board inbox list` and `board inbox resolve`.
+- **Files:** Slack supports explicit file fetch/share (`sync fetch-file`, `sync share-file`) or automatic file mirroring when enabled; GitHub and Linear receive clean file summaries rather than binary blobs.

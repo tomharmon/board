@@ -25,6 +25,7 @@ pub mod sources;
 
 pub use core::*;
 pub use read::*;
-pub use schemas::{Block, Schema};
-pub mod policy;
+pub use schemas::{Block, Schema, append_block};
 mod projections;
+pub mod roles;
+pub mod swarm;

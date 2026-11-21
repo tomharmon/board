@@ -442,8 +442,21 @@ impl Connector {
         name: &str,
         thread: Option<&str>,
     ) -> Result<PollReport> {
+        self.pull_with_tasks(board, actor, name, thread, false)
+    }
+    pub fn pull_with_tasks(
+        &self,
+        board: &Board,
+        actor: &str,
+        name: &str,
+        thread: Option<&str>,
+        as_tasks: bool,
+    ) -> Result<PollReport> {
         let source = board.source(actor, name)?;
         ensure!(source.provider == self.provider, "provider mismatch");
+        if as_tasks {
+            board.enqueue_imports_with_tasks(actor, name, &[], None, true)?;
+        }
         let since = board.source_checkpoint(actor, name, "last_scan")?;
         let start = Utc::now().to_rfc3339();
         let threads = match thread {
@@ -472,13 +485,13 @@ impl Connector {
             }
             let items = order(events)?;
             for batch in items.chunks(200) {
-                board.enqueue_imports(actor, name, batch, None)?;
+                board.enqueue_imports_with_tasks(actor, name, batch, None, as_tasks)?;
             }
             report.records += items.len();
             report.threads += 1;
         }
         if thread.is_none() {
-            board.enqueue_imports(
+            board.enqueue_imports_with_tasks(
                 actor,
                 name,
                 &[],
@@ -487,11 +500,12 @@ impl Connector {
                     expected: since,
                     next: start,
                 }),
+                as_tasks,
             )?;
         }
         // Queue data is safe even if processing fails or the process stops after checkpointing.
         loop {
-            let batch = board.drain_source_report(actor, name, 500)?;
+            let batch = board.drain_source_report_with_tasks(actor, name, 500, as_tasks)?;
             report.applied += batch.applied;
             report.failed += batch.failed;
             report.skipped += batch.skipped;

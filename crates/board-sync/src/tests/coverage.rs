@@ -1,6 +1,112 @@
 use super::*;
 
 #[test]
+fn empty_as_tasks_pull_drains_an_interrupted_ordinary_checkpoint_as_claimable_work() {
+    let mock = Mock::new(vec![
+        ("GET /repos/org/proj/issues?", 200, json!([])),
+        ("GET /repos/org/proj/issues/comments?", 200, json!([])),
+        ("GET /repos/org/proj/pulls/comments?", 200, json!([])),
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board");
+    let b = Board::open(&path).unwrap();
+    b.create_source("ada", "bugs", Provider::Github, "org/proj", "issues")
+        .unwrap();
+    let mut head = upsert(
+        "17",
+        "issue".into(),
+        "reporter".into(),
+        None,
+        "Pending issue".into(),
+    );
+    labels(&mut head, &[("tag.bug", "bug"), ("state", "open")]);
+    let comment = upsert(
+        "17",
+        "comment:7".into(),
+        "reporter".into(),
+        Some("issue".into()),
+        "Reproduced".into(),
+    );
+    b.enqueue_imports(
+        "ada",
+        "bugs",
+        &[envelope(head, json!({})), envelope(comment, json!({}))],
+        Some(&Checkpoint {
+            stream: "last_scan".into(),
+            expected: None,
+            next: "2026-01-01T00:00:00Z".into(),
+        }),
+    )
+    .unwrap();
+    drop(b);
+    let b = Board::open(&path).unwrap();
+    let c = Connector::new(Provider::Github, mock.base.clone(), Some("test".into())).unwrap();
+    let r = c.pull_with_tasks(&b, "ada", "bugs", None, true).unwrap();
+    assert_eq!((r.records, r.threads, r.applied, r.failed), (0, 0, 2, 0));
+    let m = b.find_source("ada", "bugs", "17", None).unwrap().unwrap();
+    let t = m.task.expect("a newly applied backlog root must be a task");
+    assert_eq!((t.state.as_str(), t.by.as_str()), ("ready", "ada"));
+    assert_eq!(m.labels["tag.bug"], "bug");
+    assert!(
+        b.find_source("ada", "bugs", "17", Some("comment:7"))
+            .unwrap()
+            .unwrap()
+            .task
+            .is_none()
+    );
+    assert!(
+        mock.finish()
+            .iter()
+            .all(|(request, _)| request.starts_with("GET "))
+    );
+}
+
+#[test]
+fn github_pull_as_tasks_inherits_provider_labels_and_claim_survives_refetch() {
+    use board_local::automation::{ClaimTarget, claim, get_task};
+    let issue = json!({"number":1,"state":"open","title":"Lost receipt","body":"steps","user":{"id":1},
+        "html_url":"https://github.com/org/proj/issues/1","labels":[{"name":"bug"}]});
+    let comment = json!([{"id":7,"body":"confirmed","user":{"id":2},"html_url":"https://github.com/org/proj/issues/1#issuecomment-7"}]);
+    let fetch = vec![
+        ("GET /repos/org/proj/issues/1 ", 200, issue),
+        ("GET /repos/org/proj/issues/1/comments?", 200, comment),
+    ];
+    let mock = Mock::new([fetch.clone(), fetch].concat());
+    let (b, c) = setup(Provider::Github, "org/proj", &mock);
+    let r = c
+        .pull_with_tasks(&b, "ada", "test", Some("1"), true)
+        .unwrap();
+    assert_eq!((r.records, r.applied, r.failed), (2, 2, 0));
+    let root = b.find_source("ada", "test", "1", None).unwrap().unwrap();
+    assert_eq!(root.task.as_ref().unwrap().state, "ready");
+    assert_eq!(root.labels["state"], "open");
+    assert!(root.labels.contains_key("tag.bug"));
+    let t = claim(
+        &b,
+        "ada/dev",
+        ClaimTarget::Id(root.id),
+        60,
+        &Default::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        c.pull_with_tasks(&b, "ada", "test", Some("1"), true)
+            .unwrap()
+            .applied,
+        0
+    );
+    assert_eq!(get_task(&b, root.id).unwrap().epoch, t.epoch);
+    assert!(
+        b.find_source("ada", "test", "1", Some("comment:7"))
+            .unwrap()
+            .unwrap()
+            .task
+            .is_none()
+    );
+    mock.finish();
+}
+
+#[test]
 fn github_routes_new_issues_and_pulls_separately_without_disconnecting_an_existing_thread() {
     let b = Board::memory().unwrap();
     for (name, kind) in [
@@ -673,46 +779,4 @@ fn slack_unfurls_forwarded_messages_and_never_reads_a_private_link_with_bot_cred
     assert!(r.text.contains("forwarded"));
     assert_eq!(r.links[0].author.as_deref(), Some("Ada"));
     assert_eq!(mock.finish().len(), 4);
-}
-#[test]
-fn explicitly_addressed_policy_response_sends_once_into_the_external_thread_without_creating_a_board_post()
- {
-    use board_local::policy::Rule;
-    let mock = Mock::new(vec![(
-        "POST /chat.postMessage ",
-        200,
-        json!({"ok":true,"ts":"8.000009"}),
-    )]);
-    let (b, c) = setup(Provider::Slack, "C1", &mock);
-    b.set_write_rule("ada",&Rule{name:"triage".into(),priority:0,script:r#"if write.source != () { #{drop:"private routing detail",respond:"Please add a ticket ID"} }"#.into()}).unwrap();
-    b.set_outbound("ada", "test", true).unwrap();
-    let msg = |ts: &str, parent: &str| json!({"event":{"type":"message","user":"U1","channel":"C1","ts":ts,"thread_ts":parent,"text":"no ticket"}});
-    for _ in 0..2 {
-        ingest(
-            &b,
-            "ada",
-            "test",
-            "slack",
-            "one",
-            msg("8.000001", "8.000001"),
-        )
-        .unwrap();
-        assert_eq!(b.drain_source("ada", "test", 5).unwrap(), (0, 0));
-    }
-    assert!(b.messages(&Default::default(), 5).unwrap().is_empty());
-    let sent = c.send_next(&b, "ada", "test").unwrap().unwrap();
-    assert_eq!(sent.state, "done");
-    assert!(sent.result.is_none());
-    ingest(
-        &b,
-        "ada",
-        "test",
-        "slack",
-        "echo",
-        msg("8.000009", "8.000001"),
-    )
-    .unwrap();
-    assert_eq!(b.drain_source("ada", "test", 5).unwrap(), (0, 0));
-    assert!(c.send_next(&b, "ada", "test").unwrap().is_none());
-    assert_eq!(mock.finish()[0].1["text"], "Please add a ticket ID");
 }
