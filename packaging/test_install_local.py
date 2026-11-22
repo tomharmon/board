@@ -17,7 +17,10 @@ class InstallFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="board-install-test-")
         self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
+        real_root = Path(self.tmp.name) / "real"
+        real_root.mkdir()
+        self.root = Path(self.tmp.name) / "linked"
+        self.root.symlink_to(real_root, target_is_directory=True)
         self.home = self.root / "home with spaces"
         self.data = self.home / ".local/share"
         self.binaries = self.root / "target/release"
@@ -120,7 +123,7 @@ class LocalInstallTests(InstallFixture):
                        cwd=self.root, env=env, check=True, capture_output=True, text=True)
         self.assertEqual(log.read_text().splitlines(),
                          ["build", "--locked", "--release", "-p", "board-cli", "-p", "board-ui",
-                          "--bins", "--target-dir", str(self.binaries.parent)])
+                          "--bins", "--target-dir", str(self.binaries.parent.resolve())])
         self.assertTrue((self.home / ".local/bin/board-ui").is_file())
 
     def test_cli_stops_on_build_failure(self):
@@ -170,7 +173,7 @@ class MacLocalInstallTests(InstallFixture):
             binary = app / "Contents/MacOS" / name
             link = self.home / ".local/bin" / name
             self.assertTrue(link.is_symlink())
-            self.assertEqual(link.resolve(), binary)
+            self.assertEqual(link.resolve(), binary.resolve())
             self.assertEqual(binary.read_bytes(), (self.binaries / name).read_bytes())
             self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
         self.assertEqual(sum(cmd[0] == "sips" for cmd in self.commands), 10)
