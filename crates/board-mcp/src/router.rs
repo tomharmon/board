@@ -92,7 +92,7 @@ pub(crate) fn route<'a>(
         && method == Some("notifications/cancelled")
         && let Some(cancelled) = request.pointer("/params/requestId")
     {
-        parked.retain(|p| &p.id != cancelled);
+        parked.retain_mut(|p| &p.id != cancelled || !p.retire());
     }
     let id = id?.clone();
     if parked.iter().any(|p| p.id == id) {

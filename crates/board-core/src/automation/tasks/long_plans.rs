@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 enum Edge {
     Existing(i64),
     Item(usize),
@@ -81,6 +81,47 @@ fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
 }
 pub(super) fn validate(channel: &str, items: &[PlanItem]) -> Result<()> {
     graph(channel, items).map(|_| ())
+}
+
+/// Immutable, checkpointed swarm submissions cannot correct an invalid suffix
+/// after earlier chunks have become claimable. Check the whole input read-only.
+pub(crate) fn preflight(
+    tx: &Transaction<'_>,
+    access: &Access,
+    actor: &str,
+    channel: &str,
+    items: &[PlanItem],
+) -> Result<()> {
+    let g = graph(channel, items)?;
+    let mut external = BTreeSet::new();
+    for (item, edges) in items.iter().zip(g.edges) {
+        let edges: BTreeSet<_> = edges.into_iter().collect();
+        ensure!(
+            edges.len() <= MAX_DIRECT_NEEDS,
+            Invalid.error("invalid_needs", "at most 20 direct prerequisites")
+        );
+        external.extend(edges.into_iter().filter_map(|e| match e {
+            Edge::Existing(id) => Some(id),
+            Edge::Item(_) => None,
+        }));
+        plan_assignee(actor, item.assignee.as_deref())?;
+        let (text, _) = crate::actors::settle(tx, access, actor, None, &item.text)?;
+        crate::validate_post(
+            channel,
+            actor,
+            &text,
+            &PostOptions {
+                labels: item.labels.clone(),
+                ..Default::default()
+            },
+        )?;
+        Board::blocks_on(tx, &text)?;
+    }
+    for id in external {
+        visible_needs(access, tx, &[id])?;
+        require_prerequisite(tx, id)?;
+    }
+    Ok(())
 }
 
 pub(super) fn create(

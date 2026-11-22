@@ -9,6 +9,7 @@ pub struct RunAction {
     pub message_id: i64,
     pub task_id: Option<i64>,
     pub blocked_dependents: i64,
+    pub worker: Option<String>,
 }
 #[derive(Debug, Serialize)]
 pub struct RunChange {
@@ -102,6 +103,7 @@ impl Board {
                             message_id: s.get(4)?,
                             task_id: s.get(5)?,
                             blocked_dependents: s.get(6)?,
+                            worker: s.get(7)?,
                         })
                     },
                 )?,

@@ -80,6 +80,21 @@ fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_thei
     assert_eq!(receipt["handoffs"][0]["status"], "pass");
     assert_eq!(receipt["handoffs"][0]["verified_by"], "ada/verify");
     assert!(receipt["decisions"].as_array().unwrap().is_empty());
+    chat.tool("swarm_stop", json!({"run":"audit"}), true);
+    let create = board(&db)
+        .args([
+            "--worker",
+            "audit/impl",
+            "tasks",
+            "create",
+            "other",
+            "Cannot acquire",
+            "--claim",
+        ])
+        .output()
+        .unwrap();
+    assert!(!create.status.success());
+    assert!(String::from_utf8_lossy(&create.stderr).contains("swarm_stopped"));
 }
 impl Mcp {
     fn open(mut cmd: Command) -> Self {
@@ -214,6 +229,7 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
             "swarm_start",
             "swarm_list",
             "swarm_add",
+            "swarm_plan",
             "swarm_set_limit",
             "swarm_stop",
             "roles_list",

@@ -543,7 +543,7 @@ fn task_command(
                 .map(|c| c.prepare(token.as_deref()))
                 .transpose()?;
             let lease = lease.as_deref().map(secs).transpose()?.unwrap_or(900);
-            let (mut t, _) = create_task_and_claim(
+            let (mut t, _) = create_task_in_assignment(
                 board,
                 actor,
                 target,
@@ -553,6 +553,7 @@ fn task_command(
                     lease_seconds: lease,
                     token,
                 }),
+                binding,
             )?;
             if let Some(cache) = cache {
                 if t.claim_token.is_none()

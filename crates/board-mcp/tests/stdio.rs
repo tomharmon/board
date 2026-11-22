@@ -224,8 +224,9 @@ fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
     );
     let req = json!({"name":"tasks_claim","arguments":{"ready_channel":"pool","wait_seconds":5}});
     let parked = worker.send("tools/call", req.clone());
-    let renewed = worker.call("tasks_renew", json!({"id":mine["id"],"lease_seconds":60}));
+    let renewed = worker.call("tasks_renew", json!({"id":mine["id"],"lease_seconds":3600}));
     assert_eq!(renewed["epoch"], mine["epoch"]);
+    assert!(renewed["lease_until"].as_i64() > mine["lease_until"].as_i64());
     assert!(renewed.get("claim_token").is_none());
     worker.write(
         &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":parked}})
@@ -247,6 +248,91 @@ fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
         worker.call("tasks_complete", json!({"id":task["id"]}))["state"],
         "completed"
     );
+}
+
+#[test]
+fn contended_queue_wait_yields_to_ping_and_never_leases_after_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("contention");
+    let mut c = Client::start(&path, None, None);
+    c.initialize();
+    let task = c.call("tasks_create", json!({"channel":"pool","text":"ready"}));
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let id = c.send(
+        "tools/call",
+        json!({"name":"tasks_claim","arguments":{"ready_channel":"pool","wait_seconds":1}}),
+    );
+    assert_eq!(c.request("ping", json!({}))["result"], json!({}));
+    let reply = c.read();
+    assert_eq!(reply["id"], id);
+    assert_eq!(Client::content(reply, false)["code"], "nothing_ready");
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        c.call("tasks_claim", json!({"ready_channel":"pool"}))["id"],
+        task["id"]
+    );
+}
+
+#[test]
+fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("inbox");
+    let mut boss = Client::start(&path, None, None);
+    boss.initialize();
+    boss.call(
+        "swarm_start",
+        json!({"slug":"release","goal":"Interrupt an inbox"}),
+    );
+    boss.call(
+        "swarm_add",
+        json!({"name":"review","brief":"Wait for notifications"}),
+    );
+    let mut worker = Client::start_session(&path, None, None, Some("release/review"));
+    worker.initialize();
+    let pending = worker.send(
+        "tools/call",
+        json!({"name":"swarm_wait","arguments":{"timeout_seconds":20}}),
+    );
+    worker.request("ping", json!({}));
+    assert_eq!(
+        boss.call("swarm_status", json!({}))["workers"][0]["status"],
+        "waiting"
+    );
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    worker.write(
+        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":pending}})
+            .to_string(),
+    );
+    worker.request("ping", json!({}));
+    writer.execute_batch("ROLLBACK").unwrap();
+    let msg = boss.call("swarm_dm", json!({"to":"review","text":"Still unread"}));
+    let until = Instant::now() + Duration::from_secs(4);
+    while boss.call("swarm_status", json!({}))["workers"][0]["status"] == "waiting" {
+        assert!(Instant::now() < until);
+        thread::sleep(Duration::from_millis(15));
+    }
+    let delivery = worker.call("swarm_wait", json!({"timeout_seconds":0}));
+    assert_eq!(delivery["dms"][0]["id"], msg["id"]);
+    let timeout = worker.send(
+        "tools/call",
+        json!({"name":"swarm_wait","arguments":{"timeout_seconds":1}}),
+    );
+    worker.request("ping", json!({}));
+    assert_eq!(
+        boss.call("swarm_status", json!({}))["workers"][0]["status"],
+        "waiting"
+    );
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let reply = worker.read();
+    assert_eq!(reply["id"], timeout);
+    assert_eq!(
+        Client::content(reply, true),
+        json!({"status":"still_waiting","cursor":delivery["cursor"]})
+    );
+    worker.request("ping", json!({}));
+    writer.execute_batch("ROLLBACK").unwrap();
 }
 
 #[test]
@@ -337,6 +423,19 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
         "swarm_stopped"
     );
     assert_eq!(boss.call("swarm_plan", original_plan), made);
+    assert_eq!(
+        worker.denied(
+            "tasks_create",
+            json!({"channel":"elsewhere","text":"no new lease","claim":true})
+        )["code"],
+        "swarm_stopped"
+    );
+    assert!(
+        boss.call("tasks_list", json!({"channel":"elsewhere","state":"all"}))["tasks"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -361,6 +460,38 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
     let reply = old.request("tools/call", json!({"name":"roles_list","arguments":{}}));
     assert!(reply["result"].get("structuredContent").is_none());
     assert!(Client::content(reply, true).is_array());
+}
+
+#[test]
+fn invalid_suffix_of_a_long_plan_does_not_leave_an_irrecoverable_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut boss = Client::start(&dir.path().join("board"), None, None);
+    boss.initialize();
+    boss.call(
+        "swarm_start",
+        json!({"slug":"release","goal":"Validate all items"}),
+    );
+    let mut items=(0..101).map(|i|json!({"key":format!("i{i}"),"text":"Investigate","output":"reference","acceptance":"Evidence"})).collect::<Vec<_>>();
+    for (field, bad) in [
+        ("assignee", json!("stranger/profile")),
+        (
+            "needs",
+            json!((0..21).map(|i| format!("i{i}")).collect::<Vec<_>>()),
+        ),
+        ("needs", json!([999999])),
+    ] {
+        items[100][field] = bad;
+        boss.denied("swarm_plan", json!({"key":"plan","items":items}));
+        assert_eq!(boss.call("swarm_observe", json!({}))["tasks"], json!({}));
+        items[100].as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(
+        boss.call("swarm_plan", json!({"key":"plan","items":items}))["tasks"]
+            .as_object()
+            .unwrap()
+            .len(),
+        101
+    );
 }
 
 #[test]

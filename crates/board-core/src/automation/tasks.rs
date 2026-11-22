@@ -1,6 +1,7 @@
 use super::{now, write};
 use crate::access::{Access, Action};
 use crate::errors::Kind::{Conflict, Forbidden, Invalid, Missing};
+use crate::swarm::WorkerBinding;
 use crate::{Board, PostOptions};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -256,32 +257,37 @@ fn expire_one(tx: &Transaction<'_>, id: i64, at: i64) -> Result<()> {
     Ok(())
 }
 
+const MAX_DIRECT_NEEDS: usize = 20;
 fn distinct_needs(needs: &[i64]) -> Result<Vec<i64>> {
     let mut seen = std::collections::BTreeSet::new();
     let out: Vec<_> = needs.iter().copied().filter(|n| seen.insert(*n)).collect();
     ensure!(
-        out.len() <= 20,
+        out.len() <= MAX_DIRECT_NEEDS,
         Invalid.error("invalid_needs", "at most 20 direct prerequisites")
     );
     Ok(out)
 }
 fn validate_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
     for &need in needs {
-        let state: Option<String> = tx
-            .query_row("SELECT state FROM tasks WHERE id=?", [need], |r| r.get(0))
-            .optional()?;
-        ensure!(
-            state.as_deref().is_some_and(|s| s != "canceled"),
-            Invalid.error(
-                "invalid_needs",
-                format!("invalid prerequisite: task #{need} is missing or canceled")
-            )
-        );
+        require_prerequisite(tx, need)?;
         ensure!(
             need != id,
             Invalid.error("invalid_needs", "task dependency cycle")
         );
     }
+    Ok(())
+}
+fn require_prerequisite(c: &Connection, need: i64) -> Result<()> {
+    let state: Option<String> = c
+        .query_row("SELECT state FROM tasks WHERE id=?", [need], |r| r.get(0))
+        .optional()?;
+    ensure!(
+        state.as_deref().is_some_and(|s| s != "canceled"),
+        Invalid.error(
+            "invalid_needs",
+            format!("invalid prerequisite: task #{need} is missing or canceled")
+        )
+    );
     Ok(())
 }
 fn replace_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
@@ -390,9 +396,35 @@ pub fn create_task_and_claim(
     assignee: Option<&str>,
     claim: Option<ClaimRequest<'_>>,
 ) -> Result<(Task, bool)> {
-    create_task_inner(board, actor, target, needs, assignee, claim, None)
+    create_task_in_assignment(board, actor, target, needs, assignee, claim, None)
 }
 
+pub fn create_task_in_assignment(
+    board: &Board,
+    actor: &str,
+    target: TaskTarget<'_>,
+    needs: &[i64],
+    assignee: Option<&str>,
+    claim: Option<ClaimRequest<'_>>,
+    worker: Option<&WorkerBinding>,
+) -> Result<(Task, bool)> {
+    create_task_inner(
+        board,
+        actor,
+        target,
+        needs,
+        assignee,
+        Submission::Direct { claim, worker },
+    )
+}
+
+enum Submission<'a> {
+    Direct {
+        claim: Option<ClaimRequest<'a>>,
+        worker: Option<&'a WorkerBinding>,
+    },
+    Draft(&'a str),
+}
 /// Publish exactly the composing actor's saved task entry or leave it intact.
 pub fn create_task_draft(
     board: &Board,
@@ -402,7 +434,15 @@ pub fn create_task_draft(
     assignee: Option<&str>,
     stamp: &str,
 ) -> Result<Task> {
-    Ok(create_task_inner(board, actor, target, needs, assignee, None, Some(stamp))?.0)
+    Ok(create_task_inner(
+        board,
+        actor,
+        target,
+        needs,
+        assignee,
+        Submission::Draft(stamp),
+    )?
+    .0)
 }
 
 fn create_task_inner(
@@ -411,8 +451,7 @@ fn create_task_inner(
     target: TaskTarget<'_>,
     needs: &[i64],
     assignee: Option<&str>,
-    claim: Option<ClaimRequest<'_>>,
-    draft: Option<&str>,
+    submission: Submission<'_>,
 ) -> Result<(Task, bool)> {
     crate::validate_actor(actor)?;
     if let Some(who) = assignee {
@@ -422,6 +461,17 @@ fn create_task_inner(
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
+    let (claim, draft) = match submission {
+        Submission::Direct { claim, worker } => {
+            if claim.is_some()
+                && let Some(w) = worker
+            {
+                board.require_active_worker(&tx, actor, w)?;
+            }
+            (claim, None)
+        }
+        Submission::Draft(stamp) => (None, Some(stamp)),
+    };
     if let Some(stamp) = draft {
         let mismatch = || {
             Conflict.error(
@@ -715,6 +765,21 @@ pub(crate) fn create_plan_guarded(
 }
 
 mod long_plans;
+pub(crate) use long_plans::preflight as preflight_plan;
+
+fn plan_assignee(actor: &str, assignee: Option<&str>) -> Result<Option<String>> {
+    let who = assignee.map(|p| {
+        if p.contains('/') {
+            p.to_owned()
+        } else {
+            format!("{}/{}", person(actor), p)
+        }
+    });
+    if let Some(who) = who.as_deref() {
+        validate_assignee(actor, who)?;
+    }
+    Ok(who)
+}
 
 fn plan_chunk(
     tx: &Transaction<'_>,
@@ -749,16 +814,7 @@ fn plan_chunk(
                 "empty or duplicate task key: {k}"
             );
         }
-        let assignee = item.assignee.as_deref().map(|p| {
-            if p.contains('/') {
-                p.to_owned()
-            } else {
-                format!("{}/{}", actor.split('/').next().unwrap_or(actor), p)
-            }
-        });
-        if let Some(who) = assignee.as_deref() {
-            validate_assignee(actor, who)?;
-        }
+        let assignee = plan_assignee(actor, item.assignee.as_deref())?;
         tx.execute(
             "INSERT INTO tasks(id,owner,assignee,state) VALUES(?,?,?,'ready')",
             params![id, actor, assignee],
@@ -1155,7 +1211,7 @@ pub fn claim_in_assignment(
     request: ClaimRequest<'_>,
     labels: &BTreeMap<String, String>,
     other_owners: &[String],
-    worker: Option<&crate::swarm::WorkerBinding>,
+    worker: Option<&WorkerBinding>,
 ) -> Result<Task> {
     let Some(w) = worker else {
         return claim_with_token(board, actor, target, request, labels, other_owners);
@@ -1257,12 +1313,12 @@ fn validate_queue(
 
 /// An idle parked client should not compete for SQLite's single writer. This
 /// read is only a hint: claim rechecks eligibility and fencing under the lock.
-pub fn ready_for_worker(
+fn ready_for_worker(
     board: &Board,
     actor: &str,
     scope: &str,
     labels: &BTreeMap<String, String>,
-    worker: Option<&crate::swarm::WorkerBinding>,
+    worker: Option<&WorkerBinding>,
 ) -> Result<bool> {
     crate::validate_actor(actor)?;
     validate_queue(scope, labels, &[])?;
@@ -1279,6 +1335,48 @@ pub fn ready_for_worker(
     let ready = ready_candidate(&tx, &access, actor, scope, labels, &[], now())?.is_some();
     tx.commit()?;
     Ok(ready)
+}
+
+/// Try one tick of a parked queue request, never blocking other requests on
+/// the transport. Check the deadline again before committing a winning claim.
+pub fn try_claim_ready_until(
+    board: &Board,
+    actor: &str,
+    scope: &str,
+    labels: &BTreeMap<String, String>,
+    lease_seconds: i64,
+    worker: Option<&WorkerBinding>,
+    deadline: std::time::Instant,
+) -> Result<Task> {
+    board.try_without_lock_wait(|| {
+        if std::time::Instant::now() >= deadline
+            || !ready_for_worker(board, actor, scope, labels, worker)?
+        {
+            return Err(NothingReady.into());
+        }
+        let proof = uuid::Uuid::new_v4().to_string();
+        Ok(claim_checked(
+            board,
+            actor,
+            ClaimTarget::Ready(scope),
+            ClaimRequest {
+                lease_seconds,
+                token: &proof,
+            },
+            labels,
+            &[],
+            |tx| {
+                if std::time::Instant::now() >= deadline {
+                    return Err(NothingReady.into());
+                }
+                if let Some(w) = worker {
+                    board.require_active_worker(tx, actor, w)?;
+                }
+                Ok(())
+            },
+        )?
+        .0)
+    })
 }
 
 fn ready_candidate(

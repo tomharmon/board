@@ -49,12 +49,6 @@ fn claim(b: &Board, ctx: &mut ActorContext, p: &Value) -> Result<Value> {
         .map(serde_json::from_value)
         .transpose()?
         .unwrap_or_default();
-    if let work::ClaimTarget::Ready(scope) = target
-        && p["wait_seconds"].as_u64().unwrap_or(0) > 0
-        && !work::ready_for_worker(b, &ctx.actor, scope, &labels, ctx.worker.as_ref())?
-    {
-        return Err(work::NothingReady.into());
-    }
     let token = uuid::Uuid::new_v4().to_string();
     let task = work::claim_in_assignment(
         b,
@@ -267,7 +261,15 @@ pub(crate) fn execute(
                     lease_seconds: 300,
                     token: &token,
                 });
-            let (t, _) = work::create_task_and_claim(b, actor, target, &needs, s("assignee"), req)?;
+            let (t, _) = work::create_task_in_assignment(
+                b,
+                actor,
+                target,
+                &needs,
+                s("assignee"),
+                req,
+                ctx.worker.as_ref(),
+            )?;
             remember(ctx, t)
         }
         "tasks_claim" => claim(b, ctx, p),

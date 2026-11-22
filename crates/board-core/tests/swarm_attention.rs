@@ -55,6 +55,80 @@ fn registration_is_not_execution_and_activity_does_not_imply_launch_failure() ->
         run.workers[1].launch_error.as_deref(),
         Some("Harness rejected launch")
     );
+    b.swarm_add_worker(
+        "ada",
+        "audit",
+        &SwarmAddWorker {
+            name: "review".into(),
+            brief: "Review".into(),
+            ..Default::default()
+        },
+    )?;
+    b.swarm_launch_failed("ada", "audit", "review", "Harness rejected launch")?;
+    let view = b.swarm_observe("ada", "audit", None, 0, 10)?;
+    assert_eq!(
+        view.actions
+            .iter()
+            .filter_map(|a| a.worker.as_deref())
+            .collect::<Vec<_>>(),
+        ["verify", "review"]
+    );
+    Ok(())
+}
+
+#[test]
+fn completed_input_does_not_block_dependents_while_its_handoff_awaits_review() -> Result<()> {
+    use board_local::automation::{
+        ClaimRequest, TaskAction, TaskTarget, change_task, create_task, create_task_and_claim,
+    };
+    let b = board()?;
+    let opts = PostOptions::default();
+    let target = |text| TaskTarget::New {
+        channel: "swarms/audit",
+        text,
+        options: &opts,
+    };
+    let token = "a-private-test-token";
+    let (a, _) = create_task_and_claim(
+        &b,
+        "ada/impl",
+        target("Produce artifact"),
+        &[],
+        None,
+        Some(ClaimRequest {
+            token,
+            lease_seconds: 60,
+        }),
+    )?;
+    let other = create_task(&b, "ada/impl", target("Other input"), &[], None)?;
+    create_task(
+        &b,
+        "ada/impl",
+        target("Combine both"),
+        &[a.id, other.id],
+        None,
+    )?;
+    post(
+        &b,
+        "ada/impl",
+        "handoff",
+        json!({"revision":{"kind":"sha256","value":"a".repeat(64)},"task":a.id,"summary":"Ready","changes":["artifact"],"to":"verify"}),
+    )?;
+    assert_eq!(
+        b.swarm_observe("ada", "audit", None, 0, 1)?.actions[0].blocked_dependents,
+        1
+    );
+    change_task(
+        &b,
+        a.id,
+        "ada/impl",
+        Some(a.epoch),
+        Some(token),
+        TaskAction::Complete(None),
+    )?;
+    let obs = b.swarm_observe("ada", "audit", None, 0, 1)?;
+    assert_eq!(obs.tasks["waiting"], 1);
+    assert_eq!(obs.actions[0].blocked_dependents, 0);
     Ok(())
 }
 

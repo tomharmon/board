@@ -568,6 +568,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "board-local",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

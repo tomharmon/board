@@ -1,18 +1,28 @@
-use super::{ActorContext, catalog, claim, selected_run};
+use super::{ActorContext, catalog, remember, selected_run};
 use anyhow::{Result, ensure};
-use board_local::{Board, automation::NothingReady, swarm::SwarmInboxWait};
+use board_local::{
+    Board,
+    automation::{NothingReady, try_claim_ready_until},
+    errors::{self, Kind},
+    swarm::SwarmInboxWait,
+};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
 enum Operation<'a> {
     Inbox(SwarmInboxWait<'a>),
-    Queue(Value),
+    Queue {
+        channel: String,
+        labels: std::collections::BTreeMap<String, String>,
+        lease_seconds: i64,
+    },
 }
 
 pub(crate) struct Parked<'a> {
     pub id: Value,
     deadline: Instant,
     pub next_poll: Instant,
+    pub cancelled: bool,
     operation: Operation<'a>,
 }
 
@@ -44,7 +54,16 @@ impl<'a> Parked<'a> {
                     "only a ready queue can wait"
                 );
                 (
-                    Operation::Queue(args.clone()),
+                    Operation::Queue {
+                        channel: args["ready_channel"].as_str().unwrap().into(),
+                        labels: args
+                            .get("labels")
+                            .cloned()
+                            .map(serde_json::from_value)
+                            .transpose()?
+                            .unwrap_or_default(),
+                        lease_seconds: args["lease_seconds"].as_i64().unwrap_or(300),
+                    },
                     args["wait_seconds"].as_u64().unwrap(),
                 )
             }
@@ -56,6 +75,7 @@ impl<'a> Parked<'a> {
             operation,
             deadline: now + Duration::from_secs(seconds),
             next_poll: now,
+            cancelled: false,
         }))
     }
 
@@ -67,12 +87,46 @@ impl<'a> Parked<'a> {
         let now = Instant::now();
         let expired = now >= self.deadline;
         self.next_poll = (now + Duration::from_millis(200)).min(self.deadline);
+        let result = match &mut self.operation {
+            Operation::Inbox(wait) => wait
+                .try_poll(expired)
+                .and_then(|v| v.map(super::value).transpose()),
+            Operation::Queue {
+                channel,
+                labels,
+                lease_seconds,
+            } => try_claim_ready_until(
+                board,
+                &ctx.actor,
+                channel,
+                labels,
+                *lease_seconds,
+                ctx.worker.as_ref(),
+                self.deadline,
+            )
+            .and_then(|t| remember(ctx, t))
+            .map(Some),
+        };
+        match result {
+            Err(e)
+                if (e.is::<NothingReady>() || errors::classify(&e).0 == Kind::Busy) && !expired =>
+            {
+                Ok(None)
+            }
+            other => other,
+        }
+    }
+
+    /// Cancellation never acknowledges an inbox. If a writer is contending,
+    /// retire the registration on a later tick without blocking stdin.
+    pub fn retire(&mut self) -> bool {
+        self.cancelled = true;
+        self.next_poll = Instant::now() + Duration::from_millis(200);
         match &mut self.operation {
-            Operation::Inbox(wait) => wait.poll(expired, || Ok(()))?.map(super::value).transpose(),
-            Operation::Queue(args) => match claim(board, ctx, args) {
-                Err(e) if e.is::<NothingReady>() && !expired => Ok(None),
-                result => result.map(Some),
-            },
+            Operation::Inbox(wait) => !wait
+                .try_cancel()
+                .is_err_and(|e| errors::classify(&e).0 == Kind::Busy),
+            Operation::Queue { .. } => true,
         }
     }
 }

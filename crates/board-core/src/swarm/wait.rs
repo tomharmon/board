@@ -115,11 +115,11 @@ impl Board {
         run: &str,
         after: Option<i64>,
     ) -> Result<SwarmInboxWait<'_>> {
-        let (target, last) = self.swarm_wait_target(actor, run)?;
+        let (id, target, last) = self.resolve_inbox(actor, run)?;
         Ok(SwarmInboxWait {
             board: self,
             actor: actor.into(),
-            run: run.into(),
+            run: format!("#{id}"),
             after: after.unwrap_or(last),
             target,
             pid: std::process::id(),
@@ -128,6 +128,19 @@ impl Board {
     }
 }
 impl SwarmInboxWait<'_> {
+    pub fn try_poll(&mut self, timed_out: bool) -> Result<Option<SwarmWaitOutcome>> {
+        let board = self.board;
+        match board.try_without_lock_wait(|| self.poll(timed_out, || Ok(()))) {
+            Err(e) if timed_out && crate::errors::classify(&e).0 == crate::errors::Kind::Busy => {
+                Ok(Some(SwarmWaitOutcome::StillWaiting { cursor: self.after }))
+            }
+            result => result,
+        }
+    }
+    pub fn try_cancel(&mut self) -> Result<()> {
+        let board = self.board;
+        board.try_without_lock_wait(|| self.leave(None))
+    }
     pub fn poll(
         &mut self,
         timed_out: bool,
@@ -210,6 +223,10 @@ impl Board {
         Ok((a, r))
     }
     pub fn swarm_wait_target(&self, actor: &str, run: &str) -> Result<(String, i64)> {
+        let (_, target, last) = self.resolve_inbox(actor, run)?;
+        Ok((target, last))
+    }
+    fn resolve_inbox(&self, actor: &str, run: &str) -> Result<(i64, String, i64)> {
         let tx = self.conn.unchecked_transaction()?;
         let (_, r) = self.swarm_waiting_on(&tx, actor, run, Action::Read)?;
         let out = if r.operator(actor) {
@@ -228,7 +245,7 @@ impl Board {
             (w.name.clone(), w.last_read_cursor)
         };
         tx.commit()?;
-        Ok(out)
+        Ok((r.id, out.0, out.1))
     }
     pub fn swarm_poll_wait(
         &self,

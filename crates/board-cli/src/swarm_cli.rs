@@ -488,8 +488,16 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                 )];
                 lines.extend(v.actions.iter().map(|a| {
                     format!(
-                        "#{} {} -> {}: {} ({} waiting)",
-                        a.message_id, a.kind, a.assigned_to, a.summary, a.blocked_dependents
+                        "#{} {}{} -> {}: {} ({} waiting)",
+                        a.message_id,
+                        a.kind,
+                        a.worker
+                            .as_ref()
+                            .map(|w| format!(" @{w}"))
+                            .unwrap_or_default(),
+                        a.assigned_to,
+                        a.summary,
+                        a.blocked_dependents
                     )
                 }));
                 lines.join("\n")

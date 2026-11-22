@@ -430,6 +430,14 @@ impl Board {
             request_avatar: None,
         })
     }
+    /// Cooperative transports must yield a contended writer to the request
+    /// loop instead of sleeping inside SQLite's normal busy handler.
+    pub(crate) fn try_without_lock_wait<T>(&self, op: impl FnOnce() -> Result<T>) -> Result<T> {
+        self.conn.busy_timeout(Duration::ZERO)?;
+        let result = op();
+        self.conn.busy_timeout(BUSY_TIMEOUT)?;
+        result
+    }
     pub(crate) fn write<T>(&self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
         if let Some((actor, avatar)) = &self.request_avatar {

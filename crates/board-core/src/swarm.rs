@@ -5,7 +5,7 @@ mod coordination;
 mod materialize;
 mod observe;
 mod plan;
-pub use observe::SwarmObservation;
+pub use observe::{RunAction, RunChange, SwarmObservation};
 pub use plan::{PlanReceipt, RunPolicy, SwarmPlanItem};
 mod wait;
 use crate::{

@@ -78,7 +78,8 @@ impl Board {
             (1..=4096).contains(&items.len()),
             Invalid.error("invalid_plan", "a plan requires 1..4096 items")
         );
-        let (_, r) = self.swarm_record(&self.conn, actor, run, Action::Post)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (access, r) = self.swarm_record(&tx, actor, run, Action::Post)?;
         r.control()?;
         let mut tasks = Vec::with_capacity(items.len());
         for i in items {
@@ -123,10 +124,22 @@ impl Board {
         }
         let digest = Sha256::digest(serde_json::to_vec(items)?);
         let batch = format!("swarm-plan:{}:{key}", r.id);
+        if tasks.len() > 100
+            && !tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM swarm_plans WHERE run_id=? AND key=?)",
+                params![r.id, key],
+                |s| s.get::<_, bool>(0),
+            )?
+        {
+            r.active()?;
+            crate::automation::preflight_plan(&tx, &access, actor, &r.channel, &tasks)?;
+        }
+        tx.commit()?;
+        let pinned = format!("#{}", r.id);
         let (made, _) = create_plan_guarded(self, actor, &r.channel, &tasks, Some(&batch), |tx| {
             // Recheck on every checkpoint: a stop, credential revocation, or competing
             // submission can land between chunks of a long plan.
-            let (_, r) = self.swarm_record(tx, actor, run, Action::Post)?;
+            let (_, r) = self.swarm_record(tx, actor, &pinned, Action::Post)?;
             r.control()?;
             if r.status == "active" {
                 tx.execute(

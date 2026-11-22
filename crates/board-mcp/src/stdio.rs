@@ -66,14 +66,20 @@ pub fn serve_stdio_bound(board: &Board, actor: &str, selector: Option<&str>) -> 
         }
         let mut i = 0;
         while i < pending.len() {
-            if pending[i].next_poll <= Instant::now()
-                && let Some(reply) = router::poll(board, &mut session, &mut pending[i])
-            {
-                send_reply(&mut out, &reply)?;
-                pending.swap_remove(i);
-            } else {
-                i += 1;
+            let wait = &mut pending[i];
+            if wait.next_poll <= Instant::now() {
+                if !wait.cancelled
+                    && let Some(reply) = router::poll(board, &mut session, wait)
+                {
+                    send_reply(&mut out, &reply)?;
+                    wait.cancelled = true;
+                }
+                if wait.cancelled && wait.retire() {
+                    pending.swap_remove(i);
+                    continue;
+                }
             }
+            i += 1;
         }
     }
     Ok(())
