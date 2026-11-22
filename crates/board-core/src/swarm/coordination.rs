@@ -410,7 +410,7 @@ impl Board {
     }
     pub fn swarm_check_in(&self, actor: &str, run: &str, target: &str) -> Result<()> {
         self.write(|tx| {
-            let (_,r)=self.swarm_on(tx,actor,run,Action::Post)?; r.active()?;
+            let (_,r)=self.swarm_waiting_on(tx,actor,run,Action::Post)?; r.active()?;
             let w=r.workers.iter().find(|w|w.name==target && w.actor==actor).context(Forbidden.error("wrong_swarm_actor","a worker must check itself in"))?;
             ensure!(!matches!(w.status.as_str(),"done"|"stopped"), Conflict.error("worker_stopped","worker has finished"));
             let time=crate::now();

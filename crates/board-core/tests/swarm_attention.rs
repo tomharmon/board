@@ -94,6 +94,19 @@ fn receipt_binds_checks_to_the_exact_handoff_and_resolves_explicit_decisions() -
     )?;
     let receipt = b.swarm_receipt("ada", "audit")?;
     assert_eq!(receipt.handoffs[0].status, "not-run");
+    let snapshot = b.swarm_observe("ada", "audit", None, 0, 20)?;
+    assert!(
+        snapshot
+            .actions
+            .iter()
+            .any(|a| a.kind == "verification" && a.assigned_to == "ada/impl")
+    );
+    assert!(
+        snapshot
+            .actions
+            .iter()
+            .any(|a| a.message_id == decision && a.assigned_to == "ada")
+    );
     assert_eq!(receipt.decisions.len(), 1);
     assert_eq!(
         b.attention("ada")?
@@ -125,6 +138,15 @@ fn receipt_binds_checks_to_the_exact_handoff_and_resolves_explicit_decisions() -
         json!({"revision":{"kind":"sha256","value":"b".repeat(64)},"summary":"Follow-up change","changes":["fields.rs"],"to":"verify"}),
     )?;
     let receipt = b.swarm_receipt("ada", "audit")?;
+    let current = b.swarm_observe("ada", "audit", None, 0, 20)?;
+    assert_eq!(current.actions.len(), 1);
+    assert_eq!(
+        (
+            current.actions[0].message_id,
+            current.actions[0].kind.as_str()
+        ),
+        (newer, "awaiting_verification")
+    );
     assert!(
         receipt
             .handoffs
@@ -259,6 +281,54 @@ fn attention_and_receipts_respect_channel_access() -> Result<()> {
     guest.bind_token(&token)?;
     assert!(guest.attention("guest")?.is_empty());
     assert!(guest.swarm_receipt("guest", "private").is_err());
+    assert!(guest.swarm_observe("guest", "private", None, 0, 2).is_err());
+    let grant = owner.set_grant("ada", None, "guest", &Rules::parse("swarms/private=read")?)?;
+    assert_eq!(
+        guest.swarm_observe("guest", "private", None, 0, 2)?.actions[0].assigned_to,
+        "guest"
+    );
+    owner.revoke_grant("ada", grant.id)?;
+    assert!(
+        guest
+            .swarm_observe("guest", "private", Some(0), 0, 2)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn v17_policy_upgrade_preserves_role_customization_and_uses_defaults_for_existing_runs()
+-> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("previous");
+    let b = Board::open(&path)?;
+    b.swarm_start(
+        "ada",
+        &SwarmStart {
+            slug: Some("old".into()),
+            goal: "Preserve history".into(),
+            ..Default::default()
+        },
+    )?;
+    b.role_detach_skill("implementer", "board-implementer")?;
+    let head = b.cursor()?;
+    drop(b);
+    rusqlite::Connection::open(&path)?.execute_batch(
+        "DROP TABLE swarm_plans; DROP TABLE swarm_policy; PRAGMA user_version=17;",
+    )?;
+    let b = Board::open(&path)?;
+    assert!(
+        !b.role_show("implementer")?
+            .skills
+            .iter()
+            .any(|s| s == "board-implementer")
+    );
+    assert_eq!(
+        b.swarm_observe("ada", "old", None, 0, 1)?
+            .available_capacity,
+        8
+    );
+    assert_eq!(b.cursor()?, head);
     Ok(())
 }
 

@@ -945,7 +945,7 @@ fn run(mut args: Args) -> Result<()> {
                 }
             }
         },
-        Command::Automation(cmd) => cmd.run(&mut board, &actor, js, &path)?,
+        Command::Automation(cmd) => cmd.run(&mut board, &actor, js, &path, binding.as_ref())?,
     }
     Ok(())
 }

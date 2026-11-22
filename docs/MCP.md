@@ -33,10 +33,15 @@ The registered connection is for the coordinator chat, not its subagents. Pass e
 ## Tool groups
 
 ### Swarms & roles
-- `swarm_start` — Start a new swarm run with a goal and optional safety limits.
+- `swarm_start` — Record a goal and optional limits: `max_active` (1..128, default 8), `retry_budget` (extra attempts, 0..1000, default 0), and the separate peer notification limit. The chat harness enforces launch and retry policy; Board never launches agents.
+- `swarm_plan` — Coordinator only. Submit a named dependency graph in the run channel; recover the same name-to-task-ID map by replaying the same key and items. See [Pool workflow](#pool-workflow).
+- `swarm_observe` — One run-scoped snapshot: worker and task counts, policy and available slots, paged current exceptions, and compact changes. No roster, private DMs, or transcript.
 - `swarm_list` — List visible swarm runs, newest first.
 - `swarm_add` — Register a named worker with a role preset and brief; returns the resolved prompt and materialized skills directory.
 - `swarm_status` — Inspect the run state, roster, and visible activity count. Use `swarm_read` for the actual conversation.
+- `swarm_check_in` — A worker reports starting. Pass `compact: true` to receive only run, worker, actor, and status; omit it for the original roster result.
+- `swarm_launch_failed` — Record a launch failure the harness actually observed. Silence is not a launch failure.
+- `swarm_receipt` / `swarm_decide` / `board_attention` — Inspect evidence tied to exact revisions, answer an explicit decision request, or inspect board-wide operator attention.
 - `swarm_set_limit` — Adjust a run's peer notification budget (coordinator or owner only).
 - `swarm_post` — Post a public message to the swarm channel (`@name` notifies that teammate; no `--to` field).
 - `swarm_dm` — Send a direct message to a specific worker (`to` required) and notify them.
@@ -52,16 +57,43 @@ The registered connection is for the coordinator chat, not its subagents. Pass e
 - `board_channels` — List channels.
 
 ### Tasks
-- `tasks_list` — List open, claimed, or completed tasks with channel/label/assignee filters.
+- `tasks_list` — List tasks with channel/label/assignee filters. Pass `next_after` as `after` until it is null. This is an exclusive task ID, **not** the response's snapshot event `cursor`.
 - `tasks_create` — Create a single task. Use `needs` for existing prerequisite task IDs; `claim: true` creates and leases it atomically.
 - `tasks_claim` / `tasks_complete` / `tasks_fail` / `tasks_block` — Claim and settle work with fenced leases.
+- `tasks_renew` / `tasks_release` — Extend a live lease (`id`, optional `lease_seconds`) or return it to the queue (`id`), on the same connection that claimed it.
+
+## Pool workflow
+
+Start a run and register the worker identities your chat will launch. Pass the following arguments to `swarm_plan` (CLI: `board swarm plan --run example --key report --file items.json`, where the file contains just the `items` array):
+
+```json
+{
+  "run": "example", "key": "report",
+  "items": [
+    {"key": "inspect", "text": "Investigate caching", "acceptance": "Cite measured hit rates", "output": "Evidence message ID", "labels": {"pool": "research"}},
+    {"key": "report", "text": "Synthesize findings", "needs": ["inspect"], "acceptance": "Trace the conclusion to the measurement", "output": "Report digest", "labels": {"pool": "synthesis"}}
+  ]
+}
+```
+
+The result maps each key to its ordinary Board task ID under `tasks`. Items can name later items, use an existing readable task ID as a prerequisite, or set `assignee`. There are at most 20 direct prerequisites per item and 4,096 items per submission. Up to 100 items commit together; larger plans checkpoint in chunks. Interrupted large plans may already have claimable items: retry the **identical** submission, not a new key. A changed payload under the same plan key conflicts. Roots carry `swarm.plan` and `swarm.item` labels; plan items are local-only, not connector publishes.
+
+From a bound research worker, call `tasks_claim` with `{"ready_channel":"swarms/example","labels":{"pool":"research"},"wait_seconds":30}`. One eligible worker gets the task, even if several are waiting. Read prerequisite results with `board_read(target: ID)`; renew before `lease_until`. Finish with a durable output reference or release unfinished work. If a lease is lost, stop that attempt. Waiting on the work queue does not consume a mention or DM.
+
+Call `swarm_observe(run)` when starting or resuming the coordinator. The default page size is 20; `limit` (1..100) independently bounds both pages:
+
+- `actions` are **current**, not historical. They name the responsible actor, source message, linked in-run task, and number of directly dependent in-run tasks currently waiting. They include open decisions, blocked/failed tasks, observed launch failures, and handoffs awaiting or failing verification. Pass `next_action_after` as `action_after` for the next page. Refresh from the first page to learn what is still unresolved.
+- `changes` initially shows recent events in chronological order. With explicit `after`, it pages forward from that cursor without skipping. To read the entire run use `after: 0`; use `has_more` and the last delivered `cursor` to continue. Empty pages leave the cursor unchanged. Keep the cursor only after processing the page.
+- Counts cover tasks in the run channel; an expired, not-yet-reclaimed lease is `expired`, not evidence of a crashed worker. Other queues and their dependent counts remain separate. Available capacity subtracts checked-in working/waiting workers, not unknown harness processes. Account for in-flight launches in the chat. Policy is guidance for the coordinator, not OS process enforcement.
 
 ## Arguments and sessions
 
-Initialize the session, then call `tools/list` for the complete argument schemas. Unknown arguments are rejected. Labels are JSON objects mapping strings to strings. A structured swarm post takes both `schema` (for example, `verdict@1`) and `schema_data`; invalid blocks never post. `board_read.target` accepts a message ID for a whole thread or a channel name for filtered history. Domain errors are returned as MCP tool errors with a JSON `code` and `message`.
+Initialize the session, then call `tools/list` for the argument schemas. Unknown arguments are rejected. Labels are JSON objects mapping strings to strings. A structured swarm post takes both `schema` and `schema_data`; the catalog describes the installed built-in handoff, verification and decision shapes. Use `idempotency_key` for retryable evidence. Invalid blocks never post. `board_read.target` accepts a message ID for a whole thread or a channel name for filtered history. Domain errors include a JSON `code` and `message`. For negotiated protocol versions from 2025-06-18, results also have `structuredContent`; list-only results use an `items` object wrapper there. The original JSON text (including bare lists) remains available.
 
 For tools accepting `run`, a JSON integer always means a run ID. A string selects a slug first; `"#1"` explicitly selects ID 1 even when a different run has the slug `"1"`. Without the argument the server uses `BOARD_SWARM_RUN`.
 
-Task claims are fenced and exclusive. `tasks_claim` takes exactly one of `id` or `ready_channel`; its lease lasts 30 to 3600 seconds (default 300). A winning MCP session keeps the proof in memory, never in public tool output. Complete, fail, or block the work **in the same server session** before expiry. After a process dies, another session must wait for expiry and claim again; a sibling session with the very same profile cannot settle that lease. Use the CLI task commands for longer work that needs renewal.
+Task claims are fenced and exclusive. `tasks_claim` takes exactly one of `id` or `ready_channel`; its lease lasts 30 to 3600 seconds (default 300). Only a queue can specify `wait_seconds` (0..300, default 0); timeout is the ordinary `nothing_ready` tool error, not run completion. A winning MCP session keeps the proof in memory, never in tool output, including renewal. Renew or settle **in the same server session** before expiry. After a process dies another session must wait for expiry and claim again, even with the same profile. A bound worker cannot acquire new claims after its run stops.
+
+A connection may park one inbox wait and one ready-queue wait concurrently. Ping, cancellation and other calls (including renewal) remain available on that connection. Cancel an outstanding request with `notifications/cancelled` and its original `requestId`. Canceling a parked inbox wait leaves unread messages available. A claim already committed before cancellation remains subject to its normal lease. EOF drops outstanding waits; there is no background runner.
 
 `swarm_wait` accepts `timeout_seconds` from 0 to 300 (default 90), returning `messages`, `still_waiting`, or `stopped` plus a cursor. Use one local MCP session per independently working actor. A public post does not take a `to` argument; to notify just a teammate, use a mention, or send an explicit DM. Run/worker registration stores Board state and materializes instructions, but it never starts an agent process or invokes an AI API. The MCP transport uses standard input/output; it starts no listener. Any optional REST service is separate.

@@ -1,5 +1,9 @@
 # Swarm verification
 
+## Restartable worker pool
+
+Run `cargo build --locked --offline -p board-cli`, then `python3 scripts/swarm_pool.py --bin target/debug/board`. This disposable, model-free stdio exercise uses eight worker identities and real 30-second leases. It submits 100 investigations, ten dependent summaries and a final synthesis, kills a worker, leaves a second worker holding a stale proof, and restarts the coordinator during execution. It checks identical plan IDs on replay, a pending decision in a one-entry observation, 111 unique accepted settlements, takeover at higher epochs, rejection of the stale proof, and independent verification of the final sum (5050). Board itself starts no worker processes.
+
 ## Two native agents, one local board
 
 A Codex chat registered two native subagents on a disposable SQLite board. The installed `board-swarm` skill came from the built CLI, using a temporary Codex skills directory. Each agent received the prompt, skill directory and environment returned by its own `board swarm add`. Board did not launch either agent. The sample was a Rust function that should return the last Unicode-whitespace-delimited field without allocation.

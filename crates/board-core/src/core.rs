@@ -276,7 +276,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 17;
+const DB_VERSION: i64 = 18;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -396,27 +396,30 @@ impl Board {
                 request_avatar: None,
             });
         }
-        tx.execute_batch(SCHEMA)?;
-        crate::schemas::init(&tx)?;
-        crate::automation::init_automation(&tx)?;
-        tx.execute_batch(REPLAY_KEYS)?;
-        crate::access::init(&tx)?;
-        crate::sources::init(&tx)?;
-        tx.execute_batch(
-            "DROP TABLE IF EXISTS write_rules;
+        if locked_version < 17 {
+            tx.execute_batch(SCHEMA)?;
+            crate::schemas::init(&tx)?;
+            crate::automation::init_automation(&tx)?;
+            tx.execute_batch(REPLAY_KEYS)?;
+            crate::access::init(&tx)?;
+            crate::sources::init(&tx)?;
+            tx.execute_batch(
+                "DROP TABLE IF EXISTS write_rules;
             DROP TABLE IF EXISTS rule_internal;
             DROP TABLE IF EXISTS sync_renderers;
             DROP TABLE IF EXISTS source_renderers;",
-        )?;
-        crate::roles::init(&tx)?;
-        crate::swarm::init(&tx)?;
-        crate::presence::init(&tx)?;
-        crate::files::init(&tx)?;
-        crate::actors::init(&tx)?;
-        crate::projections::init(&tx)?;
-        if locked_version < 14 {
-            crate::schemas::migrate_imported_blocks(&tx)?;
+            )?;
+            crate::roles::init(&tx)?;
+            crate::swarm::init(&tx)?;
+            crate::presence::init(&tx)?;
+            crate::files::init(&tx)?;
+            crate::actors::init(&tx)?;
+            crate::projections::init(&tx)?;
+            if locked_version < 14 {
+                crate::schemas::migrate_imported_blocks(&tx)?;
+            }
         }
+        tx.execute_batch(include_str!("swarm/orchestration.sql"))?;
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         tx.pragma_update(None, "user_version", DB_VERSION)?;
         tx.commit()?;

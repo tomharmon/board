@@ -49,6 +49,11 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      - name: Exercise a restartable MCP worker pool
+        run: |
+          cargo build --locked -p board-cli
+          python3 scripts/swarm_pool.py --bin target/debug/board
+
   mac-local-install:
     runs-on: macos-latest
     steps:

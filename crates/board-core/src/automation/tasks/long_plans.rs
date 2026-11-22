@@ -89,6 +89,7 @@ pub(super) fn create(
     channel: &str,
     items: &[PlanItem],
     key: &str,
+    guard: &impl Fn(&Transaction<'_>) -> Result<()>,
 ) -> Result<(Vec<Task>, bool)> {
     crate::core::validate_client_key(key)?;
     let g = graph(channel, items)?;
@@ -98,6 +99,7 @@ pub(super) fn create(
     loop {
         // Commit the checkpoint with the messages. A crash cannot leave a chunk unaccounted for.
         let tx = write(&board.conn)?;
+        guard(&tx)?;
         let a = board.access_on(&tx)?;
         a.actor(actor)?;
         crate::automation::authorize_callback_key(&tx, actor, key)?;

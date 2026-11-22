@@ -118,7 +118,7 @@ fn real_v14_fixture_upgrades_existing_data_and_retires_executable_tables() -> Re
     let check = rusqlite::Connection::open(&path)?;
     assert_eq!(
         check.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        17
+        18
     );
     assert_eq!(check.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('write_rules','rule_internal','sync_renderers','source_renderers','sync_render_labels')",[],|r|r.get::<_,i64>(0))?,0);
     assert_eq!(

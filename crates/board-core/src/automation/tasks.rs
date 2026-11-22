@@ -650,16 +650,28 @@ pub fn create_plan_with_outcome(
     items: &[PlanItem],
     key: Option<&str>,
 ) -> Result<(Vec<Task>, bool)> {
+    create_plan_guarded(board, actor, channel, items, key, |_| Ok(()))
+}
+
+pub(crate) fn create_plan_guarded(
+    board: &Board,
+    actor: &str,
+    channel: &str,
+    items: &[PlanItem],
+    key: Option<&str>,
+    guard: impl Fn(&Transaction<'_>) -> Result<()>,
+) -> Result<(Vec<Task>, bool)> {
     crate::validate_actor(actor)?;
     ensure!(!items.is_empty(), "plan is empty");
     if items.len() > 100 {
         let key = key
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        return long_plans::create(board, actor, channel, items, &key)
+        return long_plans::create(board, actor, channel, items, &key, &guard)
             .with_context(|| format!("plan key {key}; retry with the same key to resume"));
     }
     let tx = write(&board.conn)?;
+    guard(&tx)?;
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
     if let Some(k) = key {
@@ -675,7 +687,7 @@ pub fn create_plan_with_outcome(
     {
         if receipt.actor == actor && receipt.fingerprint == fingerprint(("unfinished", channel))? {
             tx.commit()?;
-            return long_plans::create(board, actor, channel, items, key)
+            return long_plans::create(board, actor, channel, items, key, &guard)
                 .with_context(|| format!("plan key {key}; retry with the same key to resume"));
         }
         ensure!(
@@ -1125,6 +1137,46 @@ pub fn claim_while(
     other_owners: &[String],
     listening: impl Fn() -> bool,
 ) -> Result<(Task, bool)> {
+    claim_checked(board, actor, target, request, labels, other_owners, |_| {
+        if listening() {
+            Ok(())
+        } else {
+            Err(NothingReady.into())
+        }
+    })
+}
+
+/// Check the selected worker's run in the *claim transaction*. A stopped run
+/// cannot lose a race to a parked client, even for a queue outside its channel.
+pub fn claim_in_assignment(
+    board: &Board,
+    actor: &str,
+    target: ClaimTarget<'_>,
+    request: ClaimRequest<'_>,
+    labels: &BTreeMap<String, String>,
+    other_owners: &[String],
+    worker: Option<&crate::swarm::WorkerBinding>,
+) -> Result<Task> {
+    let Some(w) = worker else {
+        return claim_with_token(board, actor, target, request, labels, other_owners);
+    };
+    Ok(
+        claim_checked(board, actor, target, request, labels, other_owners, |tx| {
+            board.require_active_worker(tx, actor, w)
+        })?
+        .0,
+    )
+}
+
+fn claim_checked(
+    board: &Board,
+    actor: &str,
+    target: ClaimTarget<'_>,
+    request: ClaimRequest<'_>,
+    labels: &BTreeMap<String, String>,
+    other_owners: &[String],
+    check: impl Fn(&Transaction<'_>) -> Result<()>,
+) -> Result<(Task, bool)> {
     crate::validate_actor(actor)?;
     validate_claim(&request)?;
     match target {
@@ -1132,31 +1184,10 @@ pub fn claim_while(
             labels.is_empty() && other_owners.is_empty(),
             "queue filters require a channel"
         ),
-        ClaimTarget::Ready(scope) => {
-            ensure!(
-                other_owners.len() <= 32,
-                "at most 32 other owners can be named"
-            );
-            crate::validate_channel(scope.strip_suffix('/').unwrap_or(scope))?;
-            for (key, value) in labels {
-                ensure!(
-                    !key.is_empty() && !value.is_empty() && !value.contains('|'),
-                    "ready claims require one exact key=value per label: {key}={value}"
-                );
-            }
-            for owner in other_owners {
-                crate::validate_actor(owner)?;
-                ensure!(
-                    !owner.contains('/'),
-                    "queue owners must name a person, not a profile"
-                );
-            }
-        }
+        ClaimTarget::Ready(scope) => validate_queue(scope, labels, other_owners)?,
     }
     let tx = write(&board.conn)?;
-    if !listening() {
-        return Err(NothingReady.into());
-    }
+    check(&tx)?;
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
@@ -1182,40 +1213,8 @@ pub fn claim_while(
     let id = match target {
         ClaimTarget::Id(id) => id,
         ClaimTarget::Ready(scope) => {
-            if labels.get("board.task").is_some_and(|s| s != "ready") {
-                return Err(NothingReady.into());
-            }
-            let mut eligible_labels = labels.clone();
-            eligible_labels.remove("board.task");
-            let (mut predicate, mut bind) = crate::read::predicate(&crate::Filter {
-                channel: Some(scope.to_owned()),
-                labels: eligible_labels,
-                ..Default::default()
-            });
-            if let Some(ch) = access.channels(&tx, Action::Label)? {
-                predicate.push_str(" AND m.channel IN (SELECT value FROM json_each(?))");
-                bind.push(serde_json::to_string(&ch)?.into());
-            }
-            // Only the owner's own profiles may receive a directed task, including rows
-            // left by older databases. Foreign pool work always needs the worker's opt-in.
-            let sql = format!("WITH ready AS (
-                SELECT id,assignee,substr(owner,1,instr(owner||'/','/')-1) AS person FROM tasks WHERE state='ready' OR (state='claimed' AND lease_until<=?)
-              ) SELECT q.id FROM ready q JOIN messages m ON m.id=q.id WHERE {predicate} AND (
-                (q.person=? AND (q.assignee IS NULL OR q.assignee=?)) OR
-                (q.assignee IS NULL AND q.person IN (SELECT value FROM json_each(?))))
-              ORDER BY (q.assignee IS NOT NULL) DESC,q.id LIMIT 1");
-            bind.insert(0, at.into());
-            bind.push(person(actor).to_owned().into());
-            bind.push(actor.to_owned().into());
-            bind.push(serde_json::to_string(other_owners)?.into());
-            let found = tx
-                .query_row(&sql, rusqlite::params_from_iter(bind), |r| r.get(0))
-                .optional()?;
-            let Some(found) = found else {
-                tx.commit()?;
-                return Err(NothingReady.into());
-            };
-            found
+            ready_candidate(&tx, &access, actor, scope, labels, other_owners, at)?
+                .ok_or(NothingReady)?
         }
     };
     expire_one(&tx, id, at)?;
@@ -1225,11 +1224,101 @@ pub fn claim_while(
         &tx,
         acquire(&tx, actor, &t, &request, &proof_target, at)?,
     )?;
-    if !listening() {
-        return Err(NothingReady.into());
-    }
+    check(&tx)?;
     tx.commit()?;
     Ok((t, true))
+}
+
+fn validate_queue(
+    scope: &str,
+    labels: &BTreeMap<String, String>,
+    other_owners: &[String],
+) -> Result<()> {
+    ensure!(
+        other_owners.len() <= 32,
+        "at most 32 other owners can be named"
+    );
+    crate::validate_channel(scope.strip_suffix('/').unwrap_or(scope))?;
+    for (key, value) in labels {
+        ensure!(
+            !key.is_empty() && !value.is_empty() && !value.contains('|'),
+            "ready claims require one exact key=value per label: {key}={value}"
+        );
+    }
+    for owner in other_owners {
+        crate::validate_actor(owner)?;
+        ensure!(
+            !owner.contains('/'),
+            "queue owners must name a person, not a profile"
+        );
+    }
+    Ok(())
+}
+
+/// An idle parked client should not compete for SQLite's single writer. This
+/// read is only a hint: claim rechecks eligibility and fencing under the lock.
+pub fn ready_for_worker(
+    board: &Board,
+    actor: &str,
+    scope: &str,
+    labels: &BTreeMap<String, String>,
+    worker: Option<&crate::swarm::WorkerBinding>,
+) -> Result<bool> {
+    crate::validate_actor(actor)?;
+    validate_queue(scope, labels, &[])?;
+    let tx = board.conn.unchecked_transaction()?;
+    let access = board.access_on(&tx)?;
+    access.actor(actor)?;
+    ensure!(
+        access.anywhere(Action::Label, Some(scope)),
+        Forbidden.error("missing_permission", "no claim permission in this scope")
+    );
+    if let Some(w) = worker {
+        board.require_active_worker(&tx, actor, w)?;
+    }
+    let ready = ready_candidate(&tx, &access, actor, scope, labels, &[], now())?.is_some();
+    tx.commit()?;
+    Ok(ready)
+}
+
+fn ready_candidate(
+    conn: &Connection,
+    access: &Access,
+    actor: &str,
+    scope: &str,
+    labels: &BTreeMap<String, String>,
+    other_owners: &[String],
+    at: i64,
+) -> Result<Option<i64>> {
+    if labels.get("board.task").is_some_and(|s| s != "ready") {
+        return Ok(None);
+    }
+    let mut eligible_labels = labels.clone();
+    eligible_labels.remove("board.task");
+    let (mut predicate, mut bind) = crate::read::predicate(&crate::Filter {
+        channel: Some(scope.to_owned()),
+        labels: eligible_labels,
+        ..Default::default()
+    });
+    if let Some(ch) = access.channels(conn, Action::Label)? {
+        predicate.push_str(" AND m.channel IN (SELECT value FROM json_each(?))");
+        bind.push(serde_json::to_string(&ch)?.into());
+    }
+    // Only the owner's own profiles may receive a directed task, including rows
+    // left by older databases. Foreign pool work always needs the worker's opt-in.
+    let sql = format!("WITH ready AS (
+                SELECT id,assignee,substr(owner,1,instr(owner||'/','/')-1) AS person FROM tasks WHERE state='ready' OR (state='claimed' AND lease_until<=?)
+              ) SELECT q.id FROM ready q JOIN messages m ON m.id=q.id WHERE {predicate} AND (
+                (q.person=? AND (q.assignee IS NULL OR q.assignee=?)) OR
+                (q.assignee IS NULL AND q.person IN (SELECT value FROM json_each(?))))
+              ORDER BY (q.assignee IS NOT NULL) DESC,q.id LIMIT 1");
+    bind.insert(0, at.into());
+    bind.push(person(actor).to_owned().into());
+    bind.push(actor.to_owned().into());
+    bind.push(serde_json::to_string(other_owners)?.into());
+    Ok(conn
+        .query_row(&sql, rusqlite::params_from_iter(bind), |r| r.get(0))
+        .optional()?)
 }
 
 fn acquire(

@@ -3,6 +3,10 @@ mod feed;
 pub use feed::SwarmFilter;
 mod coordination;
 mod materialize;
+mod observe;
+mod plan;
+pub use observe::SwarmObservation;
+pub use plan::{PlanReceipt, RunPolicy, SwarmPlanItem};
 mod wait;
 use crate::{
     Board, Message, PostOptions,
@@ -17,7 +21,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
 };
-pub use wait::SwarmWaitOutcome;
+pub use wait::{SwarmInboxWait, SwarmWaitOutcome};
 
 pub(crate) fn init(c: &Connection) -> Result<()> {
     let legacy: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='swarm_workers') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('swarm_workers') WHERE name='checked_in_at')", [], |r| r.get(0))?;
@@ -271,6 +275,18 @@ fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
 }
 
 impl Board {
+    pub(crate) fn require_active_worker(
+        &self,
+        c: &Connection,
+        actor: &str,
+        w: &WorkerBinding,
+    ) -> Result<()> {
+        let (_, r) = self.swarm_record(c, actor, &w.run, Action::Read)?;
+        r.active()?;
+        ensure!(r.id==w.run_id && c.query_row("SELECT EXISTS(SELECT 1 FROM swarm_workers WHERE run_id=? AND actor=? AND name=? AND status NOT IN ('done','stopped'))",params![r.id,actor,w.name],|r|r.get::<_,bool>(0))?,
+            Conflict.error("worker_stopped","no active assignment for this worker"));
+        Ok(())
+    }
     pub fn worker_binding(&self, selector: &str) -> Result<WorkerBinding> {
         let (slug, name) = WorkerBinding::selector(selector)?;
         let tx = self.conn.unchecked_transaction()?;
@@ -378,6 +394,15 @@ impl Board {
         Ok(count)
     }
     pub fn swarm_start(&self, actor: &str, args: &SwarmStart) -> Result<SwarmRun> {
+        self.swarm_start_with_policy(actor, args, RunPolicy::default())
+    }
+    pub fn swarm_start_with_policy(
+        &self,
+        actor: &str,
+        args: &SwarmStart,
+        policy: RunPolicy,
+    ) -> Result<SwarmRun> {
+        policy.validate()?;
         let slug = args
             .slug
             .clone()
@@ -397,6 +422,7 @@ impl Board {
             let m=Self::post_tx(tx,&channel,actor,&goal,&PostOptions{no_sync:true,..Default::default()})?;
             tx.execute("INSERT INTO swarm_runs(slug,goal,channel,root_id,repo_root,coordinator_actor,status,max_notifications,created_at) VALUES(?,?,?,?,?,?,'active',?,?)",
                 params![slug,m.text,channel,m.id,args.repo_root,actor,max,m.created_at])?;
+            tx.execute("INSERT INTO swarm_policy(run_id,max_active,retry_budget) SELECT id,?,? FROM swarm_runs WHERE slug=?",params![policy.max_active,policy.retry_budget,slug])?;
             self.swarm_overview(tx,actor,&slug)
         })
     }
@@ -440,6 +466,7 @@ impl Board {
             tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'registered',?,?,?)",
                 params![r.id,args.name,who,args.role_slug,version,prompt,serde_json::to_string(&skills)?,args.brief,args.workspace_path,args.branch_name,m.id,time,time])?;
             let w=tx.query_row("SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? AND name=?",params![r.id,args.name],worker)?;
+            Board::event_tx(tx,"swarm.registered",actor,Some(m.id),serde_json::json!({"run":r.slug,"worker":w.name}))?;
             self.materialize_spawn(&r,w,&prompt,&skills)
         })
     }

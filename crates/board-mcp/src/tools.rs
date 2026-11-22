@@ -1,11 +1,11 @@
 mod catalog;
-mod wait;
+pub(crate) mod wait;
 pub(crate) use catalog::{catalog, find};
 
 use anyhow::{Context, Result, bail, ensure};
 use board_local::{
     Board, Filter, PostOptions, automation as work,
-    swarm::{SwarmAddWorker, SwarmStart},
+    swarm::{RunPolicy, SwarmAddWorker, SwarmStart},
 };
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -28,6 +28,49 @@ fn remember(ctx: &mut ActorContext, mut task: work::Task) -> Result<Value> {
     value(task)
 }
 
+fn selected_run(ctx: &ActorContext, p: &Value) -> Result<String> {
+    if let Some(binding) = &ctx.worker {
+        return binding.select_run(reference(&p["run"]).as_deref());
+    }
+    reference(&p["run"])
+        .or_else(|| ctx.default_run.clone())
+        .context("set run or BOARD_SWARM_RUN")
+}
+
+fn claim(b: &Board, ctx: &mut ActorContext, p: &Value) -> Result<Value> {
+    let target = match (p["id"].as_i64(), p["ready_channel"].as_str()) {
+        (Some(id), None) if p.get("wait_seconds").is_none() => work::ClaimTarget::Id(id),
+        (None, Some(channel)) => work::ClaimTarget::Ready(channel),
+        _ => bail!("supply id or ready_channel; only a ready queue can wait"),
+    };
+    let labels = p
+        .get("labels")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()?
+        .unwrap_or_default();
+    if let work::ClaimTarget::Ready(scope) = target
+        && p["wait_seconds"].as_u64().unwrap_or(0) > 0
+        && !work::ready_for_worker(b, &ctx.actor, scope, &labels, ctx.worker.as_ref())?
+    {
+        return Err(work::NothingReady.into());
+    }
+    let token = uuid::Uuid::new_v4().to_string();
+    let task = work::claim_in_assignment(
+        b,
+        &ctx.actor,
+        target,
+        work::ClaimRequest {
+            lease_seconds: p["lease_seconds"].as_i64().unwrap_or(300),
+            token: &token,
+        },
+        &labels,
+        &[],
+        ctx.worker.as_ref(),
+    )?;
+    remember(ctx, task)
+}
+
 pub(crate) fn execute(
     b: &Board,
     ctx: &mut ActorContext,
@@ -45,14 +88,7 @@ pub(crate) fn execute(
     let id = || p["id"].as_i64().context("missing task or message ID");
     let after = p["after"].as_i64();
     let size = p["limit"].as_u64().unwrap_or(50) as usize;
-    let run = || {
-        if let Some(binding) = &ctx.worker {
-            return binding.select_run(reference(&p["run"]).as_deref());
-        }
-        reference(&p["run"])
-            .or_else(|| ctx.default_run.clone())
-            .context("set run or BOARD_SWARM_RUN")
-    };
+    let run = || selected_run(ctx, p);
     let labels: BTreeMap<String, String> = p
         .get("labels")
         .cloned()
@@ -62,17 +98,39 @@ pub(crate) fn execute(
     let opts = PostOptions {
         labels: labels.clone(),
         no_sync: p["no_sync"].as_bool().unwrap_or(false),
+        key: owned("idempotency_key"),
         ..Default::default()
     };
     match tool.name {
-        "swarm_start" => value(b.swarm_start(
+        "swarm_start" => value(
+            b.swarm_start_with_policy(
+                actor,
+                &SwarmStart {
+                    goal: required("goal")?.into(),
+                    slug: owned("slug"),
+                    repo_root: owned("repo_root"),
+                    max_notifications: p["max_notifications"].as_i64(),
+                },
+                RunPolicy {
+                    max_active: p["max_active"]
+                        .as_i64()
+                        .unwrap_or(RunPolicy::default().max_active),
+                    retry_budget: p["retry_budget"].as_i64().unwrap_or(0),
+                },
+            )?,
+        ),
+        "swarm_plan" => value(b.swarm_plan(
             actor,
-            &SwarmStart {
-                goal: required("goal")?.into(),
-                slug: owned("slug"),
-                repo_root: owned("repo_root"),
-                max_notifications: p["max_notifications"].as_i64(),
-            },
+            &run()?,
+            required("key")?,
+            &serde_json::from_value::<Vec<_>>(p["items"].clone())?,
+        )?),
+        "swarm_observe" => value(b.swarm_observe(
+            actor,
+            &run()?,
+            after,
+            p["action_after"].as_i64().unwrap_or(0),
+            p["limit"].as_u64().unwrap_or(20) as usize,
         )?),
         "swarm_list" => value(b.swarm_list(actor, p["before"].as_i64(), size)?),
         "swarm_add" => value(b.swarm_add_worker(
@@ -91,6 +149,9 @@ pub(crate) fn execute(
             let r = run()?;
             let (target, _) = b.swarm_wait_target(actor, &r)?;
             b.swarm_check_in(actor, &r, &target)?;
+            if p["compact"] == true {
+                return Ok(json!({"run":r,"worker":target,"actor":actor,"status":"working"}));
+            }
             value(b.swarm_status(actor, &r)?)
         }
         "swarm_launch_failed" => {
@@ -130,13 +191,6 @@ pub(crate) fn execute(
         }
         "swarm_dm" => value(b.swarm_dm(actor, &run()?, required("to")?, required("text")?)?),
         "swarm_read" => value(b.swarm_read(actor, &run()?, after.unwrap_or(0), size, true)?),
-        "swarm_wait" => wait::run(
-            b,
-            actor,
-            &run()?,
-            after,
-            p["timeout_seconds"].as_u64().unwrap_or(90),
-        ),
         "swarm_done" => value(b.swarm_done(actor, &run()?, s("summary"))?),
         "swarm_stop" => value(b.swarm_stop(actor, &run()?)?),
         "roles_list" => value(b.roles_list()?),
@@ -185,8 +239,13 @@ pub(crate) fn execute(
                 labels,
                 ..Default::default()
             };
-            let (cursor, tasks) = work::filtered_tasks_page_as(b, Some(actor), &f, 0, size)?;
-            Ok(json!({"cursor":cursor,"tasks":tasks}))
+            let (cursor, mut tasks) =
+                work::filtered_tasks_page_as(b, Some(actor), &f, after.unwrap_or(0), size + 1)?;
+            let more = tasks.len() > size;
+            tasks.truncate(size);
+            Ok(
+                json!({"cursor":cursor,"tasks":tasks,"next_after": tasks.last().filter(|_|more).map(|t|t.id)}),
+            )
         }
         "tasks_create" => {
             let target = work::TaskTarget::New {
@@ -211,22 +270,8 @@ pub(crate) fn execute(
             let (t, _) = work::create_task_and_claim(b, actor, target, &needs, s("assignee"), req)?;
             remember(ctx, t)
         }
-        "tasks_claim" => {
-            let target = match (p["id"].as_i64(), s("ready_channel")) {
-                (Some(id), None) => work::ClaimTarget::Id(id),
-                (None, Some(channel)) => work::ClaimTarget::Ready(channel),
-                _ => bail!("supply exactly one of id and ready_channel"),
-            };
-            let t = work::claim(
-                b,
-                actor,
-                target,
-                p["lease_seconds"].as_i64().unwrap_or(300),
-                &labels,
-            )?;
-            remember(ctx, t)
-        }
-        "tasks_complete" | "tasks_fail" | "tasks_block" => {
+        "tasks_claim" => claim(b, ctx, p),
+        "tasks_complete" | "tasks_fail" | "tasks_block" | "tasks_renew" | "tasks_release" => {
             let id = id()?;
             let (epoch, token) = ctx
                 .leases
@@ -236,11 +281,21 @@ pub(crate) fn execute(
             let action = match tool.name {
                 "tasks_complete" => work::TaskAction::Complete(s("result")),
                 "tasks_fail" => work::TaskAction::Fail(required("reason")?),
+                "tasks_renew" => {
+                    work::TaskAction::Renew(p["lease_seconds"].as_i64().unwrap_or(300))
+                }
+                "tasks_release" => work::TaskAction::Release,
                 _ => work::TaskAction::Block(required("reason")?),
             };
-            let t = work::change_task(b, id, actor, epoch, token, action)?;
-            ctx.leases.remove(&id);
-            value(t)
+            let result = work::change_task(b, id, actor, epoch, token, action);
+            if (result.is_ok() && tool.name != "tasks_renew")
+                || result
+                    .as_ref()
+                    .is_err_and(|e| board_local::errors::classify(e).1 == "claim_lost")
+            {
+                ctx.leases.remove(&id);
+            }
+            remember(ctx, result?)
         }
         _ => bail!("unimplemented tool {}", tool.name),
     }

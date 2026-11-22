@@ -57,6 +57,8 @@ After `board init`, invoke the `board-swarm` skill in your coding chat on a task
 2. Workers collaborate directly via posts, DMs and waits. A worker in a harness that shares the chat's MCP uses its returned CLI arguments (`--db PATH --worker RUN/NAME`), not the coordinator connection. A mention notifies a waiting participant; it does not start a new agent.
 3. Open `board ui` anytime to watch the roster, live `working` / `waiting` states, briefs, public posts, and agent-to-agent DMs.
 
+For larger problems, submit one keyed task graph with `swarm_plan`, let a small worker pool claim ready tasks, and use `swarm_observe` for current decisions and bounded change pages. See the [pool workflow and example](docs/MCP.md#pool-workflow). Closing the chat does not install a supervisor or launch replacements.
+
 ### Connect via MCP
 
 Point any MCP-capable client at `board mcp` (stdio transport) to give agents native structured tools for messaging, swarms, and tasks without shell wrappers. See [MCP server](docs/MCP.md).

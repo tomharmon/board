@@ -18,19 +18,22 @@ pub enum SwarmWaitOutcome {
     },
 }
 
-struct WaitRegistration<'a> {
+/// An interruptible inbox wait. Dropping it releases the registration without
+/// acknowledging any further notifications.
+pub struct SwarmInboxWait<'a> {
     board: &'a Board,
-    actor: &'a str,
-    run: &'a str,
+    actor: String,
+    run: String,
+    after: i64,
     target: String,
     pid: u32,
     active: bool,
 }
-impl WaitRegistration<'_> {
+impl SwarmInboxWait<'_> {
     fn enter(&mut self) -> Result<()> {
         self.board.swarm_set_worker_status(
-            self.actor,
-            self.run,
+            &self.actor,
+            &self.run,
             &self.target,
             "waiting",
             Some(self.pid),
@@ -41,13 +44,13 @@ impl WaitRegistration<'_> {
     fn leave(&mut self, through: Option<i64>) -> Result<()> {
         if self.active {
             self.board
-                .swarm_leave_wait(self.actor, self.run, &self.target, self.pid, through)?;
+                .swarm_leave_wait(&self.actor, &self.run, &self.target, self.pid, through)?;
             self.active = false;
         }
         Ok(())
     }
 }
-impl Drop for WaitRegistration<'_> {
+impl Drop for SwarmInboxWait<'_> {
     fn drop(&mut self) {
         let _ = self.leave(None);
     }
@@ -93,29 +96,58 @@ impl Board {
         timeout: Duration,
         mut check_cancel: impl FnMut() -> Result<()>,
     ) -> Result<SwarmWaitOutcome> {
+        let mut wait = self.swarm_inbox_wait(actor, run, after)?;
+        let start = Instant::now();
+        loop {
+            if let Some(result) = wait.poll(start.elapsed() >= timeout, &mut check_cancel)? {
+                return Ok(result);
+            }
+            std::thread::sleep(
+                timeout
+                    .saturating_sub(start.elapsed())
+                    .min(Duration::from_millis(250)),
+            );
+        }
+    }
+    pub fn swarm_inbox_wait(
+        &self,
+        actor: &str,
+        run: &str,
+        after: Option<i64>,
+    ) -> Result<SwarmInboxWait<'_>> {
         let (target, last) = self.swarm_wait_target(actor, run)?;
-        let after = after.unwrap_or(last);
-        let mut registration = WaitRegistration {
+        Ok(SwarmInboxWait {
             board: self,
-            actor,
-            run,
+            actor: actor.into(),
+            run: run.into(),
+            after: after.unwrap_or(last),
             target,
             pid: std::process::id(),
             active: false,
-        };
-        let start = Instant::now();
+        })
+    }
+}
+impl SwarmInboxWait<'_> {
+    pub fn poll(
+        &mut self,
+        timed_out: bool,
+        mut check_cancel: impl FnMut() -> Result<()>,
+    ) -> Result<Option<SwarmWaitOutcome>> {
+        let after = self.after;
         loop {
             check_cancel()?;
-            let poll = self.swarm_poll_wait(actor, run, &registration.target, after)?;
+            let poll = self
+                .board
+                .swarm_poll_wait(&self.actor, &self.run, &self.target, after)?;
             match poll {
                 WaitPoll::Stopped { cursor } => {
-                    registration.leave(None)?;
-                    return Ok(SwarmWaitOutcome::Stopped { cursor });
+                    self.leave(None)?;
+                    return Ok(Some(SwarmWaitOutcome::Stopped { cursor }));
                 }
-                WaitPoll::Pending if start.elapsed() >= timeout => {
+                WaitPoll::Pending if timed_out => {
                     // In particular, an empty zero-duration probe never acquires a write transaction.
-                    registration.leave(None)?;
-                    return Ok(SwarmWaitOutcome::StillWaiting { cursor: after });
+                    self.leave(None)?;
+                    return Ok(Some(SwarmWaitOutcome::StillWaiting { cursor: after }));
                 }
                 WaitPoll::Ready {
                     cursor,
@@ -124,41 +156,45 @@ impl Board {
                     dms,
                 } => {
                     check_cancel()?;
-                    if registration.active {
-                        registration.leave(Some(cursor))?;
-                    } else if !self.swarm_ack_ready(actor, run, &registration.target, cursor)? {
+                    if self.active {
+                        self.leave(Some(cursor))?;
+                    } else if !self.board.swarm_ack_ready(
+                        &self.actor,
+                        &self.run,
+                        &self.target,
+                        cursor,
+                    )? {
                         continue;
                     }
-                    return Ok(SwarmWaitOutcome::Messages {
+                    return Ok(Some(SwarmWaitOutcome::Messages {
                         cursor,
                         notifications,
                         messages,
                         dms,
-                    });
+                    }));
                 }
-                WaitPoll::Pending if !registration.active => {
-                    if let Err(e) = registration.enter() {
-                        if let WaitPoll::Stopped { cursor } =
-                            self.swarm_poll_wait(actor, run, &registration.target, after)?
-                        {
-                            return Ok(SwarmWaitOutcome::Stopped { cursor });
+                WaitPoll::Pending if !self.active => {
+                    if let Err(e) = self.enter() {
+                        if let WaitPoll::Stopped { cursor } = self.board.swarm_poll_wait(
+                            &self.actor,
+                            &self.run,
+                            &self.target,
+                            after,
+                        )? {
+                            return Ok(Some(SwarmWaitOutcome::Stopped { cursor }));
                         }
                         return Err(e);
                     }
                     // Re-read after registration: a stop or a new notification can win that gap.
                 }
-                WaitPoll::Pending => {
-                    std::thread::sleep(
-                        timeout
-                            .saturating_sub(start.elapsed())
-                            .min(Duration::from_millis(250)),
-                    );
-                }
+                WaitPoll::Pending => return Ok(None),
             }
         }
     }
+}
+impl Board {
     // Polling an idle participant must not count the whole feed or load every other brief.
-    fn swarm_waiting_on(
+    pub(super) fn swarm_waiting_on(
         &self,
         c: &Connection,
         actor: &str,

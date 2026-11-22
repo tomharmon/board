@@ -68,7 +68,15 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         .collect();
     assert_eq!(replies.len(), 5);
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "board-mcp");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 29);
+    let catalog = replies[1]["result"]["tools"].as_array().unwrap();
+    for tool in [
+        "swarm_plan",
+        "swarm_observe",
+        "tasks_renew",
+        "tasks_release",
+    ] {
+        assert!(catalog.iter().any(|t| t["name"] == tool), "missing {tool}");
+    }
     assert!(!unused.exists());
     let result = |i: usize| {
         let r = &replies[i]["result"];

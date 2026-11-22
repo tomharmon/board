@@ -17,6 +17,14 @@ struct Client {
 }
 impl Client {
     fn start(path: &Path, profile: Option<&str>, token: Option<&str>) -> Self {
+        Self::start_session(path, profile, token, None)
+    }
+    fn start_session(
+        path: &Path,
+        profile: Option<&str>,
+        token: Option<&str>,
+        worker: Option<&str>,
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_board-mcp-stdio"));
         cmd.env_clear()
             .env("BOARD_DB", path)
@@ -27,6 +35,9 @@ impl Client {
         }
         if let Some(token) = token {
             cmd.env("BOARD_TOKEN", token);
+        }
+        if let Some(worker) = worker {
+            cmd.env("BOARD_WORKER", worker);
         }
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -155,6 +166,8 @@ fn protocol_framing_inventory_and_schema_validation() {
             "swarm_done",
             "swarm_launch_failed",
             "swarm_list",
+            "swarm_observe",
+            "swarm_plan",
             "swarm_post",
             "swarm_read",
             "swarm_receipt",
@@ -168,7 +181,9 @@ fn protocol_framing_inventory_and_schema_validation() {
             "tasks_complete",
             "tasks_create",
             "tasks_fail",
-            "tasks_list"
+            "tasks_list",
+            "tasks_release",
+            "tasks_renew"
         ]
     );
     assert_eq!(c.request("unsupported", json!({}))["error"]["code"], -32601);
@@ -185,6 +200,167 @@ fn protocol_framing_inventory_and_schema_validation() {
         json!({"channel":"bugs","text":"no impersonation","actor":"another"}),
     );
     c.denied("board_read", json!({"limit":0}));
+}
+
+#[test]
+fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("pool");
+    let mut boss = Client::start(&db, None, None);
+    let mut worker = Client::start(&db, Some("pool"), None);
+    boss.initialize();
+    worker.initialize();
+    let first = boss.call(
+        "tasks_create",
+        json!({"channel":"pool","text":"first","claim":true}),
+    );
+    let next = boss.call(
+        "tasks_create",
+        json!({"channel":"pool","text":"second","needs":[first["id"]]}),
+    );
+    let mine = worker.call(
+        "tasks_create",
+        json!({"channel":"other","text":"mine","claim":true}),
+    );
+    let req = json!({"name":"tasks_claim","arguments":{"ready_channel":"pool","wait_seconds":5}});
+    let parked = worker.send("tools/call", req.clone());
+    let renewed = worker.call("tasks_renew", json!({"id":mine["id"],"lease_seconds":60}));
+    assert_eq!(renewed["epoch"], mine["epoch"]);
+    assert!(renewed.get("claim_token").is_none());
+    worker.write(
+        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":parked}})
+            .to_string(),
+    );
+    assert_eq!(
+        worker.call("tasks_release", json!({"id":mine["id"]}))["state"],
+        "ready"
+    );
+    let parked = worker.send("tools/call", req);
+    assert_eq!(worker.request("ping", json!({}))["result"], json!({}));
+    boss.call("tasks_complete", json!({"id":first["id"]}));
+    let response = worker.read();
+    assert_eq!(response["id"], parked);
+    assert_eq!(response["result"]["structuredContent"]["id"], next["id"]);
+    let task = Client::content(response, true);
+    assert!(task.get("claim_token").is_none());
+    assert_eq!(
+        worker.call("tasks_complete", json!({"id":task["id"]}))["state"],
+        "completed"
+    );
+}
+
+#[test]
+fn plans_pages_and_observations_resume_without_replaying_the_roster() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("board");
+    let mut boss = Client::start(&db, None, None);
+    boss.initialize();
+    boss.call(
+        "swarm_start",
+        json!({"slug":"release","goal":"two leaves and a join","max_active":2,"retry_budget":1}),
+    );
+    boss.call(
+        "swarm_add",
+        json!({"name":"tester","brief":"own ready work"}),
+    );
+    let mut worker = Client::start_session(&db, None, None, Some("release/tester"));
+    worker.initialize();
+    let compact = worker.call("swarm_check_in", json!({"compact":true}));
+    assert_eq!(compact["actor"], "ada/tester");
+    assert!(compact.get("workers").is_none());
+    let mut plan = json!({"key":"v1","items":[
+        {"key":"join","text":"Synthesize","output":"sum","acceptance":"includes both leaves","needs":["a","b"]},
+        {"key":"a","text":"Analyze A","acceptance":"cites evidence","output":"one number"},
+        {"key":"b","text":"Analyze B","acceptance":"cites evidence","output":"one number"}]});
+    assert_eq!(
+        worker.denied("swarm_plan", plan.clone())["code"],
+        "swarm_coordinator_required"
+    );
+    let made = boss.call("swarm_plan", plan.clone());
+    let original_plan = plan.clone();
+    assert_eq!(boss.call("swarm_plan", plan.clone()), made);
+    plan["items"][1]["acceptance"] = json!("changed");
+    assert_eq!(boss.denied("swarm_plan", plan)["code"], "duplicate_id");
+    let a = made["tasks"]["a"].clone();
+    boss.call("tasks_block", json!({"id":a,"reason":"awaiting fixture"}));
+    let b = made["tasks"]["b"].clone();
+    boss.call("tasks_block", json!({"id":b,"reason":"awaiting input"}));
+    let obs = boss.call("swarm_observe", json!({"limit":1}));
+    assert_eq!(obs["tasks"], json!({"waiting":1,"blocked":2}));
+    assert_eq!(obs["available_capacity"], 1);
+    assert_eq!(obs["policy"]["retry_budget"], 1);
+    assert_eq!(obs["actions"][0]["blocked_dependents"], 1);
+    let page = boss.call(
+        "swarm_observe",
+        json!({"limit":1,"action_after":obs["next_action_after"],"after":obs["cursor"]}),
+    );
+    assert_ne!(page["actions"][0]["task_id"], obs["actions"][0]["task_id"]);
+    assert!(page["changes"].as_array().unwrap().is_empty());
+    assert_eq!(page["cursor"], obs["cursor"]);
+    let first = worker.call("tasks_list", json!({"channel":"swarms/release","limit":2}));
+    let last = worker.call(
+        "tasks_list",
+        json!({"channel":"swarms/release","limit":2,"after":first["next_after"]}),
+    );
+    assert_eq!(last["tasks"].as_array().unwrap().len(), 1);
+    assert!(last["next_after"].is_null());
+    assert_ne!(first["cursor"], first["next_after"]);
+    let mut cursor = json!(0);
+    loop {
+        let delta = boss.call("swarm_observe", json!({"after":cursor,"limit":2}));
+        let rows = delta["changes"].as_array().unwrap();
+        assert!(rows.iter().all(|c| c["cursor"].as_i64() > cursor.as_i64()));
+        assert_eq!(delta["cursor"], rows.last().unwrap()["cursor"]);
+        cursor = delta["cursor"].clone();
+        if delta["has_more"] == false {
+            break;
+        }
+    }
+    assert_eq!(cursor, obs["cursor"]);
+    let pending = worker.send(
+        "tools/call",
+        json!({"name":"swarm_wait","arguments":{"timeout_seconds":5}}),
+    );
+    worker.request("ping", json!({}));
+    worker.write(
+        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":pending}})
+            .to_string(),
+    );
+    assert_eq!(
+        worker.call("swarm_status", json!({}))["workers"][0]["status"],
+        "working"
+    );
+    worker.send("tools/call",json!({"name":"tasks_claim","arguments":{"ready_channel":"swarms/release","wait_seconds":5}}));
+    boss.call("swarm_stop", json!({}));
+    assert_eq!(
+        Client::content(worker.read(), false)["code"],
+        "swarm_stopped"
+    );
+    assert_eq!(boss.call("swarm_plan", original_plan), made);
+}
+
+#[test]
+fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("board");
+    let mut modern = Client::start(&db, None, None);
+    modern.initialize();
+    let response = modern.request("tools/list", json!({}));
+    let defs = response["result"]["tools"].as_array().unwrap();
+    let post = defs.iter().find(|t| t["name"] == "swarm_post").unwrap();
+    let cases = post["inputSchema"]["allOf"].as_array().unwrap();
+    for name in ["handoff@1", "verification@1"] {
+        let shape = cases
+            .iter()
+            .find(|s| s["if"]["properties"]["schema"]["const"] == name)
+            .unwrap();
+        assert!(shape["then"]["properties"]["schema_data"]["properties"]["revision"].is_object());
+    }
+    let mut old = Client::start(&db, None, None);
+    old.request("initialize", json!({"protocolVersion":"2025-03-26"}));
+    let reply = old.request("tools/call", json!({"name":"roles_list","arguments":{}}));
+    assert!(reply["result"].get("structuredContent").is_none());
+    assert!(Client::content(reply, true).is_array());
 }
 
 #[test]

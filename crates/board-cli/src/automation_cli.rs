@@ -397,7 +397,13 @@ pub(crate) fn output_key(
     }
     Ok(given.map(str::to_owned))
 }
-fn take(board: &Board, actor: &str, args: &ClaimArgs, cache: &Cache) -> Result<Task> {
+fn take(
+    board: &Board,
+    actor: &str,
+    args: &ClaimArgs,
+    cache: &Cache,
+    binding: Option<&board_local::swarm::WorkerBinding>,
+) -> Result<Task> {
     let lease = secs(&args.lease)?;
     let labels = crate::pairs(&args.labels, false)?;
     let wait = args
@@ -413,7 +419,7 @@ fn take(board: &Board, actor: &str, args: &ClaimArgs, cache: &Cache) -> Result<T
             || ClaimTarget::Ready(args.ready.as_deref().unwrap_or("")),
             ClaimTarget::Id,
         );
-        match claim_with_token(
+        match claim_in_assignment(
             board,
             actor,
             target,
@@ -423,6 +429,7 @@ fn take(board: &Board, actor: &str, args: &ClaimArgs, cache: &Cache) -> Result<T
             },
             &labels,
             &args.owners,
+            binding,
         ) {
             Ok(t) => {
                 cache.remember(&t)?;
@@ -435,7 +442,14 @@ fn take(board: &Board, actor: &str, args: &ClaimArgs, cache: &Cache) -> Result<T
         }
     }
 }
-fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Path) -> Result<()> {
+fn task_command(
+    cmd: TaskArgs,
+    board: &Board,
+    actor: &str,
+    json: bool,
+    path: &Path,
+    binding: Option<&board_local::swarm::WorkerBinding>,
+) -> Result<()> {
     use TaskCmd::*;
     let Some(action) = cmd.action else {
         return list(board, actor, &cmd.query, json);
@@ -551,14 +565,14 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
             }
             t
         }
-        Claim(args) => take(board, actor, args, &cached()?)?,
+        Claim(args) => take(board, actor, args, &cached()?, binding)?,
         Run {
             claim,
             result,
             command,
         } => {
             let cache = cached()?;
-            let t = take(board, actor, claim, &cache)?;
+            let t = take(board, actor, claim, &cache, binding)?;
             return runner::run(
                 board,
                 actor,
@@ -635,9 +649,16 @@ fn task_command(cmd: TaskArgs, board: &Board, actor: &str, json: bool, path: &Pa
 }
 
 impl Commands {
-    pub fn run(self, board: &mut Board, actor: &str, json: bool, path: &Path) -> Result<()> {
+    pub fn run(
+        self,
+        board: &mut Board,
+        actor: &str,
+        json: bool,
+        path: &Path,
+        binding: Option<&board_local::swarm::WorkerBinding>,
+    ) -> Result<()> {
         match self {
-            Self::Tasks(cmd) => task_command(*cmd, board, actor, json, path),
+            Self::Tasks(cmd) => task_command(*cmd, board, actor, json, path, binding),
             Self::Watchers { action } => match *action {
                 WatchCmd::Matches { limit, lease } => {
                     let found = lease_matches(board, limit, secs(&lease)?)?;

@@ -2,7 +2,7 @@ use crate::{attachments, cli::Body, roles_cli::output};
 use anyhow::{Context, Result, ensure};
 use board_local::{
     Board,
-    swarm::{SwarmAddWorker, SwarmStart},
+    swarm::{RunPolicy, SwarmAddWorker, SwarmPlanItem, SwarmStart},
 };
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -28,6 +28,10 @@ pub enum Swarm {
         repo: Option<PathBuf>,
         #[arg(long)]
         max_notifications: Option<i64>,
+        #[arg(long, default_value_t = 8)]
+        max_active: i64,
+        #[arg(long, default_value_t = 0)]
+        retry_budget: i64,
     },
     /// Register a worker and render the pinned prompt and environment for your harness.
     Add {
@@ -46,10 +50,32 @@ pub enum Swarm {
     Status {
         run: Option<String>,
     },
+    /// Submit a replayable dependency graph from a JSON array (use - for stdin).
+    Plan {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        file: PathBuf,
+    },
+    /// Read current exceptions, counts and a bounded page of changes.
+    Observe {
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long)]
+        after: Option<i64>,
+        #[arg(long, default_value_t = 0)]
+        action_after: i64,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Explicitly announce that this worker has started. Does not launch a process.
     CheckIn {
         #[arg(long)]
         run: Option<String>,
+        #[arg(long)]
+        compact: bool,
     },
     /// Report a launch error observed by the harness, never inferred from silence.
     LaunchFailed {
@@ -162,6 +188,7 @@ impl Swarm {
             && matches!(
                 self,
                 Self::Start { .. }
+                    | Self::Plan { .. }
                     | Self::Add { .. }
                     | Self::SetLimit { .. }
                     | Self::Stop { .. }
@@ -178,7 +205,9 @@ impl Swarm {
             | Self::Wait { run, .. }
             | Self::Done { run, .. }
             | Self::Status { run }
-            | Self::CheckIn { run }
+            | Self::Plan { run, .. }
+            | Self::Observe { run, .. }
+            | Self::CheckIn { run, .. }
             | Self::LaunchFailed { run, .. }
             | Self::Receipt { run }
             | Self::Decide { run, .. }
@@ -352,10 +381,17 @@ fn wait(
 
 pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
     match cmd {
-        Swarm::CheckIn { run } => {
+        Swarm::CheckIn { run, compact } => {
             let run = reference(run.as_deref())?;
             let (target, _) = b.swarm_wait_target(actor, run)?;
             b.swarm_check_in(actor, run, &target)?;
+            if compact {
+                return output(
+                    js,
+                    &json!({"run":run,"worker":target,"actor":actor,"status":"working"}),
+                    || "Checked in".into(),
+                );
+            }
             let v = b.swarm_status(actor, run)?;
             output(js, &v, || "Checked in".into())
         }
@@ -408,8 +444,10 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             slug,
             repo,
             max_notifications,
+            max_active,
+            retry_budget,
         } => {
-            let v = b.swarm_start(
+            let v = b.swarm_start_with_policy(
                 actor,
                 &SwarmStart {
                     goal,
@@ -417,8 +455,45 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                     repo_root: repo.map(local_path).transpose()?,
                     max_notifications,
                 },
+                RunPolicy {
+                    max_active,
+                    retry_budget,
+                },
             )?;
             output(js, &v, || v.slug.clone())
+        }
+        Swarm::Plan { run, key, file } => {
+            let items: Vec<SwarmPlanItem> = serde_json::from_str(&crate::load_text(&file)?)
+                .context("expected a JSON array of plan items")?;
+            let v = b.swarm_plan(actor, reference(run.as_deref())?, &key, &items)?;
+            output(js, &v, || format!("{}: {} tasks", v.key, v.tasks.len()))
+        }
+        Swarm::Observe {
+            run,
+            after,
+            action_after,
+            limit,
+        } => {
+            let v = b.swarm_observe(
+                actor,
+                reference(run.as_deref())?,
+                after,
+                action_after,
+                limit,
+            )?;
+            output(js, &v, || {
+                let mut lines = vec![format!(
+                    "{}: {} | available slots {} | tasks {:?} | cursor {}",
+                    v.run, v.status, v.available_capacity, v.tasks, v.cursor
+                )];
+                lines.extend(v.actions.iter().map(|a| {
+                    format!(
+                        "#{} {} -> {}: {} ({} waiting)",
+                        a.message_id, a.kind, a.assigned_to, a.summary, a.blocked_dependents
+                    )
+                }));
+                lines.join("\n")
+            })
         }
         Swarm::Add {
             worker_name,

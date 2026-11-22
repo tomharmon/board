@@ -98,6 +98,8 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 - **Rune never starts work automatically:** Opening a board or viewing a swarm in Rune is always passive. Explicit user actions (posting a message, sending a DM, clicking **Stop**) take effect normally.
 - **Backlogs and tickets:** Day-to-day `@impl ↔ @verifier` iteration stays in messages and DMs. For batch work (like draining a list of Linear or GitHub issues pulled with `board sync pull ... --as-tasks`), workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket.
 
+For new parallel work, the coordinator can submit one replayable task graph with `swarm plan`, launch a small worker pool in the chat, and inspect counts and exceptions with `swarm observe` instead of relaying each handoff. The [pool workflow](MCP.md#pool-workflow) covers dependency fan-in, queue waits, renewal, and coordinator reconnects. Schema v18 adds run policy and plan receipts without changing existing tasks, assignments or role attachments. Old runs use the default policy. Back up with the old binary before upgrading.
+
 ---
 
 ## Attention and revision-bound receipts

@@ -9,6 +9,8 @@ use std::{
 
 const COORDINATOR: &str = include_str!("../assets/board-swarm-SKILL.md");
 const V15_COORDINATOR: &str = "126e1fc1455726325dfb5b7b3ad822fe5da73d0fb875e828594131181f3a7394";
+const V16_COORDINATOR: &str = "d5c9b58a6134fd9eaf47ff47709425345bf1989810ec2020035a9471312f65de";
+const V17_COORDINATOR: &str = "aeefde429f1a99e6215f088492e5cc82fde51abb27aada00192014a28e46bee7";
 const FILE: &str = "board-swarm/SKILL.md";
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -81,7 +83,10 @@ fn contents(file: &Path) -> Result<Contents> {
         if text == COORDINATOR.replace("\r\n", "\n") {
             return Ok(Contents::Current);
         }
-        if format!("{:x}", Sha256::digest(text.as_bytes())) == V15_COORDINATOR {
+        if matches!(
+            format!("{:x}", Sha256::digest(text.as_bytes())).as_str(),
+            V15_COORDINATOR | V16_COORDINATOR | V17_COORDINATOR
+        ) {
             return Ok(Contents::Previous);
         }
     }
@@ -330,6 +335,20 @@ pub fn run(cmd: Skill, js: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stock_v17_upgrades_without_replacing_custom_workflows() {
+        let root = tempfile::tempdir().unwrap();
+        let dest = Destination::explicit(Target::Path, root.path().into()).unwrap();
+        let file = root.path().join(FILE);
+        fs::create_dir(file.parent().unwrap()).unwrap();
+        let previous = include_bytes!("../tests/fixtures/coordinator-v17.md");
+        fs::write(&file, previous).unwrap();
+        assert_eq!(dest.install(false).unwrap().0, "upgraded");
+        assert_eq!(fs::read_to_string(&file).unwrap(), COORDINATOR);
+        fs::write(&file, b"local instructions").unwrap();
+        assert_eq!(dest.install(false).unwrap().0, "customized");
+    }
 
     #[test]
     fn archived_file_is_rechecked_before_replacing_it() {
