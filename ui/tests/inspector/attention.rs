@@ -173,3 +173,57 @@ fn navigation_does_not_paint_the_previous_task_page_over_swarms() {
         }
     }
 }
+
+#[test]
+fn stopping_the_open_run_switches_directly_to_its_receipt() {
+    let f = Fixture::new();
+    let (run, _) = seed(&f);
+    let tree = f.render(
+        json!([
+            {"t":0.1,"type":"tap","key":"swarms"},
+            {"t":0.3,"type":"tap","key":format!("swarm-run-{run}")},
+            {"t":0.5,"type":"tap","key":"swarm-stop"},
+            {"t":0.7,"type":"tap","key":"swarm-stop-confirm"}
+        ]),
+        DESKTOP,
+        "1.1",
+    );
+    tree.expect_key("swarm-receipt-scroll");
+    tree.expect_text("Run: stopped");
+    assert!(!tree.has_key("swarm-composer"));
+}
+
+#[test]
+fn a_decision_answer_survives_inspecting_the_source_and_returning() {
+    let f = Fixture::new();
+    let (_, decision) = seed(&f);
+    let tree = f.render(
+        json!([
+            {"t":0.1,"type":"tap","key":"needs-attention"},
+            {"t":0.3,"type":"tap","key":format!("attention-respond-{decision}")},
+            {"t":0.5,"paste":"Draft decision to keep while reviewing evidence"},
+            {"t":0.7,"type":"tap","key":format!("attention-source-{decision}")},
+            {"t":0.9,"type":"tap","key":"needs-attention"}
+        ]),
+        DESKTOP,
+        "1.3",
+    );
+    let answer = tree
+        .0
+        .iter()
+        .find(|e| e["key"] == "decision-answer")
+        .unwrap();
+    assert_eq!(
+        answer["text"],
+        "Draft decision to keep while reviewing evidence"
+    );
+    assert_eq!(
+        Board::open(&f.db)
+            .unwrap()
+            .swarm_receipt("reader", "unicode")
+            .unwrap()
+            .decisions
+            .len(),
+        1
+    );
+}

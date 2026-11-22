@@ -12,7 +12,7 @@ pub(super) fn dm_on(c: &Connection, id: i64) -> Result<SwarmDm> {
 fn notified_on(c: &Connection, id: i64) -> Result<Vec<String>> {
     rows(c.prepare("SELECT target_worker FROM swarm_notifications WHERE message_id=? AND source_kind='mention' ORDER BY target_worker")?.query_map([id],|r|r.get(0))?)
 }
-fn notify(
+pub(super) fn notify(
     tx: &Transaction,
     run: &SwarmRun,
     actor: &str,
@@ -26,7 +26,7 @@ fn notify(
     tx.execute("INSERT INTO swarm_notifications(run_id,target_worker,source_kind,from_actor,message_id,dm_id,event_cursor,created_at) VALUES(?,?,?,?,?,?,?,?)",params![run.id,target,kind,actor,msg,dm,at,crate::now()])?;
     Ok(())
 }
-fn spend(tx: &Transaction, run: &SwarmRun, actor: &str, n: i64) -> Result<()> {
+pub(super) fn spend(tx: &Transaction, run: &SwarmRun, actor: &str, n: i64) -> Result<()> {
     if n == 0 {
         return Ok(());
     }

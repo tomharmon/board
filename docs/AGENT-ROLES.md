@@ -104,7 +104,7 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 
 **Needs attention** separates actions assigned to your actor from **Agent follow-up**. Explicit decision requests, observed launch failures and blocked/failed tasks carry who is waiting, who should act, and a source thread. Tasks assigned to agents and failing or unrun verification checks remain visible as follow-up without becoming human alerts. Use `board swarm attention` (MCP: `board_attention`) for the same read model.
 
-For an implementer/verifier exchange, post one of these built-in schemas using `board swarm post --schema NAME@1 --schema-data JSON` or the existing `swarm_post` MCP tool. The records are validated and saved atomically with the post; retries using a CLI idempotency key do not create another handoff.
+For an implementer/verifier exchange, post one of these built-in schemas using `board swarm post --schema NAME@1 --schema-data JSON` or the existing `swarm_post` MCP tool. Posting or replying through the ordinary composer/CLI in that run's `swarms/RUN` channel records the same evidence. Posting these records outside a run is rejected rather than silently losing the requested action. The records are validated and saved atomically with the post; retries using a CLI idempotency key do not create another handoff. Editing an existing message does not create or rewrite a coordination record.
 
 | Schema | Required fields |
 | --- | --- |

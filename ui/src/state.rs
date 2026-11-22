@@ -458,6 +458,9 @@ impl State {
             self.people.rows.clear();
             self.people.inline = Default::default();
             self.desk.clear_data();
+            self.desk.decision_drafts.clear();
+            self.desk.selected_decision = None;
+            self.desk.decision_answer.clear();
             self.error = Some(format!("{e:#}"));
         } else {
             if self.access_blocked {

@@ -147,19 +147,24 @@ fn record<T: for<'de> Deserialize<'de>>(
     Ok((actor, serde_json::from_str(&data)?))
 }
 
+fn coordination_blocks<'a>(c: &Connection, m: &'a Message) -> Result<Vec<&'a crate::Block>> {
+    let mut blocks = Vec::new();
+    for block in &m.blocks {
+        if block.version == 1 && matches!(block.schema.as_str(), "handoff"|"verification"|"decision-request"|"decision-resolution")
+            && c.query_row("SELECT coalesce((SELECT builtin FROM schema_origins WHERE name=? AND version=1),0)", [&block.schema], |r| r.get::<_,bool>(0))? {
+            blocks.push(block);
+        }
+    }
+    Ok(blocks)
+}
+
 pub(super) fn record_on(
     tx: &Transaction,
     a: &Access,
     run: &SwarmRun,
     m: &Message,
 ) -> Result<Option<String>> {
-    let mut blocks = Vec::new();
-    for block in &m.blocks {
-        if block.version == 1 && matches!(block.schema.as_str(), "handoff"|"verification"|"decision-request"|"decision-resolution")
-            && tx.query_row("SELECT coalesce((SELECT builtin FROM schema_origins WHERE name=? AND version=1),0)", [&block.schema], |r| r.get::<_,bool>(0))? {
-            blocks.push(block);
-        }
-    }
+    let blocks = coordination_blocks(tx, m)?;
     ensure!(
         blocks.len() <= 1,
         Invalid.error(
@@ -354,6 +359,55 @@ fn receipt_on(c: &Connection, run: &SwarmRun) -> Result<SwarmReceipt> {
 }
 
 impl Board {
+    pub(crate) fn record_swarm_message_on(
+        &self,
+        tx: &Transaction,
+        a: &Access,
+        m: &Message,
+    ) -> Result<()> {
+        let blocks = coordination_blocks(tx, m)?;
+        let slug: Option<String> = tx
+            .query_row(
+                "SELECT slug FROM swarm_runs WHERE channel=?",
+                [&m.channel],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(slug) = slug else {
+            ensure!(
+                blocks.is_empty(),
+                Invalid.error(
+                    "swarm_required",
+                    "coordination records must be posted in an existing swarm channel"
+                )
+            );
+            return Ok(());
+        };
+        tx.execute("UPDATE swarm_workers SET last_activity_at=? WHERE actor=? AND run_id=(SELECT id FROM swarm_runs WHERE slug=?)",params![crate::now(),m.actor,slug])?;
+        if blocks.is_empty() {
+            return Ok(());
+        }
+        let (_, run) = self.swarm_on(tx, &m.actor, &slug, Action::Post)?;
+        if blocks.iter().any(|b| b.schema != "decision-resolution") {
+            run.active()?;
+        }
+        if let Some(target) = record_on(tx, a, &run, m)? {
+            let peer = target != "coordinator" && !run.can_control;
+            if peer && run.notifications_sent >= run.max_notifications {
+                Board::event_tx(
+                    tx,
+                    "swarm.notification_suppressed",
+                    &m.actor,
+                    Some(m.id),
+                    json!({"run":run.slug,"target":target}),
+                )?;
+            } else {
+                super::feed::notify(tx, &run, &m.actor, &target, "mention", m.id, Some(m.id))?;
+                super::feed::spend(tx, &run, &m.actor, i64::from(peer))?;
+            }
+        }
+        Ok(())
+    }
     pub fn swarm_check_in(&self, actor: &str, run: &str, target: &str) -> Result<()> {
         self.write(|tx| {
             let (_,r)=self.swarm_on(tx,actor,run,Action::Post)?; r.active()?;
@@ -432,7 +486,7 @@ impl Board {
             for d in receipt.decisions {
                 items.push(AttentionItem {
                     kind: "decision".into(),
-                    action_required: crate::core::owned_by(&d.request.to, actor),
+                    action_required: d.request.to == actor,
                     summary: d.request.summary,
                     waiting: d.actor,
                     assigned_to: d.request.to,
@@ -479,17 +533,17 @@ impl Board {
                 });
             }
         }
-        let tasks=rows(tx.prepare("SELECT t.id,t.owner,t.assignee,t.result,m.channel FROM tasks t JOIN messages m USING(id) WHERE t.state IN ('blocked','failed') AND m.deleted=0 ORDER BY t.id")?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?)))?)?;
-        for (id, owner, assignee, reason, channel) in tasks {
+        let tasks=rows(tx.prepare("SELECT t.id,t.owner,t.assignee,t.result,m.channel,coalesce(t.assignee,(SELECT actor FROM events e WHERE e.message_id=t.id AND e.kind IN ('task.blocked','task.failed') ORDER BY cursor DESC LIMIT 1),t.owner) FROM tasks t JOIN messages m USING(id) WHERE t.state IN ('blocked','failed') AND m.deleted=0 ORDER BY t.id")?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?)?;
+        for (id, owner, assignee, reason, channel, waiting) in tasks {
             if !access.allows(Action::Read, &channel) {
                 continue;
             }
             let to = assignee.unwrap_or_else(|| owner.split('/').next().unwrap_or(&owner).into());
             items.push(AttentionItem {
                 kind: "task".into(),
-                action_required: crate::core::owned_by(&to, actor),
+                action_required: to == actor,
                 summary: reason.unwrap_or_else(|| "Task needs follow-up".into()),
-                waiting: owner,
+                waiting,
                 assigned_to: to,
                 message_id: id,
                 run: None,

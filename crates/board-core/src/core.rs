@@ -649,6 +649,9 @@ impl Board {
             }
             let (text, mentions) = crate::actors::settle(tx, &a, actor, None, text)?;
             let (m, created) = Self::post_tx_with_outcome(tx, channel, actor, &text, opts)?;
+            if created {
+                self.record_swarm_message_on(tx, &a, &m)?;
+            }
             if created && !targets.is_empty() {
                 self.queue_post_targets_on(tx, actor, &m, targets)?;
             }
@@ -717,6 +720,9 @@ impl Board {
             }
             let (text, mentions) = crate::actors::settle(tx, &a, actor, Some(id), text)?;
             let (m, created) = Self::insert_reply(tx, id, actor, &text, opts, WriteOrigin::Board)?;
+            if created {
+                self.record_swarm_message_on(tx, &a, &m)?;
+            }
             Ok((
                 crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
                 created,

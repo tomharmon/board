@@ -83,7 +83,9 @@ impl Observer {
         if let Page::Swarm(id) = page {
             let key = format!("#{id}");
             let run = db.swarm_status(actor, &key)?;
-            if self.run.as_ref().is_none_or(|old| old.id != run.id) {
+            if self.run.as_ref().is_none_or(|old| {
+                old.id != run.id || (old.status == "active" && run.status != "active")
+            }) {
                 self.receipt_open = run.status != "active";
             }
             self.receipt = Some(db.swarm_receipt(actor, &key)?);
@@ -138,6 +140,32 @@ impl Observer {
     }
 }
 impl State {
+    pub fn begin_decision_answer(&mut self, id: i64) {
+        if self.desk.selected_decision == Some(id) {
+            return;
+        }
+        self.remember_decision_answer();
+        self.desk.selected_decision = Some(id);
+        self.desk.decision_answer = TextEdit::new(
+            self.desk
+                .decision_drafts
+                .get(&id)
+                .map(String::as_str)
+                .unwrap_or(""),
+        );
+    }
+    fn remember_decision_answer(&mut self) {
+        if let Some(id) = self.desk.selected_decision {
+            self.desk
+                .decision_drafts
+                .insert(id, self.desk.decision_answer.text.clone());
+        }
+    }
+    pub fn cancel_decision_answer(&mut self) {
+        self.remember_decision_answer();
+        self.desk.selected_decision = None;
+        self.desk.decision_answer.clear();
+    }
     pub fn answer_decision(&mut self) {
         let Some(id) = self.desk.selected_decision else {
             return;
@@ -159,6 +187,7 @@ impl State {
             .db()
             .and_then(|b| b.swarm_resolve_decision(&self.actor, &run, id, &summary));
         if self.result(result).is_some() {
+            self.desk.decision_drafts.remove(&id);
             self.desk.selected_decision = None;
             self.desk.decision_answer.clear();
             self.refresh();

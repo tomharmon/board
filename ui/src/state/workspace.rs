@@ -120,6 +120,8 @@ pub struct Desk {
     pub attention: Vec<board_local::swarm::AttentionItem>,
     pub selected_decision: Option<i64>,
     pub decision_answer: TextEdit,
+    pub decision_drafts: HashMap<i64, String>,
+    decision_actor: Option<String>,
     pub mode: ActivityMode,
     pub messages: Vec<Message>,
     pub events: Vec<Event>,
@@ -174,8 +176,6 @@ impl Desk {
     ];
     pub fn clear_data(&mut self) {
         self.attention.clear();
-        self.selected_decision = None;
-        self.decision_answer.clear();
         self.task_entry.instance = Default::default();
         self.messages.clear();
         self.events.clear();
@@ -241,6 +241,26 @@ impl Desk {
         filter: &Filter,
     ) -> Result<()> {
         self.attention = db.attention(actor)?;
+        if self.decision_actor.as_deref() != Some(actor) {
+            self.decision_drafts.clear();
+            self.selected_decision = None;
+            self.decision_answer.clear();
+            self.decision_actor = Some(actor.into());
+        }
+        self.decision_drafts.retain(|id, _| {
+            self.attention
+                .iter()
+                .any(|i| i.decision_id == Some(*id) && i.action_required)
+        });
+        if self.selected_decision.is_some_and(|id| {
+            !self
+                .attention
+                .iter()
+                .any(|i| i.decision_id == Some(id) && i.action_required)
+        }) {
+            self.selected_decision = None;
+            self.decision_answer.clear();
+        }
         self.head = db.cursor()?;
         self.seen = db.activity_seen(actor)?;
         self.unread = db.activity_unread(actor)?;

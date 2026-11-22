@@ -261,3 +261,124 @@ fn attention_and_receipts_respect_channel_access() -> Result<()> {
     assert!(guest.swarm_receipt("guest", "private").is_err());
     Ok(())
 }
+
+#[test]
+fn agent_addressed_work_is_followup_for_the_operator_not_a_human_action() -> Result<()> {
+    use board_local::automation::{TaskAction, TaskTarget, change_task, create_task};
+    let b = board()?;
+    let task = create_task(
+        &b,
+        "ada",
+        TaskTarget::New {
+            channel: "swarms/audit",
+            text: "Repair the failing check",
+            options: &Default::default(),
+        },
+        &[],
+        Some("ada/impl"),
+    )?;
+    change_task(
+        &b,
+        task.id,
+        "ada",
+        None,
+        None,
+        TaskAction::Block("Verifier returned a failing case"),
+    )?;
+    let request = post(
+        &b,
+        "ada/impl",
+        "decision-request",
+        json!({"to":"ada/verify","summary":"Which fixture reproduces the failure?"}),
+    )?;
+    let operator = b.attention("ada")?;
+    assert_eq!(
+        operator
+            .iter()
+            .find(|i| i.message_id == task.id)
+            .unwrap()
+            .waiting,
+        "ada/impl"
+    );
+    for id in [task.id, request] {
+        assert!(
+            !operator
+                .iter()
+                .find(|i| i.message_id == id)
+                .unwrap()
+                .action_required
+        );
+    }
+    assert!(
+        b.attention("ada/impl")?
+            .iter()
+            .find(|i| i.message_id == task.id)
+            .unwrap()
+            .action_required
+    );
+    assert!(
+        b.attention("ada/verify")?
+            .iter()
+            .find(|i| i.message_id == request)
+            .unwrap()
+            .action_required
+    );
+    assert!(
+        b.swarm_receipt("ada", "audit")?
+            .open_tasks
+            .contains(&task.id)
+    );
+    Ok(())
+}
+
+#[test]
+fn ordinary_swarm_channel_posts_and_replies_record_the_same_evidence() -> Result<()> {
+    let b = board()?;
+    let revision = json!({"kind":"sha256","value":"a".repeat(64)});
+    let handoff_body = append_block(
+        "",
+        "handoff",
+        1,
+        &json!({"revision":revision,"summary":"Ready","changes":["fields.rs"],"to":"verify"}),
+    )?;
+    let h = b.post(
+        "swarms/audit",
+        "ada/impl",
+        &handoff_body,
+        &Default::default(),
+    )?;
+    assert_eq!(b.swarm_receipt("ada", "audit")?.handoffs.len(), 1);
+    let verification = append_block(
+        "",
+        "verification",
+        1,
+        &json!({"handoff":h.id,"revision":revision,"summary":"Passed","checks":[{"name":"unit","status":"pass","command":"cargo test"}]}),
+    )?;
+    b.reply(h.id, "ada/verify", &verification, &Default::default())?;
+    assert_eq!(b.swarm_receipt("ada", "audit")?.handoffs[0].status, "pass");
+    let request = append_block(
+        "",
+        "decision-request",
+        1,
+        &json!({"to":"ada","summary":"Accept this revision?","handoff":h.id}),
+    )?;
+    let d = b.post("swarms/audit", "ada/verify", &request, &Default::default())?;
+    assert!(
+        b.attention("ada")?
+            .iter()
+            .any(|i| i.decision_id == Some(d.id) && i.action_required)
+    );
+    assert!(
+        b.post("general", "ada/verify", &request, &Default::default())
+            .is_err()
+    );
+    let resolved = append_block(
+        "",
+        "decision-resolution",
+        1,
+        &json!({"request":d.id,"summary":"Accepted"}),
+    )?;
+    b.reply(d.id, "ada", &resolved, &Default::default())?;
+    assert!(b.swarm_receipt("ada", "audit")?.decisions.is_empty());
+    Ok(())
+}

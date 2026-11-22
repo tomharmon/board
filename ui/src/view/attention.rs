@@ -64,8 +64,7 @@ fn item(s: &State, i: &AttentionItem) -> El {
         head = head.child(
             action(&format!("attention-respond-{request}"), "Respond", false).on_press_tx(
                 move |s: &mut State, tx| {
-                    s.desk.selected_decision = Some(request);
-                    s.desk.decision_answer.clear();
+                    s.begin_decision_answer(request);
                     tx.focus_when_shown("decision-answer", true);
                 },
             ),
@@ -117,7 +116,7 @@ fn item(s: &State, i: &AttentionItem) -> El {
                     .gap(8.)
                     .child(
                         action("cancel-decision-answer", "Cancel", false)
-                            .on_press(|s: &mut State| s.desk.selected_decision = None),
+                            .on_press(State::cancel_decision_answer),
                     )
                     .child(el().grow(1.))
                     .child(
