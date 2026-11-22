@@ -3,6 +3,7 @@ pub(crate) mod wait;
 pub(crate) use catalog::{catalog, find};
 
 use anyhow::{Context, Result, bail, ensure};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use board_local::{
     Board, Filter, PostOptions, automation as work,
     swarm::{RunPolicy, SwarmAddWorker, SwarmStart},
@@ -93,6 +94,12 @@ pub(crate) fn execute(
         labels: labels.clone(),
         no_sync: p["no_sync"].as_bool().unwrap_or(false),
         key: owned("idempotency_key"),
+        attachment_ids: p
+            .get("attachment_ids")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default(),
         ..Default::default()
     };
     match tool.name {
@@ -113,30 +120,55 @@ pub(crate) fn execute(
                 },
             )?,
         ),
-        "swarm_observe" => value(b.swarm_observe(
+        "swarm_observe" => value(b.swarm_observe_page(
             actor,
             &run()?,
             after,
             p["action_after"].as_i64().unwrap_or(0),
+            p["task_after"].as_i64().unwrap_or(0),
             p["limit"].as_u64().unwrap_or(20) as usize,
         )?),
         "swarm_list" => value(b.swarm_list(actor, p["before"].as_i64(), size)?),
-        "swarm_add" => value(b.swarm_add_worker(
-            actor,
-            &run()?,
-            &SwarmAddWorker {
+        "swarm_add" => {
+            let args = SwarmAddWorker {
                 name: required("name")?.into(),
                 brief: required("brief")?.into(),
                 role_slug: owned("role"),
                 workspace_path: owned("workspace_path"),
                 branch_name: owned("branch_name"),
-            },
-        )?),
+            };
+            if p["export_local"] == true {
+                value(b.swarm_add_worker(actor, &run()?, &args)?)
+            } else {
+                value(b.swarm_register_worker(actor, &run()?, &args)?)
+            }
+        }
+        "worker_assignment" => {
+            let binding =
+                ctx.worker
+                    .as_ref()
+                    .context(board_local::errors::Kind::Forbidden.error(
+                        "worker_binding_required",
+                        "use a connection bound to your worker assignment",
+                    ))?;
+            match (s("skill"), s("path")) {
+                (None, None) => value(b.worker_assignment(binding)?),
+                (Some(skill), Some(path)) => value(b.worker_skill_file(binding, skill, path)?),
+                _ => bail!("supply both skill and path to read a pinned file"),
+            }
+        }
         "swarm_status" => value(b.swarm_status(actor, &run()?)?),
         "swarm_check_in" => {
             let r = run()?;
             let (target, _) = b.swarm_wait_target(actor, &r)?;
-            b.swarm_check_in(actor, &r, &target)?;
+            b.swarm_check_in_with_runtime(
+                actor,
+                &r,
+                &target,
+                s("model"),
+                s("workspace_mode"),
+                s("session_ref"),
+            )?;
             if p["compact"] == true {
                 return Ok(json!({"run":r,"worker":target,"actor":actor,"status":"working"}));
             }
@@ -161,7 +193,7 @@ pub(crate) fn execute(
                     .context("missing max_notifications")?,
             )?,
         ),
-        "swarm_post" => {
+        "board_post" | "board_reply" | "swarm_post" => {
             let mut text = required("text")?.to_owned();
             match (s("schema"), p.get("schema_data")) {
                 (None, None) => {}
@@ -175,10 +207,24 @@ pub(crate) fn execute(
                 }
                 _ => bail!("schema and schema_data must be supplied together"),
             }
-            value(b.swarm_post(actor, &run()?, &text, &opts)?)
+            match tool.name {
+                "board_post" => value(b.post(required("channel")?, actor, &text, &opts)?),
+                "board_reply" => value(b.reply(id()?, actor, &text, &opts)?),
+                _ => value(b.swarm_post(actor, &run()?, &text, &opts)?),
+            }
         }
         "swarm_dm" => value(b.swarm_dm(actor, &run()?, required("to")?, required("text")?)?),
-        "swarm_read" => value(b.swarm_read(actor, &run()?, after.unwrap_or(0), size, true)?),
+        "swarm_read" => value(b.swarm_read_filtered(
+            actor,
+            &run()?,
+            after.unwrap_or(0),
+            size,
+            true,
+            &board_local::swarm::SwarmFilter {
+                kind: owned("kind"),
+                worker: owned("worker"),
+            },
+        )?),
         "swarm_done" => value(b.swarm_done(actor, &run()?, s("summary"))?),
         "swarm_stop" => value(b.swarm_stop(actor, &run()?)?),
         "roles_list" => value(b.roles_list()?),
@@ -190,8 +236,34 @@ pub(crate) fn execute(
             let (cursor, channels, next) = b.channels_window("", None, s("prefix"), size)?;
             Ok(json!({"cursor":cursor,"channels":channels,"next":next}))
         }
-        "board_post" => value(b.post(required("channel")?, actor, required("text")?, &opts)?),
-        "board_reply" => value(b.reply(id()?, actor, required("text")?, &opts)?),
+        "board_file_upload" => {
+            let data = STANDARD
+                .decode(required("data_base64")?)
+                .context("invalid base64 attachment")?;
+            ensure!(
+                data.len() <= board_local::FILE_CHUNK_BYTES,
+                "MCP uploads are limited to 64 KiB"
+            );
+            value(b.upload(
+                actor,
+                required("channel")?,
+                required("name")?,
+                required("content_type")?,
+                &data,
+            )?)
+        }
+        "board_file_read" => {
+            let offset = p["offset"].as_i64().unwrap_or(0);
+            let length = p["length"]
+                .as_u64()
+                .unwrap_or(board_local::FILE_CHUNK_BYTES as u64) as usize;
+            let (file, data) = b.download_range_as(actor, id()?, offset, length)?;
+            let end = offset + data.len() as i64;
+            Ok(
+                json!({"attachment":file,"offset":offset,"data_base64":STANDARD.encode(data),
+                "next_offset":(end < file.size).then_some(end)}),
+            )
+        }
         "board_read" => {
             let mut f = Filter {
                 channel: owned("channel"),

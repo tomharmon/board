@@ -161,7 +161,7 @@ fn coordination_blocks<'a>(c: &Connection, m: &'a Message) -> Result<Vec<&'a cra
 pub(super) fn record_on(
     tx: &Transaction,
     a: &Access,
-    run: &SwarmRun,
+    run: Option<&SwarmRun>,
     m: &Message,
 ) -> Result<Option<String>> {
     let blocks = coordination_blocks(tx, m)?;
@@ -175,6 +175,13 @@ pub(super) fn record_on(
     let Some(block) = blocks.first() else {
         return Ok(None);
     };
+    let run = run.context(Invalid.error(
+        "swarm_required",
+        "coordination records require a readable swarm channel",
+    ))?;
+    if block.schema != "decision-resolution" {
+        run.active()?;
+    }
     let target = match block.schema.as_str() {
         "handoff" => {
             let h: Handoff = serde_json::from_value(block.data.clone())?;
@@ -359,62 +366,39 @@ fn receipt_on(c: &Connection, run: &SwarmRun) -> Result<SwarmReceipt> {
 }
 
 impl Board {
-    pub(crate) fn record_swarm_message_on(
+    pub fn swarm_check_in(&self, actor: &str, run: &str, target: &str) -> Result<()> {
+        self.swarm_check_in_with_runtime(actor, run, target, None, None, None)
+    }
+    pub fn swarm_check_in_with_runtime(
         &self,
-        tx: &Transaction,
-        a: &Access,
-        m: &Message,
+        actor: &str,
+        run: &str,
+        target: &str,
+        model: Option<&str>,
+        workspace_mode: Option<&str>,
+        session_ref: Option<&str>,
     ) -> Result<()> {
-        let blocks = coordination_blocks(tx, m)?;
-        let slug: Option<String> = tx
-            .query_row(
-                "SELECT slug FROM swarm_runs WHERE channel=?",
-                [&m.channel],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(slug) = slug else {
+        for (v, max) in [(model, 128), (workspace_mode, 64), (session_ref, 1024)] {
             ensure!(
-                blocks.is_empty(),
+                v.is_none_or(|s| !s.trim().is_empty()
+                    && s.len() <= max
+                    && !s.chars().any(char::is_control)),
                 Invalid.error(
-                    "swarm_required",
-                    "coordination records must be posted in an existing swarm channel"
+                    "invalid_worker_report",
+                    "expected a short, printable model, workspace mode or session reference"
                 )
             );
-            return Ok(());
-        };
-        tx.execute("UPDATE swarm_workers SET last_activity_at=? WHERE actor=? AND run_id=(SELECT id FROM swarm_runs WHERE slug=?)",params![crate::now(),m.actor,slug])?;
-        if blocks.is_empty() {
-            return Ok(());
         }
-        let (_, run) = self.swarm_on(tx, &m.actor, &slug, Action::Post)?;
-        if blocks.iter().any(|b| b.schema != "decision-resolution") {
-            run.active()?;
-        }
-        if let Some(target) = record_on(tx, a, &run, m)? {
-            let peer = target != "coordinator" && !run.can_control;
-            if peer && run.notifications_sent >= run.max_notifications {
-                Board::event_tx(
-                    tx,
-                    "swarm.notification_suppressed",
-                    &m.actor,
-                    Some(m.id),
-                    json!({"run":run.slug,"target":target}),
-                )?;
-            } else {
-                super::feed::notify(tx, &run, &m.actor, &target, "mention", m.id, Some(m.id))?;
-                super::feed::spend(tx, &run, &m.actor, i64::from(peer))?;
-            }
-        }
-        Ok(())
-    }
-    pub fn swarm_check_in(&self, actor: &str, run: &str, target: &str) -> Result<()> {
         self.write(|tx| {
             let (_,r)=self.swarm_waiting_on(tx,actor,run,Action::Post)?; r.active()?;
             let w=r.workers.iter().find(|w|w.name==target && w.actor==actor).context(Forbidden.error("wrong_swarm_actor","a worker must check itself in"))?;
             ensure!(!matches!(w.status.as_str(),"done"|"stopped"), Conflict.error("worker_stopped","worker has finished"));
             let time=crate::now();
             tx.execute("UPDATE swarm_workers SET status='working',checked_in_at=coalesce(checked_in_at,?1),last_activity_at=?1,updated_at=?1,waiter_pid=NULL,launch_error=NULL WHERE id=?2",params![time,w.id])?;
+            if model.is_some() || workspace_mode.is_some() || session_ref.is_some() {
+                tx.execute("INSERT INTO swarm_worker_runtime(worker_id,model,workspace_mode,session_ref) VALUES(?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET model=excluded.model,workspace_mode=excluded.workspace_mode,session_ref=excluded.session_ref",
+                    params![w.id,model,workspace_mode,session_ref])?;
+            }
             Board::event_tx(tx,"swarm.checked_in",actor,Some(r.root_id),json!({"worker":target,"run":r.slug}))?;
             Ok(())
         })
@@ -470,74 +454,38 @@ impl Board {
         })
     }
     pub fn attention(&self, actor: &str) -> Result<Vec<AttentionItem>> {
+        crate::validate_actor(actor)?;
         let tx = self.conn.unchecked_transaction()?;
         let access = self.access_on(&tx)?;
         access.actor(actor)?;
-        let runs = rows(
-            tx.prepare("SELECT slug FROM swarm_runs ORDER BY id DESC")?
-                .query_map([], |r| r.get::<_, String>(0))?,
-        )?;
-        let mut items = vec![];
-        for slug in runs {
-            let Some((_, run)) = self.swarm_on(&tx, actor, &slug, Action::Read).ok() else {
-                continue;
-            };
-            let receipt = receipt_on(&tx, &run)?;
-            for d in receipt.decisions {
-                items.push(AttentionItem {
-                    kind: "decision".into(),
-                    action_required: d.request.to == actor,
-                    summary: d.request.summary,
-                    waiting: d.actor,
-                    assigned_to: d.request.to,
-                    message_id: d.id,
-                    run: Some(slug.clone()),
-                    run_id: Some(run.id),
-                    decision_id: Some(d.id),
-                });
-            }
-            for w in &run.workers {
-                if run.status == "active" && w.status == "launch_failed" {
-                    items.push(AttentionItem {
-                        kind: "launch-failed".into(),
-                        action_required: run.can_control,
-                        summary: w.launch_error.clone().unwrap_or_default(),
-                        waiting: w.actor.clone(),
-                        assigned_to: run.coordinator_actor.clone(),
-                        message_id: run.root_id,
-                        run: Some(slug.clone()),
-                        run_id: Some(run.id),
-                        decision_id: None,
-                    });
-                }
-            }
-            for h in receipt
-                .handoffs
-                .into_iter()
-                .filter(|h| !h.superseded && matches!(h.status.as_str(), "fail" | "not-run"))
-            {
-                items.push(AttentionItem {
-                    kind: "verification".into(),
-                    action_required: false,
-                    summary: h
-                        .verification
-                        .as_ref()
-                        .map(|v| v.summary.clone())
-                        .unwrap_or_default(),
-                    waiting: h.verified_by.unwrap_or_default(),
-                    assigned_to: h.actor,
-                    message_id: h.verification_id.unwrap_or(h.id),
-                    run: Some(slug.clone()),
-                    run_id: Some(run.id),
-                    decision_id: None,
-                });
-            }
-        }
-        let tasks=rows(tx.prepare("SELECT t.id,t.owner,t.assignee,t.result,m.channel,coalesce(t.assignee,(SELECT actor FROM events e WHERE e.message_id=t.id AND e.kind IN ('task.blocked','task.failed') ORDER BY cursor DESC LIMIT 1),t.owner) FROM tasks t JOIN messages m USING(id) WHERE t.state IN ('blocked','failed') AND m.deleted=0 ORDER BY t.id")?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?)))?)?;
-        for (id, owner, assignee, reason, channel, waiting) in tasks {
-            if !access.allows(Action::Read, &channel) {
-                continue;
-            }
+        let channels = access
+            .channels(&tx, Action::Read)?
+            .map(|c| serde_json::to_string(&c))
+            .transpose()?;
+        let mut items = rows(tx.prepare(concat!(
+            "WITH selected_runs AS (SELECT id,slug,channel,root_id,status,coordinator_actor FROM swarm_runs
+             WHERE ?1 IS NULL OR channel IN (SELECT value FROM json_each(?1)))",
+            include_str!("current_run_actions.sql"),
+            "SELECT a.kind,a.assigned_to,a.summary,a.waiting,a.source,r.slug,r.id,r.channel
+             FROM current_run_actions a JOIN selected_runs r ON r.id=a.run_id
+             WHERE a.kind != 'awaiting_verification' ORDER BY r.id DESC,a.kind,a.cursor"
+        ))?.query_map([&channels], |r| {
+            let kind: String = r.get(0)?;
+            let assigned_to: String = r.get(1)?;
+            let source = r.get(4)?;
+            let decision = kind == "decision";
+            let launch = kind == "launch_failed";
+            Ok(AttentionItem {
+                action_required: (decision && assigned_to == actor) || (launch &&
+                    SwarmRun::may_control(&access, &r.get::<_,String>(7)?, &assigned_to, actor)),
+                kind: if launch { "launch-failed".into() } else { kind },
+                summary: r.get(2)?, waiting: r.get(3)?, assigned_to,
+                message_id: source, decision_id: decision.then_some(source),
+                run: Some(r.get(5)?), run_id: Some(r.get(6)?),
+            })
+        })?)?;
+        let tasks=rows(tx.prepare("SELECT t.id,t.owner,t.assignee,t.result,coalesce(t.assignee,(SELECT actor FROM events e WHERE e.message_id=t.id AND e.kind IN ('task.blocked','task.failed') ORDER BY cursor DESC LIMIT 1),t.owner) FROM tasks t JOIN messages m USING(id) WHERE t.state IN ('blocked','failed') AND m.deleted=0 AND (?1 IS NULL OR m.channel IN (SELECT value FROM json_each(?1))) ORDER BY t.id")?.query_map([&channels],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?,r.get::<_,String>(4)?)))?)?;
+        for (id, owner, assignee, reason, waiting) in tasks {
             let to = assignee.unwrap_or_else(|| owner.split('/').next().unwrap_or(&owner).into());
             items.push(AttentionItem {
                 kind: "task".into(),

@@ -3,7 +3,7 @@ use anyhow::Result;
 use board_local::{
     Board,
     access::Action,
-    swarm::{SwarmEntry, SwarmFilter, SwarmRun, SwarmWorker},
+    swarm::{SwarmEntry, SwarmFilter, SwarmObservation, SwarmRun, SwarmSummary, SwarmWorker},
 };
 use rune::{TextEdit, Tx};
 use std::collections::HashSet;
@@ -15,6 +15,14 @@ pub enum FeedKind {
     All,
     Public,
     Direct,
+    Addressed,
+}
+#[derive(Default, Clone, Copy, Eq, PartialEq)]
+pub enum SwarmTab {
+    #[default]
+    Overview,
+    Conversation,
+    Receipt,
 }
 #[derive(Default, Clone, Eq, PartialEq)]
 pub enum SwarmTarget {
@@ -25,8 +33,13 @@ pub enum SwarmTarget {
 #[derive(Default)]
 pub struct Observer {
     pub receipt: Option<board_local::swarm::SwarmReceipt>,
-    pub receipt_open: bool,
-    pub runs: Vec<SwarmRun>,
+    pub tab: SwarmTab,
+    pub overview: Option<SwarmObservation>,
+    pub task_starts: Vec<i64>,
+    pub action_starts: Vec<i64>,
+    pub public_seen: i64,
+    pub retired_open: bool,
+    pub runs: Vec<SwarmSummary>,
     pub run: Option<SwarmRun>,
     pub entries: Vec<SwarmEntry>,
     pub run_starts: Vec<i64>,
@@ -76,41 +89,61 @@ fn stale_waiter(_: &SwarmWorker) -> bool {
 }
 impl Observer {
     pub fn load(&mut self, db: &Board, actor: &str, page: Page) -> Result<()> {
-        let mut runs = db.swarm_list(actor, self.run_starts.last().copied(), WINDOW + 1)?;
+        let mut runs = db.swarm_summaries(actor, self.run_starts.last().copied(), WINDOW + 1)?;
         self.older_run = (runs.len() > WINDOW).then(|| runs[WINDOW - 1].id);
         runs.truncate(WINDOW);
         self.runs = runs;
         if let Page::Swarm(id) = page {
             let key = format!("#{id}");
             let run = db.swarm_status(actor, &key)?;
-            if self.run.as_ref().is_none_or(|old| {
-                old.id != run.id || (old.status == "active" && run.status != "active")
-            }) {
-                self.receipt_open = run.status != "active";
+            if self.run.as_ref().is_some_and(|old| old.id != run.id) {
+                self.tab = SwarmTab::Overview;
+                self.task_starts.clear();
+                self.action_starts.clear();
             }
-            self.receipt = Some(db.swarm_receipt(actor, &key)?);
-            let mut page = db.swarm_latest_filtered(
-                actor,
-                &key,
-                self.feed_starts.last().copied(),
-                WINDOW + 1,
-                true,
-                &SwarmFilter {
-                    kind: match self.kind {
-                        FeedKind::All => None,
-                        FeedKind::Public => Some("public".into()),
-                        FeedKind::Direct => Some("dm".into()),
+            self.overview = (self.tab == SwarmTab::Overview)
+                .then(|| {
+                    db.swarm_observe_page(
+                        actor,
+                        &key,
+                        None,
+                        self.action_starts.last().copied().unwrap_or(0),
+                        self.task_starts.last().copied().unwrap_or(0),
+                        WINDOW,
+                    )
+                })
+                .transpose()?;
+            self.receipt = (self.tab == SwarmTab::Receipt)
+                .then(|| db.swarm_receipt(actor, &key))
+                .transpose()?;
+            self.entries.clear();
+            self.older_post = None;
+            if self.tab == SwarmTab::Conversation {
+                self.public_seen = db.swarm_public_seen(actor, &key)?;
+                let mut page = db.swarm_latest_filtered(
+                    actor,
+                    &key,
+                    self.feed_starts.last().copied(),
+                    WINDOW + 1,
+                    true,
+                    &SwarmFilter {
+                        kind: match self.kind {
+                            FeedKind::All => None,
+                            FeedKind::Public => Some("public".into()),
+                            FeedKind::Direct => Some("dm".into()),
+                            FeedKind::Addressed => Some("addressed".into()),
+                        },
+                        worker: self.worker.clone(),
                     },
-                    worker: self.worker.clone(),
-                },
-            )?;
-            if page.entries.len() > WINDOW {
-                page.entries.remove(0);
-                self.older_post = page.entries.first().map(|p| p.cursor);
-            } else {
-                self.older_post = None;
+                )?;
+                if page.entries.len() > WINDOW {
+                    page.entries.remove(0);
+                    self.older_post = page.entries.first().map(|p| p.cursor);
+                } else {
+                    self.older_post = None;
+                }
+                self.entries = page.entries;
             }
-            self.entries = page.entries;
             self.can_send = run.status == "active"
                 && (db.viewer(actor)?.owner
                     || db.explain(actor, &run.channel)?.contains(&Action::Post));
@@ -140,6 +173,19 @@ impl Observer {
     }
 }
 impl State {
+    pub fn swarm_tab(&mut self, tab: SwarmTab) {
+        self.desk.swarm.tab = tab;
+        self.refresh();
+    }
+    pub fn mark_swarm_seen(&mut self, through: i64) {
+        let Page::Swarm(id) = self.page else { return };
+        let result = self
+            .db()
+            .and_then(|db| db.swarm_mark_public_seen(&self.actor, &format!("#{id}"), through));
+        if self.result(result).is_some() {
+            self.refresh();
+        }
+    }
     pub fn begin_decision_answer(&mut self, id: i64) {
         if self.desk.selected_decision == Some(id) {
             return;
@@ -194,6 +240,7 @@ impl State {
         }
     }
     pub fn refresh_swarm_filter(&mut self) {
+        self.desk.swarm.tab = SwarmTab::Conversation;
         self.desk.swarm.feed_starts.clear();
         self.refresh();
     }
@@ -234,7 +281,7 @@ impl State {
             .db()
             .and_then(|db| db.swarm_stop(&self.actor, &format!("#{id}")));
         if self.result(result).is_some() {
-            self.refresh();
+            self.swarm_tab(SwarmTab::Receipt);
         }
     }
     pub fn swarm_page(&mut self, runs: bool, older: bool) {

@@ -146,6 +146,80 @@ impl Drop for Mcp {
 }
 
 #[test]
+fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("portable.sqlite");
+    let mut boss = Mcp::open(board(&db));
+    boss.tool(
+        "swarm_start",
+        json!({"slug":"sample","goal":"Ship a portable brief"}),
+        true,
+    );
+    let register = |name, role| json!({"run":"sample","name":name,"role":role,"brief":"Check only your slice"});
+    let first = boss.tool("swarm_add", register("check", "verifier"), true);
+    assert_eq!(first["selector"], "sample/check");
+    assert!(first.get("skills_dir").is_none());
+    boss.tool("swarm_add", register("build", "implementer"), true);
+    assert!(!tmp.path().join("portable.sqlite.data").exists());
+    assert_eq!(
+        boss.tool("worker_assignment", json!({}), false)["code"],
+        "worker_binding_required"
+    );
+    let mut cmd = board(&db);
+    cmd.args(["--worker", "sample/check"]);
+    let mut worker = Mcp::open(cmd);
+    let assignment = worker.tool("worker_assignment", json!({}), true);
+    assert_eq!(assignment["goal"], "Ship a portable brief");
+    assert_eq!(assignment["worker"]["brief"], "Check only your slice");
+    assert_eq!(assignment["skills"][0]["files"], json!(["SKILL.md"]));
+    let edit = board(&db)
+        .args(["roles", "edit", "verifier", "--prompt", "New role version"])
+        .output()
+        .unwrap();
+    assert!(
+        edit.status.success(),
+        "{}",
+        String::from_utf8_lossy(&edit.stderr)
+    );
+    assert_eq!(
+        worker.tool("worker_assignment", json!({}), true),
+        assignment
+    );
+    let read = worker.tool(
+        "worker_assignment",
+        json!({"skill":"board-verifier","path":"SKILL.md"}),
+        true,
+    );
+    assert!(read["text"].as_str().unwrap().contains("board-verifier"));
+    worker.tool(
+        "worker_assignment",
+        json!({"skill":"board-verifier","path":"../../private"}),
+        false,
+    );
+    worker.tool(
+        "worker_assignment",
+        json!({"skill":"board-implementer","path":"SKILL.md"}),
+        false,
+    );
+    worker.tool("worker_assignment", json!({"name":"build"}), false);
+    worker.tool("swarm_check_in",json!({"compact":true,"model":"example-model","workspace_mode":"isolated","session_ref":"test:session-1"}),true);
+    let status = boss.tool("swarm_status", json!({"run":"sample"}), true);
+    assert_eq!(status["workers"][0]["session_ref"], "test:session-1");
+    assert_eq!(status["workers"][0]["model"], "example-model");
+    assert_eq!(status["workers"][0]["workspace_mode"], "isolated");
+    assert!(status["workers"][1].get("model").is_none());
+    worker.tool("swarm_check_in", json!({"model":"contains\nbreak"}), false);
+    worker.tool(
+        "swarm_check_in",
+        json!({"session_ref":"test:session-2"}),
+        true,
+    );
+    let status = boss.tool("swarm_status", json!({"run":"sample"}), true);
+    assert_eq!(status["workers"][0]["session_ref"], "test:session-2");
+    assert!(status["workers"][0].get("model").is_none());
+}
+
+#[test]
 fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("board test.sqlite3");
@@ -163,7 +237,7 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
     for (name, role) in [("build", "implementer"), ("check", "verifier")] {
         let spawn = chat.tool(
             "swarm_add",
-            json!({"run":"release","name":name,"role":role,"brief":"Test the saved revision"}),
+            json!({"run":"release","name":name,"role":role,"brief":"Test the saved revision","export_local":true}),
             true,
         );
         let actor = format!("ada/{name}");

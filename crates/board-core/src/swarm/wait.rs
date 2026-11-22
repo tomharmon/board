@@ -18,33 +18,33 @@ pub enum SwarmWaitOutcome {
     },
 }
 
-/// An interruptible inbox wait. Dropping it releases the registration without
-/// acknowledging any further notifications.
+/// Delivery does not consume messages. Only an explicit acknowledgment
+/// supplied by the caller advances the participant's durable inbox position.
 pub struct SwarmInboxWait<'a> {
     board: &'a Board,
     actor: String,
     run: String,
     after: i64,
+    ack: Option<i64>,
     target: String,
     pid: u32,
     active: bool,
 }
 impl SwarmInboxWait<'_> {
     fn enter(&mut self) -> Result<()> {
-        self.board.swarm_set_worker_status(
+        self.active = self.board.swarm_set_worker_status(
             &self.actor,
             &self.run,
             &self.target,
             "waiting",
             Some(self.pid),
         )?;
-        self.active = true;
         Ok(())
     }
-    fn leave(&mut self, through: Option<i64>) -> Result<()> {
+    fn leave(&mut self) -> Result<()> {
         if self.active {
             self.board
-                .swarm_leave_wait(&self.actor, &self.run, &self.target, self.pid, through)?;
+                .swarm_leave_wait(&self.actor, &self.run, &self.target, self.pid)?;
             self.active = false;
         }
         Ok(())
@@ -52,7 +52,7 @@ impl SwarmInboxWait<'_> {
 }
 impl Drop for SwarmInboxWait<'_> {
     fn drop(&mut self) {
-        let _ = self.leave(None);
+        let _ = self.leave();
     }
 }
 
@@ -93,10 +93,11 @@ impl Board {
         actor: &str,
         run: &str,
         after: Option<i64>,
+        ack: Option<i64>,
         timeout: Duration,
         mut check_cancel: impl FnMut() -> Result<()>,
     ) -> Result<SwarmWaitOutcome> {
-        let mut wait = self.swarm_inbox_wait(actor, run, after)?;
+        let mut wait = self.swarm_inbox_wait(actor, run, after, ack)?;
         let start = Instant::now();
         loop {
             if let Some(result) = wait.poll(start.elapsed() >= timeout, &mut check_cancel)? {
@@ -114,13 +115,24 @@ impl Board {
         actor: &str,
         run: &str,
         after: Option<i64>,
+        ack: Option<i64>,
     ) -> Result<SwarmInboxWait<'_>> {
+        ensure!(
+            !(after.is_some() && ack.is_some())
+                && after.is_none_or(|v| v >= 0)
+                && ack.is_none_or(|v| v > 0),
+            Invalid.error(
+                "invalid_cursor",
+                "use after to replay or ack with a processed notification cursor"
+            )
+        );
         let (id, target, last) = self.resolve_inbox(actor, run)?;
         Ok(SwarmInboxWait {
             board: self,
             actor: actor.into(),
             run: format!("#{id}"),
             after: after.unwrap_or(last),
+            ack,
             target,
             pid: std::process::id(),
             active: false,
@@ -131,7 +143,11 @@ impl SwarmInboxWait<'_> {
     pub fn try_poll(&mut self, timed_out: bool) -> Result<Option<SwarmWaitOutcome>> {
         let board = self.board;
         match board.try_without_lock_wait(|| self.poll(timed_out, || Ok(()))) {
-            Err(e) if timed_out && crate::errors::classify(&e).0 == crate::errors::Kind::Busy => {
+            Err(e)
+                if timed_out
+                    && self.ack.is_none()
+                    && crate::errors::classify(&e).0 == crate::errors::Kind::Busy =>
+            {
                 Ok(Some(SwarmWaitOutcome::StillWaiting { cursor: self.after }))
             }
             result => result,
@@ -139,13 +155,20 @@ impl SwarmInboxWait<'_> {
     }
     pub fn try_cancel(&mut self) -> Result<()> {
         let board = self.board;
-        board.try_without_lock_wait(|| self.leave(None))
+        board.try_without_lock_wait(|| self.leave())
     }
     pub fn poll(
         &mut self,
         timed_out: bool,
         mut check_cancel: impl FnMut() -> Result<()>,
     ) -> Result<Option<SwarmWaitOutcome>> {
+        if let Some(through) = self.ack {
+            check_cancel()?;
+            self.after =
+                self.board
+                    .swarm_acknowledge(&self.actor, &self.run, &self.target, through)?;
+            self.ack = None;
+        }
         let after = self.after;
         loop {
             check_cancel()?;
@@ -154,12 +177,12 @@ impl SwarmInboxWait<'_> {
                 .swarm_poll_wait(&self.actor, &self.run, &self.target, after)?;
             match poll {
                 WaitPoll::Stopped { cursor } => {
-                    self.leave(None)?;
+                    self.leave()?;
                     return Ok(Some(SwarmWaitOutcome::Stopped { cursor }));
                 }
                 WaitPoll::Pending if timed_out => {
                     // In particular, an empty zero-duration probe never acquires a write transaction.
-                    self.leave(None)?;
+                    self.leave()?;
                     return Ok(Some(SwarmWaitOutcome::StillWaiting { cursor: after }));
                 }
                 WaitPoll::Ready {
@@ -170,12 +193,13 @@ impl SwarmInboxWait<'_> {
                 } => {
                     check_cancel()?;
                     if self.active {
-                        self.leave(Some(cursor))?;
-                    } else if !self.board.swarm_ack_ready(
+                        self.leave()?;
+                    } else if !self.board.swarm_set_worker_status(
                         &self.actor,
                         &self.run,
                         &self.target,
-                        cursor,
+                        "working",
+                        None,
                     )? {
                         continue;
                     }
@@ -216,9 +240,9 @@ impl Board {
     ) -> Result<(Access, SwarmRun)> {
         let (a, mut r) = self.swarm_record(c, actor, run, action)?;
         if !r.operator(actor) {
-            let sql = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? AND actor=?";
+            let sql = format!("{WORKER_SELECT} WHERE w.run_id=? AND w.actor=?");
             r.workers
-                .extend(c.query_row(sql, params![r.id, actor], worker).optional()?);
+                .extend(c.query_row(&sql, params![r.id, actor], worker).optional()?);
         }
         Ok((a, r))
     }
@@ -302,7 +326,7 @@ impl Board {
         target: &str,
         status: &str,
         waiter_pid: Option<u32>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         ensure!(
             matches!(status, "working" | "waiting" | "done")
                 && (status == "waiting") == waiter_pid.is_some()
@@ -313,12 +337,12 @@ impl Board {
             )
         );
         self.write(|tx|{
-            let (_,r)=self.swarm_on(tx,actor,run,Action::Post)?;
+            let (_,r)=self.swarm_waiting_on(tx,actor,run,Action::Post)?;
             let w=wait_for(&r,actor,target)?;
             // Stop between reading status and entering wait must still produce a stopped response.
-            if r.status!="active"{return Ok(());}
+            if r.status!="active"{return Ok(false);}
             if let Some(w)=w {
-                if matches!(w.status.as_str(),"done"|"stopped"){return Ok(());}
+                if matches!(w.status.as_str(),"done"|"stopped"){return Ok(false);}
                 if w.status!=status || w.waiter_pid!=waiter_pid {
                     tx.execute("UPDATE swarm_workers SET status=?,waiter_pid=?,updated_at=?3,checked_in_at=coalesce(checked_in_at,?3),last_activity_at=?3,launch_error=NULL WHERE id=?4",params![status,waiter_pid,crate::now(),w.id])?;
                     status_event(tx,&r,actor,target,status)?;
@@ -326,68 +350,46 @@ impl Board {
             }else{
                 ensure!(status!="done",Invalid.error("invalid_worker_status","stop the run instead of completing the coordinator"));
                 tx.execute("UPDATE swarm_runs SET coordinator_pid=? WHERE id=? AND coordinator_pid IS NOT ?",params![waiter_pid,r.id,waiter_pid])?;
-            }Ok(())
+            }Ok(true)
         })
     }
-    fn swarm_ack_ready(&self, actor: &str, run: &str, target: &str, through: i64) -> Result<bool> {
+    fn swarm_acknowledge(&self, actor: &str, run: &str, target: &str, through: i64) -> Result<i64> {
         self.write(|tx| {
-            let (_, r) = self.swarm_on(tx, actor, run, Action::Post)?;
+            let (_, r) = self.swarm_waiting_on(tx, actor, run, Action::Post)?;
             let w = wait_for(&r, actor, target)?;
-            if r.status != "active"
-                || w.is_some_and(|w| matches!(w.status.as_str(), "done" | "stopped"))
-            {
-                return Ok(false);
-            }
             ensure!(
                 tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM swarm_notifications WHERE run_id=? AND target_worker=? AND event_cursor=?)",
                     params![r.id, target, through],
                     |s| s.get::<_, bool>(0),
                 )?,
-                Invalid.error("invalid_cursor", "expected a delivered notification cursor")
+                Invalid.error("invalid_cursor", "ack must be a notification cursor from your own inbox")
             );
             if let Some(w) = w {
-                let was_waiting = w.status != "working";
-                if was_waiting || w.waiter_pid.is_some() || w.last_read_cursor < through {
-                    tx.execute(
-                        "UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL,last_read_cursor=max(last_read_cursor,?2) WHERE id=?3",
-                        params![crate::now(), through, w.id],
-                    )?;
+                if through > w.last_read_cursor {
+                    tx.execute("UPDATE swarm_workers SET last_read_cursor=? WHERE id=?", params![through,w.id])?;
                 }
-                if was_waiting {
-                    status_event(tx, &r, actor, target, "working")?;
-                }
+                Ok(through.max(w.last_read_cursor))
             } else {
-                tx.execute(
-                    "UPDATE swarm_runs SET coordinator_cursor=max(coordinator_cursor,?),coordinator_pid=NULL WHERE id=?",
-                    params![through, r.id],
-                )?;
+                let last: i64 = tx.query_row("SELECT coordinator_cursor FROM swarm_runs WHERE id=?", [r.id], |row| row.get(0))?;
+                if through > last {
+                    tx.execute("UPDATE swarm_runs SET coordinator_cursor=? WHERE id=?", params![through,r.id])?;
+                }
+                Ok(through.max(last))
             }
-            Ok(true)
         })
     }
-    pub fn swarm_leave_wait(
-        &self,
-        actor: &str,
-        run: &str,
-        target: &str,
-        pid: u32,
-        through: Option<i64>,
-    ) -> Result<()> {
-        self.write(|tx|{let (_,r)=self.swarm_on(tx,actor,run,Action::Post)?;
+    pub fn swarm_leave_wait(&self, actor: &str, run: &str, target: &str, pid: u32) -> Result<()> {
+        self.write(|tx|{let (_,r)=self.swarm_waiting_on(tx,actor,run,Action::Post)?;
             let w=wait_for(&r,actor,target)?;
             if r.status!="active"{return Ok(());}
-            if let Some(position)=through {
-                ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM swarm_notifications WHERE run_id=? AND target_worker=? AND event_cursor=?)",params![r.id,target,position],|s|s.get::<_,bool>(0))?,
-                        Invalid.error("invalid_cursor","expected a delivered notification cursor"));
-            }
             if let Some(w)=w {
                 if w.status=="waiting" && w.waiter_pid==Some(pid) {
-                    tx.execute("UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL,last_read_cursor=max(last_read_cursor,?2) WHERE id=?3",params![crate::now(),through.unwrap_or(0),w.id])?;
+                    tx.execute("UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL WHERE id=?2",params![crate::now(),w.id])?;
                     status_event(tx,&r,actor,target,"working")?;
                 }
             }else{
-                tx.execute("UPDATE swarm_runs SET coordinator_cursor=max(coordinator_cursor,?),coordinator_pid=NULL WHERE id=? AND coordinator_pid=?",params![through.unwrap_or(0),r.id,pid])?;
+                tx.execute("UPDATE swarm_runs SET coordinator_pid=NULL WHERE id=? AND coordinator_pid=?",params![r.id,pid])?;
             }Ok(())})
     }
     pub fn swarm_done(&self, actor: &str, run: &str, summary: Option<&str>) -> Result<SwarmWorker> {

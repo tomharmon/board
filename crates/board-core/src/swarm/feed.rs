@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::PublicDestination;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SwarmFilter {
@@ -50,6 +51,37 @@ pub(super) fn spend(tx: &Transaction, run: &SwarmRun, actor: &str, n: i64) -> Re
 }
 fn live(w: &SwarmWorker) -> bool {
     !matches!(w.status.as_str(), "done" | "stopped")
+}
+fn route_public(
+    tx: &Transaction,
+    run: &SwarmRun,
+    m: &Message,
+    targets: BTreeSet<String>,
+) -> Result<Vec<String>> {
+    tx.execute(
+        "UPDATE swarm_workers SET last_activity_at=? WHERE run_id=? AND actor=?",
+        params![crate::now(), run.id, m.actor],
+    )?;
+    let mut suppressed = Vec::new();
+    let mut used = 0;
+    for who in targets {
+        let peer = who != "coordinator" && !run.can_control;
+        if peer && run.notifications_sent + used >= run.max_notifications {
+            Board::event_tx(
+                tx,
+                "swarm.notification_suppressed",
+                &m.actor,
+                Some(m.id),
+                serde_json::json!({"run":run.slug,"target":who}),
+            )?;
+            suppressed.push(who);
+        } else {
+            notify(tx, run, &m.actor, &who, "mention", m.id, Some(m.id))?;
+            used += i64::from(peer);
+        }
+    }
+    spend(tx, run, &m.actor, used)?;
+    Ok(suppressed)
 }
 fn resolve(run: &SwarmRun, actor: &str, text: &str) -> (String, BTreeSet<String>) {
     let mut out = String::new();
@@ -145,56 +177,113 @@ impl Board {
         text: &str,
         opts: &PostOptions,
     ) -> Result<SwarmPostResult> {
+        Ok(self
+            .publish_public_on(tx, a, actor, PublicDestination::Run(r), text, opts)?
+            .0)
+    }
+
+    pub(crate) fn publish_public_on(
+        &self,
+        tx: &Transaction,
+        a: &Access,
+        actor: &str,
+        destination: PublicDestination<'_>,
+        text: &str,
+        opts: &PostOptions,
+    ) -> Result<(SwarmPostResult, bool)> {
+        a.actor(actor)?;
+        let reply_channel;
+        let (channel, parent, known_run) = match destination {
+            PublicDestination::Channel(channel) => (channel, None, None),
+            PublicDestination::Reply(id) => {
+                reply_channel = a.message(tx, id, Action::Post)?;
+                (reply_channel.as_str(), Some(id), None)
+            }
+            PublicDestination::Run(r) => (r.channel.as_str(), None, Some(r)),
+        };
+        a.require(Action::Post, channel)?;
         a.files(tx, actor, &opts.attachment_ids)?;
         if !opts.labels.is_empty() {
-            a.require(Action::Label, &r.channel)?;
+            a.require(Action::Label, channel)?;
         }
-        let (within, mut hits) = resolve(r, actor, text);
-        let (body, resolutions) = crate::actors::settle(tx, a, actor, None, &within)?;
-        for resolution in &resolutions {
-            if let Some(person) = &resolution.actor {
-                if let Some(w) = r
-                    .workers
-                    .iter()
-                    .find(|w| w.actor == person.id && w.actor != actor && live(w))
-                {
-                    hits.insert(w.name.clone());
-                }
-                if r.coordinator_actor == person.id && actor != person.id {
-                    hits.insert("coordinator".into());
-                }
+        // A blind post must not resolve names against a roster the writer cannot read.
+        let blind = !a.allows(Action::Read, channel);
+        let loaded = if known_run.is_none() && !blind && channel.starts_with("swarms/") {
+            let slug: Option<String> = tx
+                .query_row(
+                    "SELECT slug FROM swarm_runs WHERE channel=?",
+                    [channel],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            slug.map(|slug| {
+                self.swarm_on(tx, actor, &slug, Action::Post)
+                    .map(|(_, r)| r)
+            })
+            .transpose()?
+        } else {
+            None
+        };
+        let run = known_run.or(loaded.as_ref());
+        let active = run.filter(|r| r.status == "active");
+        let (within, mut hits) = match active {
+            Some(r) => {
+                let (body, hits) = resolve(r, actor, text);
+                (std::borrow::Cow::Owned(body), hits)
             }
-        }
-        let (m, created) = Board::post_tx_with_outcome(tx, &r.channel, actor, &body, opts)?;
+            None => (std::borrow::Cow::Borrowed(text), BTreeSet::new()),
+        };
+        let (body, resolutions) = crate::actors::settle(tx, a, actor, parent, &within)?;
+        let (m, created) = match parent {
+            Some(id) => Board::reply_tx_with_outcome(tx, id, actor, &body, opts)?,
+            None => Board::post_tx_with_outcome(tx, channel, actor, &body, opts)?,
+        };
         let mut suppressed = vec![];
-        let mut used = 0;
         if created {
-            if let Some(target) = super::coordination::record_on(tx, a, r, &m)? {
-                hits.insert(target);
-            }
-            tx.execute(
-                "UPDATE swarm_workers SET last_activity_at=? WHERE run_id=? AND actor=?",
-                params![crate::now(), r.id, actor],
-            )?;
-            for who in hits {
-                let peer = who != "coordinator" && !r.can_control;
-                if peer && r.notifications_sent + used >= r.max_notifications {
-                    suppressed.push(who);
-                    continue;
+            let target = super::coordination::record_on(tx, a, run, &m)?;
+            if let Some(r) = run {
+                if let Some(target) = target {
+                    hits.insert(target);
                 }
-                notify(tx, r, actor, &who, "mention", m.id, Some(m.id))?;
-                if peer {
-                    used += 1;
+                if active.is_some() {
+                    for person in resolutions.iter().filter_map(|v| v.actor.as_ref()) {
+                        if person.id != actor
+                            && let Some(name) = r.name_for(&person.id)
+                            && (name == "coordinator"
+                                || r.workers.iter().any(|w| w.name == name && live(w)))
+                        {
+                            hits.insert(name.to_owned());
+                        }
+                    }
                 }
+                suppressed = route_public(tx, r, &m, hits)?;
             }
-            spend(tx, r, actor, used)?;
         }
-        let notified = notified_on(tx, m.id)?;
-        Ok(SwarmPostResult {
-            message: crate::actors::write_view(a.view(tx, m)?, &body, resolutions, false),
-            notified,
-            suppressed,
-        })
+        let notified = if run.is_some() {
+            notified_on(tx, m.id)?
+        } else {
+            vec![]
+        };
+        let message = if blind {
+            if created {
+                tx.execute("INSERT INTO blind_posts VALUES(?)", [m.id])?;
+            }
+            ensure!(
+                a.blind_on(tx, m.id)?,
+                Conflict.error("duplicate_id", "client key belongs to a different write")
+            );
+            a.original(tx, m.id)?
+        } else {
+            a.view(tx, m)?
+        };
+        Ok((
+            SwarmPostResult {
+                message: crate::actors::write_view(message, &body, resolutions, blind),
+                notified,
+                suppressed,
+            },
+            created,
+        ))
     }
     pub fn swarm_dm(&self, actor: &str, run: &str, to_worker: &str, text: &str) -> Result<SwarmDm> {
         ensure!(
@@ -225,15 +314,25 @@ impl Board {
         limit: usize,
         include_dms_for_all: bool,
     ) -> Result<SwarmFeed> {
-        self.swarm_entries(
+        self.swarm_read_filtered(
             actor,
             run,
             after,
             limit,
             include_dms_for_all,
             &SwarmFilter::default(),
-            false,
         )
+    }
+    pub fn swarm_read_filtered(
+        &self,
+        actor: &str,
+        run: &str,
+        after: i64,
+        limit: usize,
+        include_dms_for_all: bool,
+        filter: &SwarmFilter,
+    ) -> Result<SwarmFeed> {
+        self.swarm_entries(actor, run, after, limit, include_dms_for_all, filter, false)
     }
     pub fn swarm_latest(
         &self,
@@ -289,8 +388,11 @@ impl Board {
         let tx = self.conn.unchecked_transaction()?;
         let (a, r) = self.swarm_on(&tx, actor, run, Action::Read)?;
         ensure!(
-            matches!(filter.kind.as_deref(), None | Some("public" | "dm")),
-            Invalid.error("invalid_swarm_filter", "expected public or dm")
+            matches!(
+                filter.kind.as_deref(),
+                None | Some("public" | "dm" | "addressed")
+            ),
+            Invalid.error("invalid_swarm_filter", "expected public, dm or addressed")
         );
         let author = filter
             .worker
@@ -309,10 +411,25 @@ impl Board {
             .transpose()?;
         let op = if older { "<" } else { ">" };
         let order = if older { "DESC" } else { "ASC" };
+        // An intended recipient remains an addressee even if the peer wake budget was exhausted.
+        let addressed = |actor: &str, worker: &str| {
+            format!("(
+                EXISTS(SELECT 1 FROM exact_mentions x WHERE x.message_id=messages.id AND x.actor={actor})
+                OR EXISTS(SELECT 1 FROM swarm_notifications n WHERE n.message_id=messages.id AND n.target_worker={worker})
+                OR EXISTS(SELECT 1 FROM swarm_evidence e LEFT JOIN swarm_evidence parent
+                    ON parent.run_id=e.run_id AND parent.message_id=coalesce(json_extract(e.payload,'$.handoff'),json_extract(e.payload,'$.request'))
+                    WHERE e.message_id=messages.id AND CASE e.kind
+                        WHEN 'decision-request' THEN json_extract(e.payload,'$.to')={actor}
+                        WHEN 'handoff' THEN json_extract(e.payload,'$.to')={worker}
+                        ELSE parent.actor={actor} END))")
+        };
+        let mine = addressed("?6", "?7");
+        let member = addressed("?11", "?10");
         let sql=format!("SELECT id AS cursor,0 AS dm,id FROM messages WHERE channel=?1 AND id>=?2 AND id{op}?3
-            AND (?9 IS NULL OR ?9='public') AND (?10 IS NULL OR actor=?11 OR EXISTS(SELECT 1 FROM swarm_notifications n WHERE n.message_id=messages.id AND n.target_worker=?10))
+            AND (?9 IS NULL OR ?9='public' OR (?9='addressed' AND {mine}))
+            AND (?10 IS NULL OR actor=?11 OR {member})
             UNION ALL SELECT event_cursor,1,id FROM swarm_dms WHERE run_id=?4 AND event_cursor{op}?3 AND (?5 OR from_actor=?6 OR to_worker=?7)
-            AND (?9 IS NULL OR ?9='dm') AND (?10 IS NULL OR from_actor=?11 OR to_worker=?10)
+            AND (?9 IS NULL OR ?9='dm' OR (?9='addressed' AND to_worker=?7)) AND (?10 IS NULL OR from_actor=?11 OR to_worker=?10)
             ORDER BY cursor {order} LIMIT ?8");
         let mut batch = rows(tx.prepare(&sql)?.query_map(
             params![

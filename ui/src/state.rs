@@ -19,7 +19,7 @@ pub use files::{AttachmentPreview, Preview};
 pub use layout::Layout;
 pub use people::People;
 pub use roles::{RoleConfirm, RoleMode};
-pub use swarms::{FeedKind, SwarmTarget};
+pub use swarms::{FeedKind, SwarmTab, SwarmTarget};
 pub use templates::SchemaPart;
 pub use video::Clip;
 pub use workspace::{ActivityMode, Desk, TaskCommand};

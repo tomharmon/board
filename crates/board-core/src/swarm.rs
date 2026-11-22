@@ -1,10 +1,12 @@
 //! Local coordination records. The calling harness, never Board, launches agents.
 mod feed;
 pub use feed::SwarmFilter;
+mod assignment;
 mod coordination;
+pub use assignment::{Assignment, AssignmentFile};
 mod materialize;
 mod observe;
-pub use observe::{RunAction, RunChange, SwarmObservation};
+pub use observe::{RunAction, RunChange, RunThread, SwarmObservation};
 mod wait;
 use crate::{
     Board, Message, PostOptions,
@@ -93,6 +95,16 @@ pub struct SwarmAddWorker {
     pub workspace_path: Option<String>,
     pub branch_name: Option<String>,
 }
+#[derive(Debug, Serialize)]
+pub struct SwarmSummary {
+    pub id: i64,
+    pub slug: String,
+    pub goal: String,
+    pub channel: String,
+    pub coordinator_actor: String,
+    pub status: String,
+    pub worker_count: i64,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmRun {
     pub id: i64,
@@ -115,11 +127,12 @@ pub struct SwarmRun {
 }
 impl SwarmRun {
     fn operator(&self, actor: &str) -> bool {
-        self.coordinator_actor == actor
-            || self
-                .coordinator_actor
-                .split_once('/')
-                .is_some_and(|(person, _)| person == actor)
+        crate::core::owned_by(&self.coordinator_actor, actor)
+    }
+    fn may_control(access: &Access, channel: &str, coordinator: &str, actor: &str) -> bool {
+        access.allows(Action::Post, channel)
+            && (crate::core::owned_by(coordinator, actor)
+                || (access.is_trusted() && !actor.contains('/')))
     }
     fn control(&self) -> Result<()> {
         ensure!(
@@ -171,6 +184,13 @@ pub struct SwarmWorker {
     pub checked_in_at: Option<String>,
     pub last_activity_at: Option<String>,
     pub launch_error: Option<String>,
+    /// Self-reported details; never credentials, commands, or proof of liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedWorker {
@@ -213,6 +233,13 @@ impl WorkerBinding {
             )
             .into()
     }
+}
+#[derive(Debug, Serialize)]
+pub struct RegisteredWorker {
+    pub run: String,
+    pub channel: String,
+    pub selector: String,
+    pub worker: SwarmWorker,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmPostResult {
@@ -290,7 +317,7 @@ fn location(s: Option<&str>) -> Result<()> {
 fn rows<T>(it: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
     Ok(it.collect::<rusqlite::Result<_>>()?)
 }
-const WORKERS: &str = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? ORDER BY id";
+const WORKER_SELECT: &str = "SELECT w.id,w.run_id,w.name,w.actor,w.role_slug,w.pinned_role_version,w.brief,w.workspace_path,w.branch_name,w.status,w.waiter_pid,w.last_read_cursor,w.created_at,w.updated_at,w.checked_in_at,w.last_activity_at,w.launch_error,p.model,p.workspace_mode,p.session_ref FROM swarm_workers w LEFT JOIN swarm_worker_runtime p ON p.worker_id=w.id";
 fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
     Ok(SwarmWorker {
         id: r.get(0)?,
@@ -310,6 +337,9 @@ fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
         checked_in_at: r.get(14)?,
         last_activity_at: r.get(15)?,
         launch_error: r.get(16)?,
+        model: r.get(17)?,
+        workspace_mode: r.get(18)?,
+        session_ref: r.get(19)?,
     })
 }
 
@@ -367,8 +397,7 @@ impl Board {
             .filter(|v| a.allows(Action::Read, &v.channel))
             .context(Missing.error("swarm_not_found", "swarm not found"))?;
         a.require(action, &run.channel)?;
-        run.can_control = a.allows(Action::Post, &run.channel)
-            && (run.operator(actor) || (a.is_trusted() && !actor.contains('/')));
+        run.can_control = SwarmRun::may_control(&a, &run.channel, &run.coordinator_actor, actor);
         Ok((a, run))
     }
     fn swarm_on(
@@ -379,7 +408,10 @@ impl Board {
         action: Action,
     ) -> Result<(Access, SwarmRun)> {
         let (a, mut run) = self.swarm_record(c, actor, reference, action)?;
-        run.workers = rows(c.prepare(WORKERS)?.query_map([run.id], worker)?)?;
+        run.workers = rows(
+            c.prepare(&format!("{WORKER_SELECT} WHERE w.run_id=? ORDER BY w.id"))?
+                .query_map([run.id], worker)?,
+        )?;
         Ok((a, run))
     }
     fn swarm_overview(&self, c: &Connection, actor: &str, reference: &str) -> Result<SwarmRun> {
@@ -394,6 +426,47 @@ impl Board {
         let r = self.swarm_overview(&tx, actor, run)?;
         tx.commit()?;
         Ok(r)
+    }
+    /// Run picker: count members, without fetching their briefs or inspecting private feeds.
+    pub fn swarm_summaries(
+        &self,
+        actor: &str,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<SwarmSummary>> {
+        ensure!(
+            (1..=500).contains(&limit),
+            Invalid.error("invalid_limit", "limit must be between 1 and 500")
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        let a = self.access_on(&tx)?;
+        a.actor(actor)?;
+        let channels = a
+            .channels(&tx, Action::Read)?
+            .map(|c| serde_json::to_string(&c))
+            .transpose()?;
+        let result = rows(
+            tx.prepare(
+                "SELECT r.id,r.slug,r.goal,r.channel,r.coordinator_actor,r.status,
+                    (SELECT count(*) FROM swarm_workers w WHERE w.run_id=r.id)
+             FROM swarm_runs r WHERE r.id<coalesce(?1,9223372036854775807)
+                AND (?2 IS NULL OR r.channel IN (SELECT value FROM json_each(?2)))
+             ORDER BY r.id DESC LIMIT ?3",
+            )?
+            .query_map(params![before, channels, limit as i64], |s| {
+                Ok(SwarmSummary {
+                    id: s.get(0)?,
+                    slug: s.get(1)?,
+                    goal: s.get(2)?,
+                    channel: s.get(3)?,
+                    coordinator_actor: s.get(4)?,
+                    status: s.get(5)?,
+                    worker_count: s.get(6)?,
+                })
+            })?,
+        )?;
+        tx.commit()?;
+        Ok(result)
     }
     pub fn swarm_list(
         &self,
@@ -471,6 +544,24 @@ impl Board {
         run: &str,
         args: &SwarmAddWorker,
     ) -> Result<SpawnedWorker> {
+        let registered = self.swarm_register_worker(actor, run, args)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let (access, r) = self.swarm_record(&tx, actor, &registered.run, Action::Post)?;
+        r.control()?;
+        r.active()?;
+        if registered.worker.role_slug.is_some() {
+            access.trusted()?;
+        }
+        let (prompt, skills) = Self::pinned_assignment(&tx, registered.worker.id)?;
+        tx.commit()?;
+        self.materialize_spawn(&r, registered.worker, &prompt, &skills)
+    }
+    pub fn swarm_register_worker(
+        &self,
+        actor: &str,
+        run: &str,
+        args: &SwarmAddWorker,
+    ) -> Result<RegisteredWorker> {
         ensure!(
             valid_slug(&args.name, 24) && !matches!(args.name.as_str(), "all" | "coordinator"),
             Invalid.error("invalid_worker_name", "invalid or reserved worker name")
@@ -490,11 +581,10 @@ impl Board {
                 // A scoped channel credential is not permission to export the private role library.
                 access.trusted()?;
             }
+            let registered = |worker| RegisteredWorker {run:r.slug.clone(),channel:r.channel.clone(),selector:format!("{}/{}",r.slug,args.name),worker};
             if let Some(w)=r.workers.iter().find(|w|w.name==args.name){
                 ensure!(w.role_slug==args.role_slug && w.brief==args.brief && w.workspace_path==args.workspace_path && w.branch_name==args.branch_name, Conflict.error("worker_exists","that worker name already has a different assignment"));
-                let (p,s):(String,String)=tx.query_row("SELECT pinned_system_prompt,pinned_skills_json FROM swarm_workers WHERE id=?",[w.id],|r|Ok((r.get(0)?,r.get(1)?)))?;
-                let skills:Vec<crate::roles::PinnedSkill>=serde_json::from_str(&s)?;
-                return self.materialize_spawn(&r,w.clone(),&p,&skills);
+                return Ok(registered(w.clone()));
             }
             ensure!(r.workers.len()<128,Invalid.error("worker_limit","a run may have up to 128 workers"));
             let (version,prompt,skills)=if let Some(slug)=&args.role_slug {
@@ -504,9 +594,9 @@ impl Board {
             let m=Self::post_tx(tx,&r.channel,actor,&body,&PostOptions{no_sync:true,..Default::default()})?;
             tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'registered',?,?,?)",
                 params![r.id,args.name,who,args.role_slug,version,prompt,serde_json::to_string(&skills)?,args.brief,args.workspace_path,args.branch_name,m.id,time,time])?;
-            let w=tx.query_row("SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? AND name=?",params![r.id,args.name],worker)?;
+            let w=tx.query_row(&format!("{WORKER_SELECT} WHERE w.run_id=? AND w.name=?"),params![r.id,args.name],worker)?;
             Board::event_tx(tx,"swarm.registered",actor,Some(m.id),serde_json::json!({"run":r.slug,"worker":w.name}))?;
-            self.materialize_spawn(&r,w,&prompt,&skills)
+            Ok(registered(w))
         })
     }
     pub fn swarm_stop(&self, actor: &str, run: &str) -> Result<SwarmRun> {

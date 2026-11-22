@@ -12,6 +12,7 @@ const V15_COORDINATOR: &str = "126e1fc1455726325dfb5b7b3ad822fe5da73d0fb875e8285
 const V16_COORDINATOR: &str = "d5c9b58a6134fd9eaf47ff47709425345bf1989810ec2020035a9471312f65de";
 const V17_COORDINATOR: &str = "aeefde429f1a99e6215f088492e5cc82fde51abb27aada00192014a28e46bee7";
 const V18_COORDINATOR: &str = "1f8dc7910259ea679e342a625199892fa2b190c02b5623c251379cd4d6e95304";
+const V19_COORDINATOR: &str = "dacab208ee6cb4e680a95db03491735e1c2da60cea43cb55301af8ede5cab456";
 const FILE: &str = "board-swarm/SKILL.md";
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -86,7 +87,7 @@ fn contents(file: &Path) -> Result<Contents> {
         }
         if matches!(
             format!("{:x}", Sha256::digest(text.as_bytes())).as_str(),
-            V15_COORDINATOR | V16_COORDINATOR | V17_COORDINATOR | V18_COORDINATOR
+            V15_COORDINATOR | V16_COORDINATOR | V17_COORDINATOR | V18_COORDINATOR | V19_COORDINATOR
         ) {
             return Ok(Contents::Previous);
         }
@@ -346,6 +347,7 @@ mod tests {
         for previous in [
             include_bytes!("../tests/fixtures/coordinator-v17.md").as_slice(),
             include_bytes!("../tests/fixtures/coordinator-v18.md").as_slice(),
+            include_bytes!("../tests/fixtures/coordinator-v19.md").as_slice(),
         ] {
             fs::write(&file, previous).unwrap();
             assert_eq!(dest.install(false).unwrap().0, "upgraded");

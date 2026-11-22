@@ -65,6 +65,20 @@ fn registration_is_not_execution_and_activity_does_not_imply_launch_failure() ->
         },
     )?;
     b.swarm_launch_failed("ada", "audit", "review", "Harness rejected launch")?;
+    let failed = b.attention("ada")?;
+    assert_eq!(
+        failed
+            .iter()
+            .map(|i| i.waiting.as_str())
+            .collect::<Vec<_>>(),
+        ["ada/verify", "ada/review"]
+    );
+    assert!(
+        failed
+            .iter()
+            .all(|i| i.kind == "launch-failed" && i.action_required && i.assigned_to == "ada")
+    );
+    assert!(b.attention("ada/impl")?.iter().all(|i| !i.action_required));
     let view = b.swarm_observe("ada", "audit", None, 0, 10)?;
     assert_eq!(
         view.actions
@@ -144,6 +158,152 @@ fn post(b: &Board, who: &str, schema: &str, data: Value) -> Result<i64> {
 }
 
 #[test]
+fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<()> {
+    use board_local::automation::{TaskTarget, create_task};
+    let b = board()?;
+    let mut opts = PostOptions::default();
+    opts.labels.insert("workstream".into(), "Storage".into());
+    let task = |channel, text| {
+        create_task(
+            &b,
+            "ada",
+            TaskTarget::New {
+                channel,
+                text,
+                options: &opts,
+            },
+            &[],
+            Some("ada/impl"),
+        )
+    };
+    let first = task(
+        "swarms/audit",
+        "Verify migration\nLong details stay in the thread",
+    )?;
+    task("elsewhere", "Foreign queue")?;
+    let last = task("swarms/audit", "Check restore")?;
+    let revision = json!({"kind":"sha256","value":"a".repeat(64)});
+    let publish = |r: &Value| {
+        post(
+            &b,
+            "ada/impl",
+            "handoff",
+            json!({"task":first.id,"revision":r,
+        "summary":"Ready","changes":["storage.rs"],"to":"verify"}),
+        )
+    };
+    let handoff = publish(&revision)?;
+    let check = post(
+        &b,
+        "ada/verify",
+        "verification",
+        json!({"handoff":handoff,"revision":revision,"summary":"Tested",
+        "checks":[{"name":"restore","status":"pass","command":"test restore"}]}),
+    )?;
+    let view = b.swarm_observe("ada", "audit", None, 0, 1)?;
+    assert_eq!(view.next_task_after, Some(first.id));
+    assert_eq!(view.goal, "Verify a revision");
+    let thread = &view.threads[0];
+    assert_eq!(
+        (
+            &*thread.title,
+            thread.workstream.as_deref(),
+            thread.assignee.as_deref()
+        ),
+        ("Verify migration", Some("Storage"), Some("ada/impl"))
+    );
+    assert_eq!(
+        (thread.latest_handoff, thread.latest_check),
+        (Some(handoff), Some(check))
+    );
+    let next = b.swarm_observe_page("ada", "audit", None, 0, first.id, 1)?;
+    assert_eq!(next.threads[0].id, last.id);
+    assert!(next.next_task_after.is_none());
+    let newer = publish(&json!({"kind":"sha256","value":"b".repeat(64)}))?;
+    let thread = &b.swarm_observe("ada", "audit", None, 0, 1)?.threads[0];
+    assert_eq!(
+        (thread.latest_handoff, thread.latest_check),
+        (Some(newer), None)
+    );
+    Ok(())
+}
+
+#[test]
+fn public_bookmarks_and_addressed_filters_do_not_consume_another_inbox() -> Result<()> {
+    let b = board()?;
+    let msg = b
+        .swarm_post("ada", "audit", "@verify review", &Default::default())?
+        .message
+        .id;
+    b.swarm_dm("ada", "audit", "impl", "Different recipient")?;
+    let dm = b.swarm_dm("ada", "audit", "verify", "Private question")?;
+    let before = b.swarm_status("ada", "audit")?.workers;
+    b.swarm_mark_public_seen("ada", "audit", msg)?;
+    assert_eq!(b.swarm_public_seen("ada", "audit")?, msg);
+    assert_eq!(b.swarm_public_seen("ada/verify", "audit")?, 0);
+    assert!(
+        b.swarm_mark_public_seen("ada", "audit", dm.event_cursor)
+            .is_err()
+    );
+    let entries = b
+        .swarm_read_filtered(
+            "ada/verify",
+            "audit",
+            msg - 1,
+            10,
+            false,
+            &SwarmFilter {
+                kind: Some("addressed".into()),
+                worker: None,
+            },
+        )?
+        .entries;
+    assert_eq!(
+        entries.iter().map(|e| e.cursor).collect::<Vec<_>>(),
+        [msg, dm.event_cursor]
+    );
+    let after = b.swarm_status("ada", "audit")?.workers;
+    assert_eq!(before[1].last_read_cursor, after[1].last_read_cursor);
+    b.swarm_set_limit("ada", "audit", 0)?;
+    let handoff = post(
+        &b,
+        "ada/impl",
+        "handoff",
+        json!({"revision":{"kind":"sha256","value":"a".repeat(64)},
+        "summary":"Quiet handoff","changes":["artifact"],"to":"verify"}),
+    )?;
+    let entries = b
+        .swarm_read_filtered(
+            "ada/verify",
+            "audit",
+            dm.event_cursor,
+            10,
+            false,
+            &SwarmFilter {
+                kind: Some("addressed".into()),
+                worker: None,
+            },
+        )?
+        .entries;
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].cursor, handoff);
+    assert!(entries[0].notified.is_empty());
+    let member_view = b.swarm_read_filtered(
+        "ada",
+        "audit",
+        dm.event_cursor,
+        10,
+        true,
+        &SwarmFilter {
+            kind: Some("public".into()),
+            worker: Some("verify".into()),
+        },
+    )?;
+    assert_eq!(member_view.entries[0].cursor, handoff);
+    Ok(())
+}
+
+#[test]
 fn receipt_binds_checks_to_the_exact_handoff_and_resolves_explicit_decisions() -> Result<()> {
     let b = board()?;
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
@@ -182,13 +342,18 @@ fn receipt_binds_checks_to_the_exact_handoff_and_resolves_explicit_decisions() -
             .any(|a| a.message_id == decision && a.assigned_to == "ada")
     );
     assert_eq!(receipt.decisions.len(), 1);
-    assert_eq!(
-        b.attention("ada")?
-            .iter()
-            .filter(|i| i.action_required)
-            .count(),
-        1
-    );
+    let inbox = b.attention("ada")?;
+    assert_eq!(inbox.iter().filter(|i| i.action_required).count(), 1);
+    assert!(inbox.iter().any(|i| {
+        i.kind == "verification"
+            && !i.action_required
+            && i.waiting == "ada/verify"
+            && i.assigned_to == "ada/impl"
+            && snapshot
+                .actions
+                .iter()
+                .any(|a| a.message_id == i.message_id && a.summary == i.summary)
+    }));
     assert!(
         post(
             &b,
@@ -214,6 +379,10 @@ fn receipt_binds_checks_to_the_exact_handoff_and_resolves_explicit_decisions() -
     let receipt = b.swarm_receipt("ada", "audit")?;
     let current = b.swarm_observe("ada", "audit", None, 0, 20)?;
     assert_eq!(current.actions.len(), 1);
+    assert!(
+        b.attention("ada")?.is_empty(),
+        "an unverified handoff should not alert the operator"
+    );
     assert_eq!(
         (
             current.actions[0].message_id,

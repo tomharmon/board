@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 
 pub const MAX_DIRECT_BYTES: i64 = 100 * 1024 * 1024;
+pub const FILE_CHUNK_BYTES: usize = 64 * 1024;
 pub(crate) fn binary_type() -> String {
     "application/octet-stream".into()
 }
@@ -247,6 +248,36 @@ impl Board {
         let out = (Self::attachment_on(&tx, id)?, Self::file_bytes_on(&tx, id)?);
         tx.commit()?;
         Ok(out)
+    }
+    /// Read only this slice, authorizing the live placement in the same snapshot.
+    pub fn download_range_as(
+        &self,
+        actor: &str,
+        id: i64,
+        offset: i64,
+        length: usize,
+    ) -> Result<(Attachment, Vec<u8>)> {
+        ensure!(
+            offset >= 0 && (1..=FILE_CHUNK_BYTES).contains(&length),
+            Invalid.error(
+                "invalid_file_range",
+                "expected a nonnegative offset and 1..65536 bytes"
+            )
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        self.authorize_files(&tx, actor, &[id])?;
+        let file = Self::attachment_on(&tx, id)?;
+        ensure!(
+            offset <= file.size,
+            Invalid.error("invalid_file_range", "offset exceeds file size")
+        );
+        let mut data = vec![0; (file.size - offset).min(length as i64) as usize];
+        if !data.is_empty() {
+            let blob = tx.blob_open(rusqlite::MAIN_DB, "file_assets", "bytes", id, true)?;
+            blob.read_at_exact(&mut data, usize::try_from(offset)?)?;
+        }
+        tx.commit()?;
+        Ok((file, data))
     }
     pub fn upload(
         &self,

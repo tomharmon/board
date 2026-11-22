@@ -35,6 +35,38 @@ fn add(b: &Board, name: &str) -> Result<SpawnedWorker> {
 }
 
 #[test]
+fn run_picker_counts_members_only_in_visible_runs_before_paginating() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("summary.db");
+    let b = Board::open(&path)?;
+    let public = start(&b, "ada", 20)?;
+    b.swarm_register_worker("ada", "editor", &spec("check"))?;
+    let private = b.swarm_start(
+        "ada",
+        &SwarmStart {
+            goal: "Private work".into(),
+            slug: Some("private".into()),
+            ..Default::default()
+        },
+    )?;
+    b.set_grant("ada", None, "reader", &Rules::parse("swarms/editor=read")?)?;
+    let mut reader = Board::open(&path)?;
+    reader.bind_token(&b.issue_credential("ada", "reader", None, None)?.token)?;
+    let view = reader.swarm_summaries("reader", None, 1)?;
+    assert_eq!(view.len(), 1);
+    assert_eq!(view[0].id, public.id);
+    assert_eq!(view[0].worker_count, 1);
+    assert!(
+        reader
+            .swarm_summaries("reader", Some(public.id), 1)?
+            .is_empty()
+    );
+    assert!(reader.swarm_summaries("ada", None, 1).is_err());
+    assert_eq!(b.swarm_summaries("ada", None, 1)?[0].id, private.id);
+    Ok(())
+}
+
+#[test]
 fn local_owner_can_supervise_another_coordinator_without_taking_its_inbox() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("board.db");
@@ -118,7 +150,7 @@ fn real_v14_fixture_upgrades_existing_data_and_retires_executable_tables() -> Re
     let check = rusqlite::Connection::open(&path)?;
     assert_eq!(
         check.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        19
+        20
     );
     assert_eq!(check.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('write_rules','rule_internal','sync_renderers','source_renderers','sync_render_labels')",[],|r|r.get::<_,i64>(0))?,0);
     assert_eq!(
@@ -126,6 +158,33 @@ fn real_v14_fixture_upgrades_existing_data_and_retires_executable_tables() -> Re
         "ok"
     );
     assert!(start(&b, "ada", 20)?.workers.is_empty());
+    Ok(())
+}
+
+#[test]
+fn a_v19_assignment_upgrades_without_inventing_a_runtime_report() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("previous.sqlite");
+    let b = Board::open(&db)?;
+    start(&b, "ada", 10)?;
+    b.swarm_register_worker("ada", "editor", &spec("check"))?;
+    let cursor = b.cursor()?;
+    drop(b);
+    let previous = rusqlite::Connection::open(&db)?;
+    previous.execute_batch("DROP TABLE swarm_worker_runtime; PRAGMA user_version=19;")?;
+    drop(previous);
+    let b = Board::open(&db)?;
+    let binding = b.worker_binding("editor/check")?;
+    let w = b.worker_assignment(&binding)?.worker;
+    assert_eq!(w.actor, "ada/check");
+    assert_eq!(w.model, None);
+    assert_eq!(w.session_ref, None);
+    assert_eq!(b.cursor()?, cursor);
+    b.swarm_check_in_with_runtime(&w.actor, "editor", "check", Some("sample"), None, None)?;
+    assert_eq!(
+        b.swarm_status("ada", "editor")?.workers[0].model.as_deref(),
+        Some("sample")
+    );
     Ok(())
 }
 
@@ -371,12 +430,12 @@ fn capped_concurrent_notices_cannot_overspend_and_a_stale_waiter_cannot_advance(
     else {
         panic!("expected notice")
     };
-    b.swarm_leave_wait("ada/verify", "editor", "verify", 11, Some(cursor))?;
+    b.swarm_leave_wait("ada/verify", "editor", "verify", 11)?;
     let w = &b.swarm_status("ada", "editor")?.workers[1];
     assert_eq!(w.last_read_cursor, last);
     assert_eq!(w.waiter_pid, Some(22));
-    b.swarm_leave_wait("ada/verify", "editor", "verify", 22, Some(cursor))?;
-    assert_eq!(b.swarm_wait_target("ada/verify", "editor")?.1, cursor);
+    b.swarm_leave_wait("ada/verify", "editor", "verify", 22)?;
+    assert_eq!(b.swarm_wait_target("ada/verify", "editor")?.1, last);
     assert!(
         b.swarm_dm("ada/impl", "editor", "verify", "more work")
             .is_err()
@@ -509,14 +568,14 @@ fn worker_slug_mentions_take_precedence_and_ignore_code_and_addresses_inside_mar
 
 #[cfg(unix)]
 #[test]
-fn materializing_a_role_rejects_existing_symlinks_without_publishing_a_worker() -> Result<()> {
+fn a_failed_local_export_leaves_a_usable_portable_assignment_without_following_symlinks()
+-> Result<()> {
     use std::os::unix::fs::symlink;
     let dir = tempfile::tempdir()?;
     let out = tempfile::tempdir()?;
     let path = dir.path().join("links.db");
     let b = Board::open(&path)?;
     start(&b, "ada", 20)?;
-    let at = b.cursor()?;
     symlink(out.path(), dir.path().join("links.db.data"))?;
     assert!(
         b.swarm_add_worker(
@@ -529,14 +588,33 @@ fn materializing_a_role_rejects_existing_symlinks_without_publishing_a_worker() 
         )
         .is_err()
     );
-    assert!(b.swarm_status("ada", "editor")?.workers.is_empty());
-    assert_eq!(b.cursor()?, at);
+    let binding = b.worker_binding("editor/builder")?;
+    let assigned = b.worker_assignment(&binding)?;
+    assert_eq!(assigned.worker.name, "builder");
+    assert_eq!(assigned.skills[0].slug, "board-implementer");
+    assert_eq!(assigned.skills[0].files, ["SKILL.md"]);
+    let before = b.cursor()?;
+    fs::remove_file(dir.path().join("links.db.data"))?;
+    let exported = b.swarm_add_worker(
+        "ada",
+        "editor",
+        &SwarmAddWorker {
+            role_slug: Some("implementer".into()),
+            ..spec("builder")
+        },
+    )?;
+    assert!(exported.skills_dir.is_dir());
+    assert_eq!(
+        b.cursor()?,
+        before,
+        "export retries must not create another brief"
+    );
     assert!(fs::read_dir(out.path())?.next().is_none());
     Ok(())
 }
 
 #[test]
-fn ready_wait_advances_cursor_without_spurious_waiting_status_events() -> Result<()> {
+fn addressed_inbox_only_advances_when_its_owner_acknowledges_a_batch() -> Result<()> {
     let b = Board::memory()?;
     start(&b, "ada", 20)?;
     add(&b, "impl")?;
@@ -544,13 +622,18 @@ fn ready_wait_advances_cursor_without_spurious_waiting_status_events() -> Result
     b.swarm_check_in("ada/verify", "editor", "verify")?;
     let dm = b.swarm_dm("ada/impl", "editor", "verify", "ready before wait")?;
     let before = b.cursor()?;
-    let outcome = b.swarm_wait(
-        "ada/verify",
-        "editor",
-        None,
-        std::time::Duration::from_secs(5),
-        || Ok(()),
-    )?;
+    let last = b.swarm_wait_target("ada/verify", "editor")?.1;
+    let wait = |actor, after, ack| {
+        b.swarm_wait(
+            actor,
+            "editor",
+            after,
+            ack,
+            std::time::Duration::ZERO,
+            || Ok(()),
+        )
+    };
+    let outcome = wait("ada/verify", None, None)?;
     let SwarmWaitOutcome::Messages { cursor, dms, .. } = outcome else {
         panic!("expected queued DM immediately");
     };
@@ -561,9 +644,35 @@ fn ready_wait_advances_cursor_without_spurious_waiting_status_events() -> Result
         before,
         "ready wait for an already-working worker should not emit waiting/working status churn"
     );
-    assert_eq!(
-        b.swarm_wait_target("ada/verify", "editor")?.1,
-        dm.event_cursor
+    assert_eq!(b.swarm_wait_target("ada/verify", "editor")?.1, last);
+    assert!(matches!(
+        wait("ada/verify", Some(cursor), None)?,
+        SwarmWaitOutcome::StillWaiting { .. }
+    ));
+    assert!(matches!(
+        wait("ada/verify", None, None)?,
+        SwarmWaitOutcome::Messages { .. }
+    ));
+    assert!(
+        wait("ada/impl", None, Some(cursor)).is_err(),
+        "a DM sender cannot ack the recipient's inbox"
     );
+    assert!(wait("ada/verify", Some(cursor), Some(cursor)).is_err());
+    let next = b
+        .swarm_dm("ada/impl", "editor", "verify", "second batch")?
+        .event_cursor;
+    for _ in 0..2 {
+        assert!(
+            matches!(wait("ada/verify", None, Some(cursor))?, SwarmWaitOutcome::Messages { cursor: c, .. } if c == next)
+        );
+    }
+    assert!(
+        matches!(wait("ada/verify", None, Some(next))?, SwarmWaitOutcome::StillWaiting {cursor: c} if c == next)
+    );
+    assert!(
+        matches!(wait("ada/verify", None, Some(cursor))?, SwarmWaitOutcome::StillWaiting {cursor: c} if c == next),
+        "an old ack must not rewind the saved cursor"
+    );
+    assert_eq!(b.swarm_wait_target("ada/verify", "editor")?.1, next);
     Ok(())
 }

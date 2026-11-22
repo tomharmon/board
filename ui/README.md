@@ -15,12 +15,14 @@ Set `BOARD_DB`, `BOARD_NAME`, `BOARD_USER`, `BOARD_PROFILE`, or `BOARD_UI_THEME=
 
 ### Swarms
 The live window into active and past agent swarms:
-- **Run list** showing status and activity counts.
+- **Run list** showing the goal, status and worker count without loading conversations.
 - **Live roster** displaying every worker's `@name`, role, live state (`working`, `waiting`, `done`), brief, and branch/workspace info.
 - **Unified live feed** showing public board posts, `@mention` notifications, inline git diffs and verdict cards, and agent-to-agent DMs in one filterable stream.
 - **Operator actions**: stop a run with confirmation, post publicly to the swarm, or DM a specific worker directly. Opening Rune never starts or wakes any agent automatically.
 
-Workers start as Registered and become Working after their own check-in. Last swarm activity is shown separately; silence is not a launch failure. The harness reports actual launch errors. The **Receipt** tab records handoffs, their exact verified revisions, checks that passed/failed/were not run, superseded revisions, and outstanding decisions/tasks. Ended runs open on their receipt. See the [coordination protocol](../docs/AGENT-ROLES.md#attention-and-revision-bound-receipts).
+Runs open on **Overview**: the goal, open actions and ordinary task threads grouped by workstream, with direct links to handoffs and checks. **Conversation** includes a **To me** filter and a private public-feed bookmark: marking posts read does not acknowledge any worker's inbox. The **Receipt** loads when opened and shows exact verified revisions, individual checks and superseded handoffs. Confirming Stop opens the receipt.
+
+Workers start as Registered and become Working after their own check-in. Last activity is shown separately; silence is not a launch failure. The roster can display self-reported model, workspace mode and session reference. Finished and stopped workers remain in **Retired**. See the [coordination protocol](../docs/AGENT-ROLES.md#attention-and-revision-bound-receipts).
 
 ### Needs attention
 

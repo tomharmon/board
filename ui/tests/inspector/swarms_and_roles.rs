@@ -29,6 +29,7 @@ impl Steps {
         let mut s = Self::default();
         s.tap("swarms");
         s.tap(format!("swarm-run-{id}"));
+        s.tap("swarm-conversation");
         s
     }
     fn library() -> Self {
@@ -72,6 +73,85 @@ fn seed(b: &Board) -> SwarmRun {
 fn has(t: &Tree, needle: &str) -> bool {
     t.0.iter()
         .any(|e| e["text"].as_str().is_some_and(|v| v.contains(needle)))
+}
+
+#[test]
+fn overview_shows_ordinary_workstreams_and_only_opens_history_on_demand() {
+    use board_local::automation::{TaskTarget, create_task};
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let run = seed(&b);
+    let mut options = board_local::PostOptions::default();
+    options
+        .labels
+        .insert("workstream".into(), "Recovery".into());
+    let task = create_task(
+        &b,
+        "reader",
+        TaskTarget::New {
+            channel: &run.channel,
+            text: "Check the backup",
+            options: &options,
+        },
+        &[],
+        Some("reader/verify"),
+    )
+    .unwrap();
+    for (width, height) in [(1200, 900), (390, 844)] {
+        let mut steps = Steps::default();
+        if width == 390 {
+            steps.tap("open-nav");
+        }
+        steps.tap("swarms");
+        steps.tap(format!("swarm-run-{}", run.id));
+        let (tree, _) = f.snapshot(
+            json!(steps.0),
+            (width, height),
+            "light",
+            &format!("run-overview-{width}"),
+        );
+        tree.expect_key("swarm-overview-scroll");
+        tree.expect_key(&format!("swarm-task-{}", task.id));
+        tree.expect_text("Recovery");
+        assert!(has(&tree, "reader/verify"));
+        assert!(!tree.has_key("swarm-feed") && !tree.has_key("swarm-receipt-scroll"));
+        let bounds = tree.bounds("swarm-overview-scroll");
+        assert!(bounds.w > 140. && bounds.edge() <= f64::from(width) + 1.);
+    }
+}
+
+#[test]
+fn public_read_marker_survives_restart_without_consuming_worker_notifications() {
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let run = seed(&b);
+    let posted = b
+        .swarm_post(
+            "reader/impl",
+            &run.slug,
+            "@verify Please check",
+            &Default::default(),
+        )
+        .unwrap()
+        .message
+        .id;
+    let ack = || {
+        b.swarm_status("reader", &run.slug)
+            .unwrap()
+            .workers
+            .into_iter()
+            .find(|w| w.name == "verify")
+            .unwrap()
+            .last_read_cursor
+    };
+    let before = ack();
+    let mut steps = Steps::swarm(run.id);
+    steps.view(&f).expect_key("swarm-public-new");
+    steps.tap("swarm-mark-read");
+    assert!(!steps.view(&f).has_key("swarm-public-new"));
+    assert_eq!(b.swarm_public_seen("reader", &run.slug).unwrap(), posted);
+    assert!(!Steps::swarm(run.id).view(&f).has_key("swarm-public-new"));
+    assert_eq!(ack(), before);
 }
 
 #[test]

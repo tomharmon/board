@@ -230,7 +230,15 @@ fn direct_peer_loop_no_coordinator_relay_and_stop_wakes_waiter() {
         .find(|w| w["name"] == "verify")
         .unwrap();
     assert_eq!(w["status"], "working");
-    assert_eq!(w["last_read_cursor"], got["cursor"]);
+    assert!(w["last_read_cursor"].as_i64().unwrap() < got["cursor"].as_i64().unwrap());
+    let ack = got["cursor"].to_string();
+    assert_eq!(
+        b.get(
+            "verify",
+            &["swarm", "wait", "--ack", &ack, "--timeout", "0s"]
+        )["status"],
+        "still_waiting"
+    );
     // Reply arrives **before** the implementer starts waiting.
     let d = b.get(
         "verify",
@@ -245,7 +253,17 @@ fn direct_peer_loop_no_coordinator_relay_and_stop_wakes_waiter() {
     let wake = b.get("impl", &["swarm", "wait", "--timeout", "0s"]);
     assert_eq!(wake["dms"][0]["id"], d["id"]);
     assert_eq!(
-        b.get("impl", &["swarm", "wait", "--timeout", "0s"])["status"],
+        b.get(
+            "impl",
+            &[
+                "swarm",
+                "wait",
+                "--timeout",
+                "0s",
+                "--ack",
+                &wake["cursor"].to_string()
+            ]
+        )["status"],
         "still_waiting"
     );
     let child = b.wait("verify");

@@ -123,7 +123,7 @@ impl Board {
                 opts.open(path)?.write_all(text.as_bytes())?;
             }
         }
-        // A compare-only retry handles a crash between the atomic rename and the SQLite commit.
+        // Local export is repeatable; registration is already durable at this point.
         // Never follow links or replace user data at a pre-existing destination.
         match fs::symlink_metadata(&final_dir) {
             Ok(_) => ensure!(
@@ -132,7 +132,12 @@ impl Board {
                 final_dir.display()
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                fs::rename(stage.path(), &final_dir)?
+                if let Err(e) = fs::rename(stage.path(), &final_dir) {
+                    // Another local exporter can finish after the existence check.
+                    if !same_tree(stage.path(), &final_dir).unwrap_or(false) {
+                        return Err(e.into());
+                    }
+                }
             }
             Err(e) => return Err(e.into()),
         }

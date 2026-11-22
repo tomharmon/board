@@ -8,7 +8,8 @@ mod files;
 mod prose;
 pub mod reactions;
 pub use files::{
-    MAX_DIRECT_BYTES, Upload, content_type_for, valid_name as validate_attachment_name,
+    FILE_CHUNK_BYTES, MAX_DIRECT_BYTES, Upload, content_type_for,
+    valid_name as validate_attachment_name,
 };
 pub mod automation;
 mod backup;

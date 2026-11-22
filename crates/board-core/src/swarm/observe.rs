@@ -20,13 +20,28 @@ pub struct RunChange {
     pub worker: Option<String>,
 }
 #[derive(Debug, Serialize)]
+pub struct RunThread {
+    pub id: i64,
+    pub title: String,
+    pub workstream: Option<String>,
+    pub state: String,
+    pub assignee: Option<String>,
+    pub claimant: Option<String>,
+    pub latest_handoff: Option<i64>,
+    pub latest_check: Option<i64>,
+}
+#[derive(Debug, Serialize)]
 pub struct SwarmObservation {
     pub run: String,
+    pub goal: String,
+    pub channel: String,
     pub status: String,
     pub policy: RunPolicy,
     pub available_capacity: i64,
     pub workers: BTreeMap<String, i64>,
     pub tasks: BTreeMap<String, i64>,
+    pub threads: Vec<RunThread>,
+    pub next_task_after: Option<i64>,
     pub actions: Vec<RunAction>,
     pub next_action_after: Option<i64>,
     pub changes: Vec<RunChange>,
@@ -45,6 +60,32 @@ fn counts(
 }
 
 impl Board {
+    /// A viewer's public feed bookmark is independent of any participant's addressed inbox.
+    pub fn swarm_public_seen(&self, actor: &str, run: &str) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+        let (a, r) = self.swarm_record(&tx, actor, run, Action::Read)?;
+        let at = tx
+            .query_row(
+                "SELECT through FROM swarm_public_seen WHERE run_id=? AND viewer=?",
+                params![r.id, a.private_key(actor)?],
+                |s| s.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        tx.commit()?;
+        Ok(at)
+    }
+    pub fn swarm_mark_public_seen(&self, actor: &str, run: &str, through: i64) -> Result<()> {
+        self.write(|tx| {
+            let (a, r) = self.swarm_record(tx, actor, run, Action::Read)?;
+            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE channel=? AND id=? AND id>=?)",
+                params![r.channel, through, r.root_id], |s| s.get::<_,bool>(0))?,
+                Invalid.error("invalid_cursor","expected a public message from this run"));
+            tx.execute("INSERT INTO swarm_public_seen VALUES(?,?,?) ON CONFLICT(run_id,viewer) DO UPDATE SET through=max(through,excluded.through)",
+                params![r.id, a.private_key(actor)?, through])?;
+            Ok(())
+        })
+    }
     /// Current exceptions and chronological deltas are separate pages from one
     /// snapshot. Neither replays prose, loads briefs, nor exposes another run's tasks.
     pub fn swarm_observe(
@@ -55,8 +96,22 @@ impl Board {
         action_after: i64,
         limit: usize,
     ) -> Result<SwarmObservation> {
+        self.swarm_observe_page(actor, run, after, action_after, 0, limit)
+    }
+    pub fn swarm_observe_page(
+        &self,
+        actor: &str,
+        run: &str,
+        after: Option<i64>,
+        action_after: i64,
+        task_after: i64,
+        limit: usize,
+    ) -> Result<SwarmObservation> {
         ensure!(
-            (1..=100).contains(&limit) && after.unwrap_or(0) >= 0 && action_after >= 0,
+            (1..=100).contains(&limit)
+                && after.unwrap_or(0) >= 0
+                && action_after >= 0
+                && task_after >= 0,
             Invalid.error(
                 "invalid_page",
                 "limit must be 1..100 and positions nonnegative"
@@ -83,14 +138,38 @@ impl Board {
             0
         };
         let fetch = (limit + 1) as i64;
+        let mut threads = rows(
+            tx.prepare(include_str!("observation_threads.sql"))?
+                .query_map(params![r.channel, r.id, task_after, fetch], |s| {
+                    Ok(RunThread {
+                        id: s.get(0)?,
+                        title: s
+                            .get::<_, String>(1)?
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .to_owned(),
+                        workstream: s.get(2)?,
+                        state: s.get(3)?,
+                        assignee: s.get(4)?,
+                        claimant: s.get(5)?,
+                        latest_handoff: s.get(6)?,
+                        latest_check: s.get(7)?,
+                    })
+                })?,
+        )?;
+        let next_task_after = (threads.len() > limit).then(|| threads[limit - 1].id);
+        threads.truncate(limit);
         let mut actions = rows(
-            tx.prepare(include_str!("observation_actions.sql"))?
+            tx.prepare(concat!(
+                "WITH selected_runs AS (SELECT id,root_id,status,coordinator_actor FROM swarm_runs WHERE id=?1)",
+                include_str!("current_run_actions.sql"),
+                include_str!("observation_actions.sql")
+            ))?
                 .query_map(
                     params![
                         r.id,
                         r.channel,
-                        r.coordinator_actor,
-                        r.root_id,
                         action_after,
                         fetch
                     ],
@@ -141,11 +220,15 @@ impl Board {
         tx.commit()?;
         Ok(SwarmObservation {
             run: r.slug,
+            goal: r.goal,
+            channel: r.channel,
             status: r.status,
             policy,
             available_capacity: capacity,
             workers,
             tasks,
+            threads,
+            next_task_after,
             actions,
             next_action_after,
             changes,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::{FeedKind, SwarmTarget};
+use crate::state::{FeedKind, SwarmTab, SwarmTarget};
 use board_local::swarm::{SwarmEntry, SwarmRun};
 
 fn badge(s: &str, ink: &str, bg: &str) -> El {
@@ -76,11 +76,8 @@ fn runs(s: &State, inset: f32) -> El {
             .child(
                 mono(
                     format!(
-                        "{}   #{}   {} workers   {} entries",
-                        run.coordinator_actor,
-                        run.channel,
-                        run.workers.len(),
-                        run.activity_count
+                        "{}   #{}   {} workers",
+                        run.coordinator_actor, run.channel, run.worker_count
                     ),
                     MUTED,
                 )
@@ -118,7 +115,20 @@ fn roster(s: &State, run: &SwarmRun) -> El {
     if run.workers.is_empty() {
         out = out.child(mono("No workers registered", MUTED).py(8.));
     }
-    for w in &run.workers {
+    let retired =
+        |w: &board_local::swarm::SwarmWorker| matches!(w.status.as_str(), "done" | "stopped");
+    let retired_count = run.workers.iter().filter(|w| retired(w)).count();
+    if retired_count > 0 {
+        out = out.child(
+            workspace::tab(
+                "swarm-retired",
+                &format!("Retired ({retired_count})"),
+                o.retired_open,
+            )
+            .on_press(|s: &mut State| s.desk.swarm.retired_open = !s.desk.swarm.retired_open),
+        );
+    }
+    for w in run.workers.iter().filter(|w| o.retired_open || !retired(w)) {
         let name = w.name.clone();
         let pick = name.clone();
         let expand = name.clone();
@@ -232,6 +242,9 @@ fn roster(s: &State, run: &SwarmRun) -> El {
             for (key, val) in [
                 ("Branch", w.branch_name.as_deref()),
                 ("Workspace", w.workspace_path.as_deref()),
+                ("Reported model", w.model.as_deref()),
+                ("Workspace mode", w.workspace_mode.as_deref()),
+                ("Session reference", w.session_ref.as_deref()),
             ] {
                 if let Some(v) = val {
                     member = member.child(
@@ -348,6 +361,7 @@ fn feed(s: &State) -> El {
         ("all", "All", FeedKind::All),
         ("public", "Public", FeedKind::Public),
         ("dm", "DMs", FeedKind::Direct),
+        ("addressed", "To me", FeedKind::Addressed),
     ] {
         filters = filters.child(
             workspace::tab(&format!("swarm-kind-{key}"), title, o.kind == kind).on_press(
@@ -368,7 +382,34 @@ fn feed(s: &State) -> El {
     }
     let mut list = col().w_full().px(10.);
     let mut any = false;
+    let mut new_divider = false;
+    let unfiltered = matches!(o.kind, FeedKind::All | FeedKind::Public) && o.worker.is_none();
+    if unfiltered
+        && let Some(last) = o
+            .entries
+            .iter()
+            .rev()
+            .find(|e| e.message.is_some() && e.cursor > o.public_seen)
+    {
+        let through = last.cursor;
+        filters = filters.child(
+            tool(
+                "swarm-mark-read",
+                "Mark public posts read through this page",
+                &glyphs::CHECK,
+            )
+            .on_press(move |s: &mut State| s.mark_swarm_seen(through)),
+        );
+    }
     for e in &o.entries {
+        if unfiltered && !new_divider && e.message.is_some() && e.cursor > o.public_seen {
+            list = list.child(
+                mono("New public posts", MUTED)
+                    .key("swarm-public-new")
+                    .py(4.),
+            );
+            new_divider = true;
+        }
         list = list.child(entry(s, e)).child(rule());
         any = true;
     }
@@ -392,6 +433,133 @@ fn feed(s: &State) -> El {
                 })
                 .child(list),
         )
+}
+fn overview(s: &State) -> El {
+    let o = &s.desk.swarm;
+    let Some(view) = &o.overview else { return el() };
+    let mut body = col().w_full().px(10.).py(8.).gap(5.);
+    let link = |key: String, title: String, id: i64| {
+        click(
+            label(&title, 13., 500., INK)
+                .key(key)
+                .w_full()
+                .wrap_anywhere()
+                .py(3.),
+            &title,
+        )
+        .on_press(move |s: &mut State| s.open_message_thread(id))
+    };
+    let pages = |tasks: bool, back: bool, next: Option<i64>| {
+        let prefix = if tasks {
+            "swarm-threads"
+        } else {
+            "swarm-actions"
+        };
+        if !back && next.is_none() {
+            return el();
+        }
+        row()
+            .gap(4.)
+            .child(
+                tool(
+                    &format!("{prefix}-back"),
+                    "Previous page",
+                    &icons::PREVIOUS_FRAME,
+                )
+                .disabled(!back)
+                .on_press(move |s: &mut State| {
+                    let o = &mut s.desk.swarm;
+                    if tasks {
+                        o.task_starts.pop();
+                    } else {
+                        o.action_starts.pop();
+                    }
+                    s.refresh();
+                }),
+            )
+            .child(
+                tool(&format!("{prefix}-next"), "Next page", &icons::NEXT_FRAME)
+                    .disabled(next.is_none())
+                    .on_press(move |s: &mut State| {
+                        if let Some(at) = next {
+                            let o = &mut s.desk.swarm;
+                            if tasks {
+                                o.task_starts.push(at)
+                            } else {
+                                o.action_starts.push(at)
+                            }
+                            s.refresh();
+                        }
+                    }),
+            )
+    };
+    body = body.child(label("Needs attention", 15., 600., INK));
+    if view.actions.is_empty() {
+        body = body.child(mono("No open actions on this page", MUTED));
+    }
+    for a in &view.actions {
+        body = body.child(link(
+            format!("swarm-action-{}", a.cursor),
+            format!(
+                "{} · {} · {}",
+                a.assigned_to,
+                a.kind.replace('_', " "),
+                a.summary
+            ),
+            a.message_id,
+        ));
+    }
+    body = body
+        .child(pages(
+            false,
+            !o.action_starts.is_empty(),
+            view.next_action_after,
+        ))
+        .child(rule())
+        .child(label("Task threads", 15., 600., INK));
+    if view.threads.is_empty() {
+        body = body.child(mono("No task threads on this page", MUTED));
+    }
+    let mut groups = std::collections::BTreeMap::new();
+    for t in &view.threads {
+        groups
+            .entry(t.workstream.as_deref().unwrap_or("Ungrouped"))
+            .or_insert_with(Vec::new)
+            .push(t);
+    }
+    for (group, tasks) in groups {
+        body = body.child(label(group, 13., 600., DIM).py(3.).wrap_anywhere());
+        for t in tasks {
+            let owner = t
+                .claimant
+                .as_deref()
+                .or(t.assignee.as_deref())
+                .unwrap_or("Unassigned");
+            body = body
+                .child(link(
+                    format!("swarm-task-{}", t.id),
+                    format!("#{}  {}", t.id, t.title),
+                    t.id,
+                ))
+                .child(mono(format!("{} · {owner}", t.state), MUTED).wrap_anywhere());
+            for (name, id) in [
+                ("Handoff", t.latest_handoff),
+                ("Verification", t.latest_check),
+            ] {
+                if let Some(id) = id {
+                    body = body.child(link(
+                        format!("swarm-task-{}-{name}", t.id),
+                        format!("{name} #{id}"),
+                        id,
+                    ));
+                }
+            }
+        }
+    }
+    scroll(
+        "swarm-overview-scroll",
+        body.child(pages(true, !o.task_starts.is_empty(), view.next_task_after)),
+    )
 }
 fn composer(s: &State, r: &SwarmRun, overlays: &mut Vec<El>) -> El {
     let o = &s.desk.swarm;
@@ -560,15 +728,24 @@ pub(super) fn view(s: &State, inset: f32, narrow: bool) -> El {
     head = head.child(meta).child(attention::banner(s, Some(run.id)));
     let tabs = row()
         .w_full()
-        .gap(16.)
+        .gap(12.)
+        .flex_wrap()
         .px(10.)
         .child(
-            workspace::tab("swarm-conversation", "Conversation", !o.receipt_open)
-                .on_press(|s: &mut State| s.desk.swarm.receipt_open = false),
+            workspace::tab("swarm-overview", "Overview", o.tab == SwarmTab::Overview)
+                .on_press(|s: &mut State| s.swarm_tab(SwarmTab::Overview)),
         )
         .child(
-            workspace::tab("swarm-receipt", "Receipt", o.receipt_open)
-                .on_press(|s: &mut State| s.desk.swarm.receipt_open = true),
+            workspace::tab(
+                "swarm-conversation",
+                "Conversation",
+                o.tab == SwarmTab::Conversation,
+            )
+            .on_press(|s: &mut State| s.swarm_tab(SwarmTab::Conversation)),
+        )
+        .child(
+            workspace::tab("swarm-receipt", "Receipt", o.tab == SwarmTab::Receipt)
+                .on_press(|s: &mut State| s.swarm_tab(SwarmTab::Receipt)),
         );
     let mut stream = col()
         .grow(1.)
@@ -576,12 +753,12 @@ pub(super) fn view(s: &State, inset: f32, narrow: bool) -> El {
         .min_h(0.)
         .h_full()
         .child(tabs)
-        .child(if o.receipt_open {
-            attention::receipt(s)
-        } else {
-            feed(s)
+        .child(match o.tab {
+            SwarmTab::Receipt => attention::receipt(s),
+            SwarmTab::Conversation => feed(s),
+            SwarmTab::Overview => overview(s),
         });
-    if o.can_send && !o.receipt_open {
+    if o.can_send && o.tab == SwarmTab::Conversation {
         stream = stream.child(col().w_full().px(10.).pb(10.).child(composer(
             s,
             run,

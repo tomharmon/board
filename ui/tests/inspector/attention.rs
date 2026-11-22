@@ -102,7 +102,7 @@ fn operator_can_find_and_answer_a_decision_without_reading_the_feed() {
 }
 
 #[test]
-fn stopped_run_opens_its_revision_bound_receipt_without_claiming_unrun_checks_passed() {
+fn stopped_run_shows_its_revision_bound_receipt_on_request_without_claiming_unrun_checks_passed() {
     let f = Fixture::new();
     let (run, _) = seed(&f);
     Board::open(&f.db)
@@ -120,6 +120,7 @@ fn stopped_run_opens_its_revision_bound_receipt_without_claiming_unrun_checks_pa
         steps.extend([
             json!({"t":0.3,"type":"tap","key":"swarms"}),
             json!({"t":0.5,"type":"tap","key":format!("swarm-run-{run}")}),
+            json!({"t":0.7,"type":"tap","key":"swarm-receipt"}),
         ]);
         let (tree, _) = f.snapshot(json!(steps), size, "light", &format!("receipt-{prefix}"));
         for text in [

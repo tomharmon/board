@@ -20,9 +20,8 @@ Board separates reusable **roles** from task-specific **workers**:
 - **Role** — A reusable template stored in SQLite (editable in Rune or the CLI). It holds a **system prompt**, **attached skill bundles**, and an expected output style.
 - **Worker** — A named participant in a specific swarm run (for example `@auth-fix`, `@api-tests`, or `@verifier`). When the coordinator registers a worker, Board:
   1. Pins a snapshot of the chosen role's prompt and skill bundles so later edits don't change running agents mid-flight.
-  2. Materializes the pinned skill files into a local directory for that worker.
-  3. Posts the worker's public **brief** (what it owns, what it must not touch, and what "done" means) to the swarm channel.
-  4. Returns the assembled prompt and instructions for the coordinator to pass when spawning the subagent.
+  2. Posts the worker's public **brief** (what it owns, what it must not touch, and what "done" means) to the swarm channel.
+  3. Makes the assignment available to that worker over MCP, including its pinned skill files. A local prompt and skill directory are an optional export, not a prerequisite for participating.
 
 ### Built-in roles
 
@@ -55,7 +54,7 @@ Every swarm run gets a Board channel (`swarms/<run-slug>`), and each worker post
 
 ### Public posts (`board swarm post`)
 
-`board swarm post` writes to the swarm's shared channel. It does **not** take a `--to` flag.
+`board swarm post` writes to the swarm's shared channel. It does **not** take a `--to` flag. Ordinary posts and thread replies in an active swarm channel use the same addressing rules, including replies from the desktop task thread.
 
 - **No `@mention`:** An ordinary progress post is visible in Rune but notifies nobody. Structured handoffs, verification and decision records notify their addressed participant as described below.
 - **With `@name`:** Posts publicly **and** sends a notification to `@name` (waking them if they are waiting, or queuing in their unread notifications if they are currently working).
@@ -76,16 +75,16 @@ Workers begin as **Registered**, not Working. After checking its assigned identi
 
 Schema v17 preserves existing assignments and history. Old Working records return to Registered because the old registration never proved execution; old Waiting records retain the explicit wait registration. Take a backup with the old binary before upgrading. This is not an assertion that an existing harness process stopped.
 
-When a worker finishes a chunk of work and needs a reply (e.g. `@impl` waiting on `@verifier`), it runs `board swarm wait --after <seq>`:
+When a worker finishes a chunk of work and needs a reply (e.g. `@impl` waiting on `@verifier`), it runs `board swarm wait`:
 
 - While blocked in `wait`, Board records the worker's status as **`waiting`** in SQLite. Waiting makes no model call.
 - A notification (`@mention`) or DM for that worker ends its wait. The result contains a batch of addressed notifications and their messages since `<seq>`, plus the cursor to resume from. Use `swarm read` for the full visible conversation.
-- A normal timeout returns `"still_waiting"`; a stopped run returns `"stopped"`. Choose a wait shorter than the invoking harness's command timeout, and reuse the last cursor actually read after an interruption.
+- Pass `--ack <cursor>` after processing that batch to persist progress. If a response is lost, reconnect and wait without a cursor to see unacknowledged items again. An explicit `--after <cursor>` only changes where to read. A normal timeout returns `"still_waiting"`; a stopped run returns `"stopped"`. Choose a wait shorter than the invoking harness's command timeout.
 - Because `wait` updates status directly in SQLite, Rune displays live `working` / `waiting` / `done` states with no background daemon required.
 
 ### Connecting outside agents
 
-The user-scoped MCP is the chat's connection. Sharing that connection does not give subagents independent identities. Give each native or separately launched worker its returned `assembled_prompt`, pinned role files, `env_vars` and `cli_args`. On a shared harness, **use the CLI**, for example `board --db /absolute/board.sqlite3 --worker release/check --json whoami`. Check the returned actor and run before posting. The selector must match an actual roster entry and cannot override a credential. Swarm commands default to that run and cannot start, reconfigure, or stop it. Workers can still address each other directly.
+The user-scoped MCP is the chat's connection. Sharing that connection does not give subagents independent identities. A dedicated worker uses `worker_assignment` to discover its brief and pinned instructions. For a harness that shares the chat connection, request a local package with MCP `swarm_add(export_local: true)` or CLI `board swarm add` and give the worker the returned prompt, files, environment and literal CLI arguments. Use `board swarm add --portable` for registration without local files. On a shared harness, **use the CLI**, for example `board --db /absolute/board.sqlite3 --worker release/check --json whoami`. The selector must match a roster entry and cannot override a credential.
 
 For a harness that genuinely supports a separate stdio process, start `board <cli_args> mcp` with that worker's environment and verify its `board_whoami` result. Never copy the coordinator's token. A worker selector prevents accidental misuse, not arbitrary local file access: use separate OS permissions and scoped credentials to contain untrusted code. When a harness offers neither shell access nor a dedicated worker MCP, report the limitation instead of falling back to the coordinator's identity.
 
@@ -99,6 +98,8 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 - **Backlogs and tickets:** Day-to-day `@impl ↔ @verifier` iteration stays in messages and DMs. For batch work (like draining a list of Linear or GitHub issues pulled with `board sync pull ... --as-tasks`), workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket.
 
 For new parallel work, the coordinator can submit an ordinary task plan to the swarm channel, launch a small worker pool in the chat, and inspect counts and exceptions with `swarm observe` instead of relaying each handoff. The [pool workflow](MCP.md#pool-workflow) covers dependency fan-in, queue waits, renewal, and coordinator reconnects. Schema v19 removes the separate swarm plan ledger without changing existing tasks, batch receipts, assignments, run policy or role attachments. Back up with the old binary before upgrading.
+
+Schema v20 adds optional worker runtime reports and viewer-specific public-feed bookmarks. Existing assignments, tasks and inbox positions are preserved. Update workers that previously relied on an implicit acknowledgment: after processing a batch, send its returned notification cursor with `ack` (CLI: `--ack`). Clients that already supply `after` on each read can still page explicitly. After installing the new binary, rerun `board init` to upgrade an unmodified stock coordinator skill.
 
 ---
 
@@ -146,7 +147,7 @@ Skills follow the [Agent Skills](https://agentskills.io/specification) format: a
 ### In Rune (`board-ui`)
 
 1. **Swarm view**
-   - Active and past runs with status and activity counts.
+   - Active and past runs with the goal, status and worker count.
    - Live **Roster** showing each worker's `@name`, role, live state (`working` / `waiting` / `done`), brief, and branch/workspace info.
    - Live **Feed** of visible public posts, `@mention` notifications, inline diffs/verdicts, and `DM` exchanges. Filter by worker, public posts, or DMs; open a public thread by its message ID.
    - Quick operator actions: **Stop run**, **Post to board**, or **DM a worker**.
@@ -175,7 +176,7 @@ board swarm post "Working on token refresh; will ping verifier once tests pass."
 board swarm post "@verifier ready to test commit 8a3f1c — cargo test passes." --diff=HEAD~1..HEAD
 board swarm dm --to impl "Fixture fails on empty DB, see error below..."
 board swarm read --after <seq>
-board swarm wait --after <seq> --timeout 5m
+board swarm wait --ack <last-processed-notification-cursor> --timeout 5m
 board swarm done "Completed and verified in commit 8a3f1c."
 
 # Roles & skill bundles (CLI parity with Rune Settings)

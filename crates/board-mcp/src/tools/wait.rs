@@ -43,6 +43,7 @@ impl<'a> Parked<'a> {
                         &ctx.actor,
                         &run,
                         args["after"].as_i64(),
+                        args["ack"].as_i64(),
                     )?),
                     args["timeout_seconds"].as_u64().unwrap_or(90),
                 )

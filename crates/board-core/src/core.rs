@@ -118,6 +118,12 @@ pub struct PostOptions {
     pub attachment_ids: Vec<i64>,
 }
 
+pub(crate) enum PublicDestination<'a> {
+    Channel(&'a str),
+    Reply(i64),
+    Run(&'a crate::swarm::SwarmRun),
+}
+
 #[derive(Clone, Copy)]
 enum WriteOrigin {
     Board,
@@ -276,7 +282,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 19;
+const DB_VERSION: i64 = 20;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -654,37 +660,18 @@ impl Board {
                 self.consume_composer_on(tx, actor, scope, stamp)?;
             }
             let a = self.access_on(tx)?;
-            a.actor(actor)?;
-            a.require(Action::Post, channel)?;
-            a.files(tx, actor, &opts.attachment_ids)?;
-            if !opts.labels.is_empty() {
-                a.require(Action::Label, channel)?;
-            }
-            let (text, mentions) = crate::actors::settle(tx, &a, actor, None, text)?;
-            let (m, created) = Self::post_tx_with_outcome(tx, channel, actor, &text, opts)?;
-            if created {
-                self.record_swarm_message_on(tx, &a, &m)?;
-            }
+            let (post, created) = self.publish_public_on(
+                tx,
+                &a,
+                actor,
+                PublicDestination::Channel(channel),
+                text,
+                opts,
+            )?;
             if created && !targets.is_empty() {
-                self.queue_post_targets_on(tx, actor, &m, targets)?;
+                self.queue_post_targets_on(tx, actor, &post.message, targets)?;
             }
-            if a.allows(Action::Read, channel) {
-                return Ok((
-                    crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
-                    created,
-                ));
-            }
-            if created {
-                tx.execute("INSERT INTO blind_posts VALUES(?)", [m.id])?;
-            }
-            ensure!(
-                a.blind_on(tx, m.id)?,
-                Conflict.error("duplicate_id", "client key belongs to a different write")
-            );
-            Ok((
-                crate::actors::write_view(a.original(tx, m.id)?, &text, mentions, true),
-                created,
-            ))
+            Ok((post.message, created))
         })
     }
     pub fn reply_with_outcome(
@@ -725,21 +712,9 @@ impl Board {
                 self.consume_composer_on(tx, actor, scope, stamp)?;
             }
             let a = self.access_on(tx)?;
-            a.actor(actor)?;
-            let channel = a.message(tx, id, Action::Post)?;
-            a.files(tx, actor, &opts.attachment_ids)?;
-            if !opts.labels.is_empty() {
-                a.require(Action::Label, &channel)?;
-            }
-            let (text, mentions) = crate::actors::settle(tx, &a, actor, Some(id), text)?;
-            let (m, created) = Self::insert_reply(tx, id, actor, &text, opts, WriteOrigin::Board)?;
-            if created {
-                self.record_swarm_message_on(tx, &a, &m)?;
-            }
-            Ok((
-                crate::actors::write_view(a.view(tx, m)?, &text, mentions, false),
-                created,
-            ))
+            let (post, created) =
+                self.publish_public_on(tx, &a, actor, PublicDestination::Reply(id), text, opts)?;
+            Ok((post.message, created))
         })
     }
     pub(crate) fn post_tx(
@@ -759,6 +734,15 @@ impl Board {
         opts: &PostOptions,
     ) -> Result<(Message, bool)> {
         Self::insert(tx, channel, None, actor, text, opts, WriteOrigin::Board)
+    }
+    pub(crate) fn reply_tx_with_outcome(
+        tx: &Transaction,
+        id: i64,
+        actor: &str,
+        text: &str,
+        opts: &PostOptions,
+    ) -> Result<(Message, bool)> {
+        Self::insert_reply(tx, id, actor, text, opts, WriteOrigin::Board)
     }
     pub(crate) fn platform_post_tx(
         tx: &Transaction<'_>,

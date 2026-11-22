@@ -153,6 +153,8 @@ fn protocol_framing_inventory_and_schema_validation() {
         [
             "board_attention",
             "board_channels",
+            "board_file_read",
+            "board_file_upload",
             "board_post",
             "board_read",
             "board_reply",
@@ -200,6 +202,93 @@ fn protocol_framing_inventory_and_schema_validation() {
         json!({"channel":"bugs","text":"no impersonation","actor":"another"}),
     );
     c.denied("board_read", json!({"limit":0}));
+}
+
+#[test]
+fn mcp_file_chunks_require_a_live_readable_placement_on_every_read() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board");
+    let b = Board::open(&path).unwrap();
+    b.set_grant("ada", None, "guest", &Rules::parse("shared=read").unwrap())
+        .unwrap();
+    let token = b.issue_credential("ada", "guest", None, None).unwrap();
+    let mut reader = Client::start(&path, None, Some(&token.token));
+    let mut owner = Client::start(&path, None, None);
+    reader.initialize();
+    owner.initialize();
+    let mut upload = json!({"channel":"private","name":"result.bin","content_type":"application/octet-stream","data_base64":""});
+    reader.denied("board_file_upload", upload.clone());
+    let empty = owner.call("board_file_upload", upload.clone());
+    let part = owner.call("board_file_read", json!({"id":empty["id"]}));
+    assert_eq!(part["data_base64"], "");
+    assert!(part["next_offset"].is_null());
+    upload["data_base64"] = json!("not base64!");
+    owner.denied("board_file_upload", upload.clone());
+    let mut bytes = vec![0xB1; board_local::FILE_CHUNK_BYTES + 1];
+    upload["data_base64"] = json!(STANDARD.encode(&bytes));
+    owner.denied("board_file_upload", upload.clone());
+    bytes.pop();
+    upload["data_base64"] = json!(STANDARD.encode(&bytes));
+    let attachment = owner.call("board_file_upload", upload);
+    let id = &attachment["id"];
+    let slice = json!({"id":id,"length":3});
+    assert_eq!(
+        reader.denied("board_file_read", slice.clone())["code"],
+        "attachment_not_found"
+    );
+    owner.call(
+        "board_post",
+        json!({"channel":"private","text":"Private copy","attachment_ids":[id]}),
+    );
+    assert_eq!(
+        reader.denied("board_file_read", slice.clone())["code"],
+        "attachment_not_found"
+    );
+    let shared = owner.call(
+        "board_post",
+        json!({"channel":"shared","text":"Published result","attachment_ids":[id]}),
+    );
+    let part = reader.call("board_file_read", slice);
+    assert_eq!(part["attachment"], attachment);
+    assert_eq!(part["offset"], 0);
+    assert_eq!(part["next_offset"], 3);
+    let mut got = STANDARD
+        .decode(part["data_base64"].as_str().unwrap())
+        .unwrap();
+    let rest = reader.call(
+        "board_file_read",
+        json!({"id":id,"offset":part["next_offset"]}),
+    );
+    assert!(rest["next_offset"].is_null());
+    got.extend(
+        STANDARD
+            .decode(rest["data_base64"].as_str().unwrap())
+            .unwrap(),
+    );
+    assert_eq!(got, bytes);
+    assert!(
+        reader.call("board_file_read", json!({"id":id,"offset":bytes.len()}))["next_offset"]
+            .is_null()
+    );
+    for bad in [
+        json!({"id":id,"length":0}),
+        json!({"id":id,"length":65537}),
+        json!({"id":id,"offset":-1}),
+        json!({"id":id,"offset":bytes.len()+1}),
+    ] {
+        reader.denied("board_file_read", bad);
+    }
+    b.delete(shared["id"].as_i64().unwrap(), "ada", None)
+        .unwrap();
+    assert_eq!(
+        reader.denied(
+            "board_file_read",
+            json!({"id":id,"offset":part["next_offset"]})
+        )["code"],
+        "attachment_not_found"
+    );
 }
 
 #[test]
@@ -315,9 +404,22 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     }
     let delivery = worker.call("swarm_wait", json!({"timeout_seconds":0}));
     assert_eq!(delivery["dms"][0]["id"], msg["id"]);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(
+        worker.denied(
+            "swarm_wait",
+            json!({"timeout_seconds":0,"ack":delivery["cursor"]})
+        )["code"],
+        "database_busy"
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(
+        worker.call("swarm_wait", json!({"timeout_seconds":0}))["dms"][0]["id"],
+        msg["id"]
+    );
     let timeout = worker.send(
         "tools/call",
-        json!({"name":"swarm_wait","arguments":{"timeout_seconds":1}}),
+        json!({"name":"swarm_wait","arguments":{"timeout_seconds":1,"ack":delivery["cursor"]}}),
     );
     worker.request("ping", json!({}));
     assert_eq!(
@@ -445,20 +547,49 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
     modern.initialize();
     let response = modern.request("tools/list", json!({}));
     let defs = response["result"]["tools"].as_array().unwrap();
-    let post = defs.iter().find(|t| t["name"] == "swarm_post").unwrap();
-    let cases = post["inputSchema"]["allOf"].as_array().unwrap();
-    for name in ["handoff@1", "verification@1"] {
-        let shape = cases
-            .iter()
-            .find(|s| s["if"]["properties"]["schema"]["const"] == name)
-            .unwrap();
-        assert!(shape["then"]["properties"]["schema_data"]["properties"]["revision"].is_object());
+    for tool in ["swarm_post", "board_post", "board_reply"] {
+        let post = defs.iter().find(|t| t["name"] == tool).unwrap();
+        let cases = post["inputSchema"]["allOf"].as_array().unwrap();
+        for name in ["handoff@1", "verification@1"] {
+            let shape = cases
+                .iter()
+                .find(|s| s["if"]["properties"]["schema"]["const"] == name)
+                .unwrap();
+            assert!(
+                shape["then"]["properties"]["schema_data"]["properties"]["revision"].is_object()
+            );
+        }
     }
     let mut old = Client::start(&db, None, None);
     old.request("initialize", json!({"protocolVersion":"2025-03-26"}));
     let reply = old.request("tools/call", json!({"name":"roles_list","arguments":{}}));
     assert!(reply["result"].get("structuredContent").is_none());
     assert!(Client::content(reply, true).is_array());
+}
+
+#[test]
+fn ordinary_public_replies_record_evidence_once_on_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board");
+    let mut boss = Client::start(&path, None, None);
+    boss.initialize();
+    let run = boss.call(
+        "swarm_start",
+        json!({"slug":"release","goal":"verify one change"}),
+    );
+    boss.call("swarm_add", json!({"name":"check","brief":"verify"}));
+    let mut verifier = Client::start_session(&path, None, None, Some("release/check"));
+    verifier.initialize();
+    let args = json!({"channel":run["channel"],"text":"Review @check","idempotency_key":"mcp-public-root"});
+    let root = boss.call("board_post", args.clone());
+    assert_eq!(boss.call("board_post", args)["id"], root["id"]);
+    let args = json!({"id":root["id"],"text":"Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
+    let reply = verifier.call("board_reply", args.clone());
+    assert_eq!(reply["re"], root["id"]);
+    assert_eq!(verifier.call("board_reply", args)["id"], reply["id"]);
+    let receipt = boss.call("swarm_receipt", json!({}));
+    assert_eq!(receipt["decisions"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["decisions"][0]["id"], reply["id"]);
 }
 
 #[test]
@@ -556,7 +687,7 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
     let id = run["id"].as_i64().unwrap();
     let spawn = coordinator.call(
         "swarm_add",
-        json!({"run":id,"name":"checker","role":"verifier","brief":"Verify the receipt"}),
+        json!({"run":id,"name":"checker","role":"verifier","brief":"Verify the receipt","export_local":true}),
     );
     assert_eq!(spawn["worker"]["actor"], "ada/checker");
     assert!(Path::new(spawn["skills_dir"].as_str().unwrap()).is_dir());
@@ -634,7 +765,7 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
 }
 
 #[test]
-fn a_restarted_stdio_waiter_recovers_an_unread_mention_after_hard_termination() {
+fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_response() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("board");
     let mut boss = Client::start(&path, None, None);
@@ -658,13 +789,22 @@ fn a_restarted_stdio_waiter_recovers_an_unread_mention_after_hard_termination() 
         assert!(Instant::now() < deadline, "waiter did not enter");
         thread::sleep(Duration::from_millis(15));
     }
-    first.child.kill().unwrap();
-    first.child.wait().unwrap();
     let message = boss.call(
         "swarm_post",
         json!({"text":"@checker verify this revision"}),
     )["message"]["id"]
         .clone();
+    // The server has finished the wait; deliberately kill the connection without reading its reply.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while boss.call("swarm_status", json!({}))["workers"][0]["status"] == "waiting" {
+        assert!(
+            Instant::now() < deadline,
+            "server did not finish the delivery"
+        );
+        thread::sleep(Duration::from_millis(15));
+    }
+    first.child.kill().unwrap();
+    first.child.wait().unwrap();
     let mut replacement = Client::start(&path, Some("checker"), None);
     replacement.initialize();
     let result = replacement.call("swarm_wait", json!({"timeout_seconds":0}));
@@ -672,7 +812,10 @@ fn a_restarted_stdio_waiter_recovers_an_unread_mention_after_hard_termination() 
     assert_eq!(result["cursor"], message);
     assert_eq!(result["messages"][0]["id"], message);
     assert_eq!(
-        replacement.call("swarm_wait", json!({"timeout_seconds":0}))["status"],
+        replacement.call(
+            "swarm_wait",
+            json!({"timeout_seconds":0,"ack":result["cursor"]})
+        )["status"],
         "still_waiting"
     );
     let worker = boss.call("swarm_status", json!({}))["workers"][0].clone();

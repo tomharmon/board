@@ -46,6 +46,9 @@ pub enum Swarm {
         workspace: Option<PathBuf>,
         #[arg(long)]
         branch: Option<String>,
+        /// Register only, without rendering local skill files or CLI arguments.
+        #[arg(long)]
+        portable: bool,
     },
     Status {
         run: Option<String>,
@@ -58,6 +61,8 @@ pub enum Swarm {
         after: Option<i64>,
         #[arg(long, default_value_t = 0)]
         action_after: i64,
+        #[arg(long, default_value_t = 0)]
+        task_after: i64,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -67,6 +72,13 @@ pub enum Swarm {
         run: Option<String>,
         #[arg(long)]
         compact: bool,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        workspace_mode: Option<String>,
+        /// Public, opaque reference to the session. Do not include credentials.
+        #[arg(long)]
+        session_ref: Option<String>,
     },
     /// Report a launch error observed by the harness, never inferred from silence.
     LaunchFailed {
@@ -147,12 +159,15 @@ pub enum Swarm {
         #[arg(long, default_value_t = 100)]
         limit: usize,
     },
-    /// Sleep until notified, timeout, or stop. Omit --after to use your saved read position.
+    /// Sleep until notified, timeout, or stop. Unacknowledged messages replay.
     Wait {
         #[arg(long)]
         run: Option<String>,
         #[arg(long)]
         after: Option<i64>,
+        /// Acknowledge the last processed message batch and continue from the saved position.
+        #[arg(long, conflicts_with = "after")]
+        ack: Option<i64>,
         #[arg(long, default_value = "5m")]
         timeout: String,
     },
@@ -356,6 +371,7 @@ fn wait(
     actor: &str,
     run: &str,
     after: Option<i64>,
+    ack: Option<i64>,
     duration: Duration,
 ) -> Result<Value> {
     let signals = WaitSignals::install()?;
@@ -363,6 +379,7 @@ fn wait(
         actor,
         run,
         after,
+        ack,
         duration,
         || signals.check(),
     )?)?)
@@ -370,10 +387,23 @@ fn wait(
 
 pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
     match cmd {
-        Swarm::CheckIn { run, compact } => {
+        Swarm::CheckIn {
+            run,
+            compact,
+            model,
+            workspace_mode,
+            session_ref,
+        } => {
             let run = reference(run.as_deref())?;
             let (target, _) = b.swarm_wait_target(actor, run)?;
-            b.swarm_check_in(actor, run, &target)?;
+            b.swarm_check_in_with_runtime(
+                actor,
+                run,
+                &target,
+                model.as_deref(),
+                workspace_mode.as_deref(),
+                session_ref.as_deref(),
+            )?;
             if compact {
                 return output(
                     js,
@@ -455,19 +485,21 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             run,
             after,
             action_after,
+            task_after,
             limit,
         } => {
-            let v = b.swarm_observe(
+            let v = b.swarm_observe_page(
                 actor,
                 reference(run.as_deref())?,
                 after,
                 action_after,
+                task_after,
                 limit,
             )?;
             output(js, &v, || {
                 let mut lines = vec![format!(
-                    "{}: {} | available slots {} | tasks {:?} | cursor {}",
-                    v.run, v.status, v.available_capacity, v.tasks, v.cursor
+                    "{}: {}\n{} | available slots {} | tasks {:?} | cursor {}",
+                    v.run, v.goal, v.status, v.available_capacity, v.tasks, v.cursor
                 )];
                 lines.extend(v.actions.iter().map(|a| {
                     format!(
@@ -483,6 +515,22 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                         a.blocked_dependents
                     )
                 }));
+                lines.extend(v.threads.iter().map(|t| {
+                    format!(
+                        "#{} [{} · {}] {}: {}",
+                        t.id,
+                        t.workstream.as_deref().unwrap_or("Ungrouped"),
+                        t.state,
+                        t.claimant
+                            .as_deref()
+                            .or(t.assignee.as_deref())
+                            .unwrap_or("Unassigned"),
+                        t.title
+                    )
+                }));
+                if let Some(at) = v.next_task_after {
+                    lines.push(format!("More tasks: --task-after {at}"));
+                }
                 lines.join("\n")
             })
         }
@@ -493,18 +541,21 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             brief,
             workspace,
             branch,
+            portable,
         } => {
-            let v = b.swarm_add_worker(
-                actor,
-                reference(run.as_deref())?,
-                &SwarmAddWorker {
-                    name: worker_name,
-                    role_slug: role,
-                    brief,
-                    workspace_path: workspace.map(local_path).transpose()?,
-                    branch_name: branch,
-                },
-            )?;
+            let run = reference(run.as_deref())?;
+            let args = SwarmAddWorker {
+                name: worker_name,
+                role_slug: role,
+                brief,
+                workspace_path: workspace.map(local_path).transpose()?,
+                branch_name: branch,
+            };
+            if portable {
+                let v = b.swarm_register_worker(actor, run, &args)?;
+                return output(js, &v, || v.selector.clone());
+            }
+            let v = b.swarm_add_worker(actor, run, &args)?;
             output(js, &v, || v.assembled_prompt.clone())
         }
         Swarm::Status { run } => {
@@ -644,13 +695,14 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
         Swarm::Wait {
             run,
             after,
+            ack,
             timeout,
         } => {
             let dur = timeout
                 .parse::<u64>()
                 .map(Duration::from_secs)
                 .or_else(|_| humantime::parse_duration(&timeout))?;
-            let v = wait(b, actor, reference(run.as_deref())?, after, dur)?;
+            let v = wait(b, actor, reference(run.as_deref())?, after, ack, dur)?;
             output(js, &v, || {
                 let mut s = format!(
                     "{}  cursor {}",
