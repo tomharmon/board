@@ -28,8 +28,14 @@ impl Home {
         Self { root, bin, board }
     }
     fn cmd(&self, args: &[&str]) -> Output {
+        self.run(true, args)
+    }
+    fn run(&self, json: bool, args: &[&str]) -> Output {
         let mut cmd = Command::new(&self.board);
-        cmd.args(["--json", "init"])
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.arg("init")
             .args(args)
             .current_dir(self.root.path())
             .env("HOME", self.root.path())
@@ -106,10 +112,26 @@ fn state<'a>(v: &'a Value, name: &str) -> &'a Value {
 #[test]
 fn unknown_clients_get_manual_setup_without_touching_the_board() {
     let h = Home::new();
+    let plan = json(h.cmd(&["--dry-run"]));
+    assert_eq!(plan["server_verified"], false);
     let v = json(h.cmd(&[]));
-    assert!(v["manual"]["command"].as_str().is_some());
+    assert_eq!(v["server_verified"], true);
+    assert_eq!(v["manual"]["command"], serde_json::json!(h.board));
     assert_eq!(v["manual"]["args"], serde_json::json!(["mcp"]));
-    assert_eq!(state(&v, "codex")["detected"], false);
+    for e in v["harnesses"].as_array().unwrap() {
+        assert_eq!(e["detected"], false);
+        assert_eq!(e["verified"], false);
+        assert_eq!(e["registration"], "not-installed");
+    }
+    let out = h.run(false, &[]);
+    assert!(out.status.success());
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("verified over stdio") && text.contains("No client was configured"));
+    assert!(text.contains("Other harnesses: register stdio command"));
+    assert!(!text.contains("Open a new coding chat"));
+    for path in [".codex", ".claude", ".claude.json", ".agents"] {
+        assert!(!h.root.path().join(path).exists());
+    }
     assert!(!h.root.path().join("do-not-migrate.db").exists());
 }
 
@@ -183,13 +205,23 @@ fn foreign_or_disabled_registration_is_neither_run_nor_replaced() {
 fn wrong_executable_without_swarm_start_is_rejected_before_writing_config() {
     use std::os::unix::fs::PermissionsExt;
     let h = Home::new();
-    h.harness("codex");
     let bin = h.bin.join("not-board");
     fs::write(&bin,"#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"board-mcp\"}}}' '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[]}}'\n").unwrap();
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
-    let out = h.cmd(&["--board-bin", bin.to_str().unwrap()]);
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("swarm_start"));
+    let exe = bin.to_str().unwrap();
+    assert_eq!(
+        json(h.cmd(&["--board-bin", exe, "--dry-run"]))["server_verified"],
+        false
+    );
+    for codex_installed in [false, true] {
+        if codex_installed {
+            h.harness("codex");
+        }
+        let out = h.cmd(&["--board-bin", exe]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("swarm_start"));
+    }
+    assert!(!h.root.path().join("do-not-migrate.db").exists());
     assert!(!h.skill(".agents").exists());
     assert!(!h.root.path().join(".codex/config.toml").exists());
 }

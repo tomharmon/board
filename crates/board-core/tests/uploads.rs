@@ -161,31 +161,3 @@ fn staged_parts_resume_after_restart_validate_bytes_and_finish_once() -> Result<
     }
     Ok(())
 }
-
-#[test]
-fn v3_inline_file_ids_keep_their_bytes_after_upgrade() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("old.db");
-    let b = Board::open(&path)?;
-    let m = b.post("dev", "owner", "legacy", &Default::default())?;
-    drop(b);
-    let fixture = rusqlite::Connection::open(&path)?;
-    fixture.execute("INSERT INTO attachments(id,message_id,name,size,bytes) VALUES(17,?,'proof.bin',3,x'00ff01')",[m.id])?;
-    fixture.pragma_update(None, "user_version", 3)?;
-    drop(fixture);
-    let b = Board::open(&path)?;
-    let recovered = b.download(17)?;
-    assert_eq!(recovered.1, [0, 255, 1]);
-    assert_eq!(b.get(m.id)?.attachments, [recovered.0]);
-    let again = b.post(
-        "other",
-        "owner",
-        "",
-        &PostOptions {
-            attachment_ids: vec![17],
-            ..Default::default()
-        },
-    )?;
-    assert_eq!(again.attachments[0].id, 17);
-    Ok(())
-}

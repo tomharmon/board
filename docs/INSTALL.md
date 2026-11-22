@@ -35,7 +35,7 @@ To uninstall this source build, remove `~/Applications/Board.app` in Finder and 
 
 ## Linux: apt or pacman
 
-Supported release targets: **x86-64 Ubuntu 24.04+** (also compatible Debian-family systems meeting the package's declared glibc/library dependencies) and **x86-64 Arch Linux**. The GUI needs a working Wayland or X11 session and a Vulkan driver; `ffmpeg` is optional. There is no claim of an ARM, RPM or musl build. In a terminal, as a normal user with `sudo`:
+Supported release targets: **x86-64 Ubuntu 24.04+** (also compatible Debian-family systems meeting the package's declared glibc/library dependencies) and **x86-64 Arch Linux**. The GUI needs a working Wayland or X11 session and a Vulkan driver; `ffmpeg` is optional for AVIF image previews. There is no claim of an ARM, RPM or musl build. In a terminal, as a normal user with `sudo`:
 
 ```sh
 t=$(mktemp) && curl -fLsS --proto '=https' --proto-redir '=https' https://github.com/tomharmon/board/releases/latest/download/install-linux.sh -o "$t" && /bin/sh "$t"
@@ -47,7 +47,7 @@ Open **Board** from the applications menu or type `board ui`. Both binaries live
 
 ## Linux source install
 
-From a source checkout with Python 3 and the [Rust/Linux build dependencies](../README.md#build-from-source) installed:
+Install Rust/Cargo, Python 3, a C compiler, `pkg-config`, and the xkbcommon, Wayland, X11, and Vulkan development libraries. The Ubuntu CI build uses `libxkbcommon-dev`, `libxkbcommon-x11-dev`, `libwayland-dev`, `libx11-dev`, and `libvulkan-dev`. A working Vulkan driver is needed to run the desktop app; `ffmpeg` is optional for AVIF still images. From the checkout:
 
 ```sh
 python3 packaging/install_local.py
@@ -79,6 +79,10 @@ $m = "$env:TEMP\Board-$([guid]::NewGuid()).msi"; Invoke-WebRequest -UseBasicPars
 
 The MSI installs `%LOCALAPPDATA%\Programs\Board\board.exe` and `board-ui.exe`, adds that directory to **your** PATH, registers a **Board** Start menu shortcut with its icon, and appears in Installed Apps. Open a **new terminal** to use `board`; a running application may retain its old PATH until restarted. Future versions use the same per-user location. Remove it in Settings > Apps > Installed apps. The installer never edits the machine PATH or runs an elevated first-time setup.
 
+## Source build options
+
+From the checkout, `cargo build --locked --release --workspace --bins` builds the CLI and desktop binaries without installing them. To build only the CLI without desktop libraries, use `cargo build --locked --release -p board-cli`. For an offline rebuild, first run `cargo fetch --locked` while connected, then add `--offline` to the build command.
+
 ## After installation
 
 ```sh
@@ -87,7 +91,11 @@ board init
 board ui
 ```
 
-`board init --dry-run` previews changes without writing settings. `board init` reports which supported harnesses were detected and configured. Connect other MCP clients to the installed `board` with the argument `mcp`, using its absolute path if the client launched from the desktop has a different PATH. See [MCP](MCP.md). Removing a package does not delete boards or reverse user-selected harness configuration. Before upgrading an existing board schema, back up its SQLite file with the **old** CLI as described in the README.
+`board init --dry-run` previews changes without writing settings or probing the server. A normal `board init` verifies the installed server on a disposable board and reports separately whether it configured a client. No recognized client is required for the server check. Connect other MCP clients to the installed `board` with the argument `mcp`, using its absolute path if the client launched from the desktop has a different PATH. See [MCP](MCP.md). Removing a package does not delete boards or reverse user-selected harness configuration.
+
+## Database format
+
+Board is experimental and opens only its current SQLite format. An older database is rejected, not migrated or erased. Keep it and its original executable if you need its contents. Start a fresh board by pointing `BOARD_DB` at a new file.
 
 ## Verify a download
 

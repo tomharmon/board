@@ -2,7 +2,7 @@ use anyhow::Result;
 use board_local::{
     Board,
     access::Rules,
-    automation::{self, ClaimTarget, TaskAction},
+    automation::{self, TaskAction},
     sources::{Direction, Envelope, Provider},
 };
 use serde_json::json;
@@ -33,21 +33,18 @@ fn task_intake_survives_restart_and_never_promotes_replies_or_resets_existing_wo
     let m = b.find_source("ada", "bugs", "new", None)?.unwrap();
     let task = m.task.as_ref().unwrap();
     assert_eq!((&*task.state, &*task.by), ("ready", "ada"));
-    assert_eq!(m.labels["tag.bug"], "1");
-    assert_eq!(m.labels["state"], "open");
+    let conn = rusqlite::Connection::open(&path)?;
+    let fields: i64 = conn.query_row(
+        "SELECT count(*) FROM labels WHERE message_id=? AND (key,value) IN (('tag.bug','1'),('state','open'))", [m.id], |r| r.get(0),
+    )?;
+    assert_eq!(fields, 2, "adopting the thread preserves source metadata");
     assert!(b.get(ordinary.id)?.task.is_none());
     let r = b
         .find_source("ada", "bugs", "new", Some("comment"))?
         .unwrap();
     assert_eq!(r.re, Some(m.id));
     assert!(r.task.is_none());
-    let lease = automation::claim(
-        &b,
-        "ada/worker",
-        ClaimTarget::Id(m.id),
-        300,
-        &Default::default(),
-    )?;
+    let lease = automation::claim(&b, "ada/worker", m.id, 300)?;
     b.enqueue_imports_with_tasks("ada", "bugs", &batch, None, true)?;
     assert_eq!(b.drain_source("ada", "bugs", 10)?, (0, 0));
     assert_eq!(automation::get_task(&b, m.id)?.epoch, lease.epoch);

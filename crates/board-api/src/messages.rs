@@ -3,12 +3,10 @@ use axum::extract::{Path, Query, RawQuery};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use board_local::{Filter, PostOptions};
 use serde::Deserialize;
-use std::collections::BTreeMap;
 
-type Labels = BTreeMap<String, String>;
 type Data = ApiResult<Json<Value>>;
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct ChannelQuery {
     after: Option<String>,
@@ -16,6 +14,7 @@ pub(super) struct ChannelQuery {
     prefix: Option<String>,
     limit: Option<usize>,
 }
+#[utoipa::path(get, path = "/channels", params(ChannelQuery), tag = "channels")]
 pub(super) async fn channels(State(a): State<App>, Query(q): Query<ChannelQuery>) -> Data {
     let (cursor, rows, next) = a
         .call(move |b, _| {
@@ -31,11 +30,13 @@ pub(super) async fn channels(State(a): State<App>, Query(q): Query<ChannelQuery>
         json!({"channels":rows,"cursor":cursor,"next_after":next}),
     ))
 }
+#[utoipa::path(get, path="/channels/{*name}", params(("name" = String, Path)), tag="channels")]
 pub(super) async fn one_channel(State(a): State<App>, Path(name): Path<String>) -> Data {
     Ok(Json(json!(a.call(move |b, _| b.channel(&name)).await?)))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub(super) struct ActorQuery {
     query: Option<String>,
     #[serde(default)]
@@ -61,6 +62,7 @@ fn actor_query(raw: Option<String>) -> ApiResult<(ActorQuery, Vec<String>)> {
         .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "invalid actors query"))?;
     Ok((q, ids))
 }
+#[utoipa::path(get, path="/actors", params(ActorQuery,("id"=Option<Vec<String>>, Query, description="Repeat for each actor, up to 100 IDs",style=Form,explode=true)), tag="actors")]
 pub(super) async fn actors(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
     let (q, ids) = actor_query(raw)?;
     let (cursor, rows) = a
@@ -72,13 +74,14 @@ pub(super) async fn actors(State(a): State<App>, RawQuery(raw): RawQuery) -> Dat
         json!({"actors":rows.into_iter().map(|a|a.id).collect::<Vec<_>>(),"cursor":cursor})
     }))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ActorProfile {
     handle: String,
     name: String,
     avatar: Option<String>,
 }
+#[utoipa::path(put, path = "/profile", tag = "profile")]
 pub(super) async fn save_profile(
     State(a): State<App>,
     Json(p): Json<ActorProfile>,
@@ -89,13 +92,15 @@ pub(super) async fn save_profile(
     .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NewChannel {
     name: String,
     #[serde(default)]
+    #[schema(default = false)]
     private: bool,
 }
+#[utoipa::path(post, path="/channels", responses((status=200, description="Public channel already exists"),(status=201, description="Channel created",headers(("Location"=String))),(status=403,description="Permission denied", body=Problem,content_type="application/problem+json"),(status=409,description="Private channel conflicts with an existing channel, subtree or grant",body=Problem,content_type="application/problem+json")), tag="channels")]
 pub(super) async fn channel(
     State(a): State<App>,
     Json(body): Json<NewChannel>,
@@ -122,7 +127,7 @@ pub(super) async fn channel(
     })
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Browse {
     channel: Option<String>,
@@ -133,10 +138,11 @@ pub(super) struct Browse {
     re: Option<i64>,
     after: Option<i64>,
     before: Option<i64>,
+    #[param(minimum = 1, maximum = 500)]
     limit: Option<usize>,
 }
 impl Browse {
-    fn parse(self, terms: &[String]) -> ApiResult<(Filter, usize)> {
+    fn parse(self) -> ApiResult<(Filter, usize)> {
         let limit = self.limit.unwrap_or(50);
         if !(1..=500).contains(&limit) || self.after.is_some_and(|n| n < 0) {
             return Err(ApiError::new(
@@ -153,38 +159,19 @@ impl Browse {
                 mentions: self.mentions,
                 re: self.re,
                 after: self.after,
-                labels: Default::default(),
-                label_terms: board_local::LabelTerm::parse(terms)?,
+                ..Default::default()
             },
             limit,
         ))
     }
 }
-fn query_terms<T: serde::de::DeserializeOwned>(raw: Option<String>) -> ApiResult<(T, Vec<String>)> {
-    let mut labels = Vec::new();
-    let mut scalars = url::form_urlencoded::Serializer::new(String::new());
-    for (k, v) in url::form_urlencoded::parse(raw.as_deref().unwrap_or("").as_bytes()) {
-        if k == "label" {
-            labels.push(v.into_owned());
-        } else {
-            scalars.append_pair(&k, &v);
-        }
-    }
-    let q = serde_urlencoded::from_str(&scalars.finish()).map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid or unknown query parameter",
-        )
-    })?;
-    Ok((q, labels))
-}
 fn resolve_me(f: &mut Filter, who: &str) {
     f.bind_actor(who);
 }
-pub(super) async fn threads(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
-    let (q, terms) = query_terms::<Browse>(raw)?;
+#[utoipa::path(get, path="/threads", params(Browse), responses((status=200, description="Visible threads")), tag="threads")]
+pub(super) async fn threads(State(a): State<App>, Query(q): Query<Browse>) -> Data {
     let before = q.before;
-    let (mut f, n) = q.parse(&terms)?;
+    let (mut f, n) = q.parse()?;
     let p = a
         .call(move |b, who| {
             resolve_me(&mut f, who);
@@ -195,10 +182,10 @@ pub(super) async fn threads(State(a): State<App>, RawQuery(raw): RawQuery) -> Da
         json!({"cursor":p.cursor,"snapshot":p.snapshot,"older":p.older,"threads":p.rows}),
     ))
 }
-pub(super) async fn messages(State(a): State<App>, RawQuery(raw): RawQuery) -> Data {
-    let (q, terms) = query_terms::<Browse>(raw)?;
+#[utoipa::path(get, path="/messages", params(Browse), responses((status=200, description="Visible messages")), tag="messages")]
+pub(super) async fn messages(State(a): State<App>, Query(q): Query<Browse>) -> Data {
     let before = q.before;
-    let (mut f, n) = q.parse(&terms)?;
+    let (mut f, n) = q.parse()?;
     let p = a
         .call(move |b, who| {
             resolve_me(&mut f, who);
@@ -209,25 +196,25 @@ pub(super) async fn messages(State(a): State<App>, RawQuery(raw): RawQuery) -> D
         json!({"cursor":p.cursor,"snapshot":p.snapshot,"older":p.older,"messages":p.rows}),
     ))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ThreadQuery {
+    #[param(minimum = 1)]
     after: Option<i64>,
+    #[param(minimum = 1, maximum = 500)]
     limit: Option<usize>,
 }
+#[utoipa::path(get, path="/threads/{id}", params(("id" = i64, Path), ThreadQuery), responses((status=200, description="Thread and readable replies")), tag="threads")]
 pub(super) async fn thread(
     State(a): State<App>,
     Path(id): Path<i64>,
-    RawQuery(raw): RawQuery,
+    Query(q): Query<ThreadQuery>,
 ) -> Data {
-    let (q, terms) = query_terms::<ThreadQuery>(raw)?;
-    let label_terms = board_local::LabelTerm::parse(&terms)?;
     Ok(Json(json!(
         a.call(move |b, _| b.conversation_window(
             id,
             &Filter {
                 after: q.after,
-                label_terms,
                 ..Filter::default()
             },
             q.limit
@@ -235,38 +222,44 @@ pub(super) async fn thread(
         .await?
     )))
 }
+#[utoipa::path(get, path="/posts/{key}", params(("key" = String, Path)), tag="posts")]
 pub(super) async fn posted(State(a): State<App>, Path(key): Path<String>) -> Data {
     Ok(Json(json!(
         a.call(move |b, actor| b.posted(actor, &key)).await?
     )))
 }
+#[utoipa::path(get, path="/messages/{id}", params(("id" = i64, Path)), responses((status=200,description="Current message",body=board_local::Message)), tag="messages")]
 pub(super) async fn message(State(a): State<App>, Path(id): Path<i64>) -> Data {
     Ok(Json(json!(a.call(move |b, _| b.get(id)).await?)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct NewMessage {
     #[serde(default)]
     no_sync: bool,
     #[serde(default)]
+    #[schema(max_items = 32)]
     sync_targets: Vec<String>,
     channel: Option<String>,
+    #[schema(minimum = 1)]
     reply_to: Option<i64>,
     #[serde(default)]
+    #[schema(max_length = 10000)]
     text: String,
     after: Option<i64>,
     #[serde(default)]
-    labels: Labels,
-    #[serde(default)]
+    #[schema(max_items = 10)]
     attachments: Vec<FileInput>,
     #[serde(default)]
+    #[schema(max_items = 10)]
     attachment_ids: Vec<super::files_api::FileRef>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FileInput {
     name: String,
+    #[schema(content_encoding = "base64")]
     data_base64: String,
 }
 pub(super) fn decode_files(attachments: Vec<FileInput>) -> anyhow::Result<Vec<(String, Vec<u8>)>> {
@@ -285,6 +278,7 @@ pub(super) fn decode_files(attachments: Vec<FileInput>) -> anyhow::Result<Vec<(S
         })
         .collect()
 }
+#[utoipa::path(post, path="/messages", params(("Idempotency-Key"=Option<String>,Header)), responses((status=200,description="Existing message",body=board_local::Message),(status=201,description="New message",body=board_local::Message,headers(("Location"=String)))), tag="messages")]
 pub(super) async fn post_message(
     State(a): State<App>,
     headers: HeaderMap,
@@ -298,7 +292,6 @@ pub(super) async fn post_message(
                 no_sync: input.no_sync,
                 key,
                 after: input.after,
-                labels: input.labels,
                 files,
                 attachment_ids: super::files_api::resolve(b, actor, &input.attachment_ids)?,
             };
@@ -323,12 +316,13 @@ pub(super) async fn post_message(
         Json(json!(m)).into_response()
     })
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Edit {
     text: String,
     if_revision: Option<i64>,
 }
+#[utoipa::path(patch, path="/messages/{id}", params(("id" = i64, Path)), responses((status=200,description="Current message",body=board_local::Message)), tag="messages")]
 pub(super) async fn edit(
     State(a): State<App>,
     Path(id): Path<i64>,
@@ -339,11 +333,12 @@ pub(super) async fn edit(
             .await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Revision {
     if_revision: Option<i64>,
 }
+#[utoipa::path(delete, path="/messages/{id}", params(("id" = i64, Path), Revision), tag="messages")]
 pub(super) async fn remove(
     State(a): State<App>,
     Path(id): Path<i64>,
@@ -353,23 +348,7 @@ pub(super) async fn remove(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
-#[derive(Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
-pub(super) struct LabelPatch {
-    set: Labels,
-    unset: Vec<String>,
-    conditions: BTreeMap<String, Option<String>>,
-}
-pub(super) async fn labels(
-    State(a): State<App>,
-    Path(id): Path<i64>,
-    Json(p): Json<LabelPatch>,
-) -> Data {
-    Ok(Json(json!(
-        a.call(move |b, actor| b.labels(id, actor, &p.set, &p.unset, &p.conditions))
-            .await?
-    )))
-}
+#[utoipa::path(put, path="/messages/{id}/reactions/{name}", params(("id" = i64, Path), ("name" = String, Path)), tag="messages")]
 pub(super) async fn react(
     State(a): State<App>,
     Path((id, name)): Path<(i64, String)>,
@@ -378,6 +357,7 @@ pub(super) async fn react(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(delete, path="/messages/{id}/reactions/{name}", params(("id" = i64, Path), ("name" = String, Path)), tag="messages")]
 pub(super) async fn unreact(
     State(a): State<App>,
     Path((id, name)): Path<(i64, String)>,
@@ -386,6 +366,7 @@ pub(super) async fn unreact(
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(get, path="/attachments/{id}", params(("id" = String, Path)), tag="attachments")]
 pub(super) async fn attachment(
     State(a): State<App>,
     Path(id): Path<String>,
@@ -407,7 +388,7 @@ pub(super) async fn attachment(
     )
         .into_response())
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 pub(super) struct EventQuery {
     #[serde(default)]
@@ -424,12 +405,12 @@ pub(super) struct EventQuery {
     wait_ms: Option<u64>,
     last: Option<usize>,
 }
+#[utoipa::path(get, path="/events", params(EventQuery,("Last-Event-ID"=Option<String>,Header,description="Resume after this delivered cursor")), tag="events")]
 pub(super) async fn events(
     State(a): State<App>,
     headers: HeaderMap,
-    RawQuery(raw): RawQuery,
+    Query(q): Query<EventQuery>,
 ) -> ApiResult<Response> {
-    let (q, terms) = query_terms::<EventQuery>(raw)?;
     let last_id = headers
         .get("last-event-id")
         .map(|h| {
@@ -472,7 +453,7 @@ pub(super) async fn events(
         text: q.text,
         mentions: q.mentions,
     }
-    .parse(&terms)?;
+    .parse()?;
     let (f, head) = a
         .call(move |b, who| {
             let mut f = f;
@@ -523,19 +504,22 @@ pub(super) async fn events(
         .await;
     }
 }
+#[utoipa::path(get, path = "/schemas", tag = "schemas")]
 pub(super) async fn schemas(State(a): State<App>) -> Data {
     Ok(Json(json!({"schemas":a.call(|b,_|b.schemas()).await?})))
 }
+#[utoipa::path(get, path="/schemas/{name}/{version}", params(("name" = String, Path), ("version" = u32, Path)), tag="schemas")]
 pub(super) async fn schema(State(a): State<App>, Path((name, v)): Path<(String, u32)>) -> Data {
     Ok(Json(json!(a.call(move |b, _| b.schema(&name, v)).await?)))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SchemaInput {
     #[serde(default)]
     description: String,
     schema: Value,
 }
+#[utoipa::path(put, path="/schemas/{name}/{version}", params(("name" = String, Path), ("version" = u32, Path)), tag="schemas")]
 pub(super) async fn register_schema(
     State(a): State<App>,
     Path((name, v)): Path<(String, u32)>,

@@ -30,7 +30,6 @@ impl State {
         let present = !draft.body.is_empty()
             || (!draft.channel.is_empty() && draft.channel != "general")
             || !e.files.is_empty()
-            || !e.labels.text.is_empty()
             || e.no_sync
             || task != TaskDraftSettings::default();
         let state = present.then(|| {
@@ -38,7 +37,6 @@ impl State {
                 draft,
                 ComposerSettings {
                     no_sync: e.no_sync,
-                    labels: e.labels.text.clone(),
                     task: Some(task),
                     ..Default::default()
                 },
@@ -72,10 +70,6 @@ impl State {
         let mut entry = workspace::TaskEntry::default();
         if let Some(saved) = saved {
             let settings = &saved.settings;
-            anyhow::ensure!(
-                !settings.review_before_send,
-                "This recovered draft cannot be posted as a task"
-            );
             let task = settings
                 .task
                 .as_ref()
@@ -84,7 +78,6 @@ impl State {
             entry.form.channel = TextEdit::new(&saved.draft.channel);
             entry.form.name = TextEdit::new(&task.assignee);
             entry.form.extra = TextEdit::new(&task.needs);
-            entry.labels = TextEdit::new(&settings.labels);
             entry.no_sync = settings.no_sync;
             entry.stamp = Some(saved.stamp);
             entry.files = saved.files;

@@ -6,19 +6,14 @@ use anyhow::Context;
 use anyhow::{Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 /// Draft values survive restart; posting is always an explicit, immediate action.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ComposerSettings {
     pub no_sync: bool,
-    /// A draft previously intended for delayed delivery needs explicit manual-send review.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub review_before_send: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
-    pub labels: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<TaskDraftSettings>,
 }
@@ -44,21 +39,6 @@ impl TaskDraftSettings {
             .collect()
     }
 }
-impl ComposerSettings {
-    pub fn parsed_labels(&self) -> Result<BTreeMap<String, String>> {
-        let mut map = BTreeMap::new();
-        for line in self.labels.lines().map(str::trim).filter(|s| !s.is_empty()) {
-            let (k, v) = line
-                .split_once('=')
-                .context("Use one key=value label per line")?;
-            ensure!(
-                map.insert(k.trim().to_owned(), v.to_owned()).is_none(),
-                "Duplicate label: {k}"
-            );
-        }
-        Ok(map)
-    }
-}
 pub struct SavedComposer {
     pub draft: Draft,
     pub settings: ComposerSettings,
@@ -75,17 +55,10 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS composer_files(actor TEXT NOT NULL,scope TEXT NOT NULL,
         ordinal INTEGER NOT NULL,name TEXT NOT NULL,data BLOB NOT NULL,PRIMARY KEY(actor,scope,ordinal),
         FOREIGN KEY(actor,scope) REFERENCES composer_drafts(actor,scope) ON DELETE CASCADE);
-        INSERT OR IGNORE INTO composer_settings SELECT actor,scope,lower(hex(randomblob(16))),'{}' FROM composer_drafts;
         CREATE TRIGGER IF NOT EXISTS composer_stamp_on_insert AFTER INSERT ON composer_drafts BEGIN
             INSERT INTO composer_settings VALUES(new.actor,new.scope,lower(hex(randomblob(16))),'{}'); END;
         CREATE TRIGGER IF NOT EXISTS composer_stamp_on_update AFTER UPDATE OF body,channel,reply_to ON composer_drafts BEGIN
-            UPDATE composer_settings SET stamp=lower(hex(randomblob(16))) WHERE actor=new.actor AND scope=new.scope; END;
-        UPDATE composer_settings SET settings=json_remove(
-                CASE WHEN json_extract(settings,'$.later') THEN json_set(settings,'$.review_before_send',json('true')) ELSE settings END,
-                '$.later','$.due','$.every','$.times','$.until'), stamp=lower(hex(randomblob(16)))
-            WHERE json_type(settings,'$.later') IS NOT NULL OR json_type(settings,'$.due') IS NOT NULL
-               OR json_type(settings,'$.every') IS NOT NULL OR json_type(settings,'$.times') IS NOT NULL
-               OR json_type(settings,'$.until') IS NOT NULL;")?;
+            UPDATE composer_settings SET stamp=lower(hex(randomblob(16))) WHERE actor=new.actor AND scope=new.scope; END;")?;
     Ok(())
 }
 
@@ -264,12 +237,10 @@ impl Board {
         ensure!(
             draft.body == text
                 && settings.no_sync == opts.no_sync
-                && !settings.review_before_send
                 && opts.key.is_none()
                 && settings.after == opts.after
                 && (opts.after.is_none() || scope.starts_with("thread:"))
-                && opts.attachment_ids.is_empty()
-                && settings.parsed_labels()? == opts.labels,
+                && opts.attachment_ids.is_empty(),
             conflict()
         );
         let mut stmt = c.prepare(

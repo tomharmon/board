@@ -2,28 +2,10 @@ use super::*;
 use rune_kit::Checkbox;
 
 pub(super) fn options(s: &State) -> El {
-    let active = s.delivery.no_sync || !s.delivery.labels.text.is_empty();
-    tool("delivery-options", "Delivery options", &icons::TAG)
+    let active = s.delivery.no_sync;
+    tool("delivery-options", "Delivery options", &icons::SETTINGS)
         .fill(if active { c(TINT) } else { Color::TRANSPARENT })
         .on_press(State::open_delivery)
-}
-fn labels(s: &State) -> El {
-    let name = "Labels (one key=value per line)";
-    let field = text_input(&s.delivery.labels, font(14.0, 450.0))
-        .key("compose-labels")
-        .label(name)
-        .w_full()
-        .h(74.0)
-        .padding(8.0)
-        .radius(4.0)
-        .border(1.0, c(EDGE))
-        .on_edit(|s: &mut State| &mut s.delivery.labels)
-        .on_input_change(|s: &mut State, _| s.draft_changed());
-    col()
-        .w_full()
-        .gap(4.0)
-        .child(label(name, 13.0, 570.0, INK).w_full().wrap_anywhere())
-        .child(field)
 }
 pub(super) fn view(s: &State, inset: f32) -> El {
     let d = &s.delivery;
@@ -56,11 +38,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
                 })
                 .build(&Kit::neutral(dark()))
                 .key("compose-no-sync"),
-        )
-        .child(labels(s));
-    if let Some(choices) = suggestions::labels(s, suggestions::Field::Delivery) {
-        form = form.child(choices);
-    }
+        );
     if let Some(id) = d.after {
         form = form.child(guard(id));
     }

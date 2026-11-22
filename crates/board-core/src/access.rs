@@ -23,7 +23,6 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
        CREATE TABLE IF NOT EXISTS access_members(grant_id INTEGER NOT NULL REFERENCES access_grants(id) ON DELETE CASCADE,
        subject TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(grant_id,subject));
        CREATE INDEX IF NOT EXISTS access_members_by_subject ON access_members(subject,grant_id);
-       INSERT OR IGNORE INTO access_members SELECT id,subject,0 FROM access_grants;
        CREATE TABLE IF NOT EXISTS access_credentials(
        id TEXT PRIMARY KEY,digest BLOB UNIQUE NOT NULL,actor TEXT NOT NULL,scope TEXT,expires INTEGER,revoked INTEGER NOT NULL DEFAULT 0);
        CREATE TABLE IF NOT EXISTS blind_posts(id INTEGER PRIMARY KEY REFERENCES messages(id));
@@ -35,11 +34,13 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum Action {
     Read,
     Post,
     React,
-    Label,
+    #[serde(alias = "label")]
+    Task,
     Sync,
     Manage,
 }
@@ -48,7 +49,7 @@ const ALL: [Action; 6] = [
     Action::Read,
     Action::Post,
     Action::React,
-    Action::Label,
+    Action::Task,
     Action::Sync,
     Action::Manage,
 ];
@@ -56,6 +57,8 @@ type Actions = BTreeSet<Action>;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "utoipa", schema(value_type = RuleInput))]
 pub struct Rules(pub BTreeMap<String, Actions>);
 #[derive(Debug, Serialize)]
 pub struct Viewer {
@@ -70,43 +73,47 @@ pub struct Viewer {
     pub owner: bool,
 }
 
+#[derive(Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+enum RuleShortcut {
+    All,
+    None,
+}
+#[derive(Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+enum Verbs {
+    Name(RuleShortcut),
+    Actions(BTreeSet<Action>),
+}
+impl Verbs {
+    fn actions(self) -> Actions {
+        match self {
+            Self::Name(RuleShortcut::All) => ALL.into_iter().collect(),
+            Self::Name(RuleShortcut::None) => Actions::new(),
+            Self::Actions(xs) => xs,
+        }
+    }
+}
+#[derive(Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[serde(untagged)]
+enum RuleInput {
+    Any(Verbs),
+    Map(BTreeMap<String, Verbs>),
+}
+
 impl<'de> Deserialize<'de> for Rules {
     fn deserialize<D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         use serde::de::Error;
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Verbs {
-            Name(String),
-            Actions(Actions),
-        }
-        impl Verbs {
-            fn read(self) -> Result<Actions> {
-                match self {
-                    Self::Name(s) if s == "all" => Ok(ALL.into_iter().collect()),
-                    Self::Name(s) if s == "none" => Ok(Actions::new()),
-                    Self::Name(_) => anyhow::bail!("expected all, none, or an action array"),
-                    Self::Actions(xs) => Ok(xs),
-                }
-            }
-        }
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum Form {
-            Any(Verbs),
-            Map(BTreeMap<String, Verbs>),
-        }
-        let map = match Form::deserialize(deserializer)? {
-            Form::Any(v) => [("*".into(), v)].into(),
-            Form::Map(m) => m,
+        let map = match RuleInput::deserialize(deserializer)? {
+            RuleInput::Any(v) => [("*".into(), v)].into(),
+            RuleInput::Map(m) => m,
         };
-        let rules = Self(
-            map.into_iter()
-                .map(|(k, v)| Ok((k, v.read()?)))
-                .collect::<Result<_>>()
-                .map_err(D::Error::custom)?,
-        );
+        let rules = Self(map.into_iter().map(|(k, v)| (k, v.actions())).collect());
         rules.validate().map_err(D::Error::custom)?;
         Ok(rules)
     }
@@ -182,7 +189,7 @@ impl Rules {
                 || (action == Action::Read
                     && actions
                         .iter()
-                        .any(|a| matches!(a, Action::React | Action::Label | Action::Sync)))
+                        .any(|a| matches!(a, Action::React | Action::Task | Action::Sync)))
         })
     }
 }
@@ -391,15 +398,28 @@ impl Access {
                 .collect(),
         ))
     }
-    pub(crate) fn view(&self, c: &Connection, mut m: crate::Message) -> Result<crate::Message> {
-        crate::schemas::correct_snapshot(c, &mut m)?;
+    pub(crate) fn read_channels_json(&self, c: &Connection) -> Result<Option<String>> {
+        Ok(self
+            .channels(c, Action::Read)?
+            .map(|v| serde_json::to_string(&v))
+            .transpose()?)
+    }
+    pub(crate) fn view(&self, c: &Connection, m: crate::Message) -> Result<crate::Message> {
+        self.view_in_run(c, m, None)
+    }
+    pub(crate) fn view_in_run(
+        &self,
+        c: &Connection,
+        mut m: crate::Message,
+        run: Option<i64>,
+    ) -> Result<crate::Message> {
         if !self.allows(Action::Read, &m.channel) {
             m.links.clear();
             m.file_notices.clear();
             m.notified.clear();
             m.suppressed.clear();
-        } else if m.channel.starts_with("swarms/") && !m.deleted {
-            crate::swarm::read_mention_routing(c, &mut m)?;
+        } else if !m.deleted {
+            crate::swarm::read_mention_routing(c, self, &mut m, run)?;
         }
         if !self.is_trusted()
             && let Some(origin) = &m.origin

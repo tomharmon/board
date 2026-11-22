@@ -27,7 +27,7 @@ impl From<Job> for Entry {
             Some("upsert") => "Update or post",
             Some("edit" | "message.edited") => "Edit",
             Some("delete" | "message.deleted") => "Delete",
-            Some("labels" | "labels.changed") => "Labels",
+            Some("labels" | "labels.changed") => "Source details",
             Some("react" | "reaction.added" | "reaction.removed") => "Reaction",
             Some("thread.start") => "Start thread",
             _ => "Change",
@@ -351,7 +351,7 @@ mod tests {
         let token = b.issue_credential("owner", "reader", None, None).unwrap();
         let mut client = Board::open(&path).unwrap();
         client.bind_token(&token.token).unwrap();
-        let mut state = State::opened(Ok((client, Some("reader".into()))));
+        let mut state = State::test_board(client, Some("reader"));
         state.desk.source.selected = "-updates".into();
         state.go(Page::Inbox);
         let mut rt = Runtime::new(state, crate::view::view, (1000., 800.), Env::default());
@@ -473,7 +473,7 @@ mod tests {
             assert!(quoted_database(&db).is_none());
             db.create_source("user", "feed", Provider::Local, "stream", "work")
                 .unwrap();
-            let mut state = State::opened(Ok((db, None)));
+            let mut state = State::test_board(db, None);
             state.actor = "user".into();
             state.desk.source.selected = "feed".into();
             state.go(Page::Inbox);

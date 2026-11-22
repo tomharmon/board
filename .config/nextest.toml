@@ -1,0 +1,6 @@
+[test-groups.desktop-renderers]
+max-threads = 2
+
+[[profile.default.overrides]]
+filter = 'package(board-ui) & binary(inspector)'
+test-group = 'desktop-renderers'

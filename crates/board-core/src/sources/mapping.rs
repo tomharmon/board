@@ -1,6 +1,7 @@
 use super::*;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Copy {
     pub source: String,
     pub thread: String,
@@ -34,6 +35,79 @@ pub(super) fn root_on(c: &Connection, name: &str, thread: &str) -> Result<Option
 pub(super) fn find_on(c: &Connection, name: &str, thread: &str, id: &str) -> Result<Option<Copy>> {
     Ok(c.query_row("SELECT source,thread,external,message,origin,url FROM sync_copies WHERE source=? AND thread=? AND external=?",params![name,thread,id],copy_row).optional()?)
 }
+fn validate_field(s: &str) -> Result<()> {
+    ensure!(
+        s.len() <= 64
+            && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+            && s.bytes().all(|b| b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'_' | b'-' | b'.'))
+            && !matches!(s, "constructor" | "prototype"),
+        "invalid source metadata key: {s}"
+    );
+    ensure!(
+        !s.starts_with("board."),
+        Kind::Invalid.error(
+            "reserved_label",
+            format!("reserved source metadata key: {s}")
+        )
+    );
+    Ok(())
+}
+
+fn metadata_on(c: &Connection, id: i64) -> Result<BTreeMap<String, String>> {
+    Ok(
+        c.prepare("SELECT key,value FROM labels WHERE message_id=?")?
+            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?,
+    )
+}
+
+fn put_metadata(tx: &Transaction<'_>, id: i64, fields: &BTreeMap<String, String>) -> Result<usize> {
+    let mut changed = 0;
+    for (k, v) in fields {
+        validate_field(k)?;
+        ensure!(
+            v.encode_utf16().count() <= 256 && !v.chars().any(char::is_control),
+            "source metadata values must be at most 256 characters without controls"
+        );
+        changed += tx.execute("INSERT INTO labels VALUES (?,?,?) ON CONFLICT(message_id,key) DO UPDATE SET value=excluded.value WHERE value<>excluded.value", params![id,k,v])?;
+    }
+    Ok(changed)
+}
+
+fn update_metadata(
+    tx: &Transaction<'_>,
+    id: i64,
+    source: &str,
+    actor: &str,
+    set: &BTreeMap<String, String>,
+    unset: &[String],
+) -> Result<Message> {
+    let old = Board::get_on(tx, id)?;
+    ensure!(!old.deleted, Kind::Gone.error("deleted", "message removed"));
+    let mut changed = put_metadata(tx, id, set)?;
+    for k in unset {
+        validate_field(k)?;
+        ensure!(!set.contains_key(k), "key both set and unset: {k}");
+        changed += tx.execute(
+            "DELETE FROM labels WHERE message_id=? AND key=?",
+            params![id, k],
+        )?;
+    }
+    if changed == 0 {
+        return Ok(old);
+    }
+    Board::changed(
+        tx,
+        "source.metadata",
+        actor,
+        &old,
+        json!({"source":source}),
+        false,
+    )
+}
+
 fn valid_link(url: Option<&str>) -> Result<()> {
     if let Some(u) = url {
         ensure!(
@@ -299,14 +373,15 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         let root = root_on(tx, &s.name, &i.thread)?
             .with_context(|| Kind::Invalid.error("ignored_event", "signal has no linked thread"))?;
         let m = Board::get_on(tx, root)?;
-        if m.deleted || !conditions.iter().all(|(k, v)| m.labels.get(k) == Some(v)) {
+        let current = metadata_on(tx, root)?;
+        if m.deleted || !conditions.iter().all(|(k, v)| current.get(k) == Some(v)) {
             return Ok(m);
         }
         meet_authors(tx, s, i, &actor)?;
         let updated = if set.is_empty() && unset.is_empty() {
             m
         } else {
-            Board::labels_tx(tx, root, &actor, set, unset, &BTreeMap::new())?
+            update_metadata(tx, root, &s.name, &actor, set, unset)?
         };
         if let Some(text) = reply {
             let m = Board::platform_reply_tx(
@@ -356,6 +431,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             | Change::Reconcile {
                 text, labels: next, ..
             } => {
+                let current = metadata_on(tx, old.id)?;
                 let prior: BTreeMap<String, String> = serde_json::from_str(&labels)?;
                 let mut desired = next.clone();
                 let mut extra = Vec::new();
@@ -375,16 +451,16 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                         }
                     }
                     extra.extend(
-                        old.labels
+                        current
                             .keys()
                             .filter(|k| supplied(k) && !next.contains_key(*k))
                             .cloned(),
                     );
                     for (k, prefix) in reset {
-                        if next.contains_key(k) && next.get(k) != old.labels.get(k) {
+                        if next.contains_key(k) && next.get(k) != current.get(k) {
                             ensure!(!prefix.is_empty(), "empty label reset prefix");
                             extra.extend(
-                                old.labels
+                                current
                                     .keys()
                                     .filter(|key| key.starts_with(prefix))
                                     .cloned(),
@@ -394,7 +470,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                 }
                 let mut unset = prior
                     .iter()
-                    .filter(|(k, v)| !desired.contains_key(*k) && old.labels.get(*k) == Some(*v))
+                    .filter(|(k, v)| !desired.contains_key(*k) && current.get(*k) == Some(*v))
                     .map(|(k, _)| k.clone())
                     .collect::<Vec<_>>();
                 unset.append(&mut extra);
@@ -403,8 +479,8 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                 if text != &old.text || !old.blocks.is_empty() {
                     Board::platform_edit_tx(tx, old.id, &actor, text, None)?;
                 }
-                if !unset.is_empty() || next.iter().any(|(k, v)| old.labels.get(k) != Some(v)) {
-                    Board::labels_tx(tx, old.id, &actor, next, &unset, &BTreeMap::new())?;
+                if !unset.is_empty() || next.iter().any(|(k, v)| current.get(k) != Some(v)) {
+                    update_metadata(tx, old.id, &s.name, &actor, next, &unset)?;
                 }
                 managed = Some(serde_json::to_string(&desired)?);
                 Board::get_on(tx, old.id)?
@@ -422,7 +498,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
                 unreachable!("handled before looking up the copy")
             }
             Change::Labels { set, unset } => {
-                Board::labels_tx(tx, old.id, &actor, set, unset, &BTreeMap::new())?
+                update_metadata(tx, old.id, &s.name, &actor, set, unset)?
             }
         }
     } else {
@@ -448,7 +524,6 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
         };
         let opts = PostOptions {
             no_sync: i.no_sync,
-            labels: labels.clone(),
             ..Default::default()
         };
         let parent = match &i.parent {
@@ -481,6 +556,7 @@ pub(super) fn apply(tx: &Transaction<'_>, s: &Source, i: &Import) -> Result<Mess
             Some(p) => Board::platform_reply_tx(tx, p, &actor, text, &opts)?,
             None => Board::platform_post_tx(tx, &s.channel, &actor, text, &opts)?,
         };
+        put_metadata(tx, m.id, labels)?;
         bind(tx, s, &i.thread, &i.external, &m, true, i.url.as_deref())?;
         let m = Board::get_on(tx, m.id)?;
         Board::snapshot(tx, m.id, &m, None)?;

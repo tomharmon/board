@@ -8,12 +8,13 @@ fn board() -> Result<Board> {
         "ada",
         &SwarmStart {
             goal: "Verify a revision".into(),
+            channel: Some("project".into()),
             slug: Some("audit".into()),
             ..Default::default()
         },
     )?;
     for name in ["impl", "verify"] {
-        b.swarm_add_worker(
+        b.swarm_register_worker(
             "ada",
             "audit",
             &SwarmAddWorker {
@@ -26,14 +27,31 @@ fn board() -> Result<Board> {
     Ok(b)
 }
 
+fn link_work(b: &Board, id: i64) -> Result<()> {
+    b.swarm_register_worker(
+        "ada",
+        "audit",
+        &SwarmAddWorker {
+            name: format!("work-{id}"),
+            brief: "Work on the linked thread".into(),
+            thread_id: Some(id),
+            ..Default::default()
+        },
+    )?;
+    Ok(())
+}
+
 #[test]
 fn registration_is_not_execution_and_activity_does_not_imply_launch_failure() -> Result<()> {
     let b = board()?;
     let worker = &b.swarm_status("ada", "audit")?.workers[0];
     assert_eq!(worker.status, "registered");
     assert!(worker.last_activity_at.is_none());
-    assert!(b.swarm_check_in("ada/verify", "audit", "impl").is_err());
-    b.swarm_check_in("ada/impl", "audit", "impl")?;
+    assert!(
+        b.swarm_check_in("ada/outsider", "audit", None, None, None)
+            .is_err()
+    );
+    b.swarm_check_in("ada/impl", "audit", None, None, None)?;
     b.swarm_post(
         "ada/impl",
         "audit",
@@ -55,7 +73,7 @@ fn registration_is_not_execution_and_activity_does_not_imply_launch_failure() ->
         run.workers[1].launch_error.as_deref(),
         Some("Harness rejected launch")
     );
-    b.swarm_add_worker(
+    b.swarm_register_worker(
         "ada",
         "audit",
         &SwarmAddWorker {
@@ -98,7 +116,7 @@ fn completed_input_does_not_block_dependents_while_its_handoff_awaits_review() -
     let b = board()?;
     let opts = PostOptions::default();
     let target = |text| TaskTarget::New {
-        channel: "swarms/audit",
+        channel: "project",
         text,
         options: &opts,
     };
@@ -122,6 +140,9 @@ fn completed_input_does_not_block_dependents_while_its_handoff_awaits_review() -
         &[a.id, other.id],
         None,
     )?;
+    for id in [a.id, other.id, dependent.id] {
+        link_work(&b, id)?;
+    }
     post(
         &b,
         "ada/impl",
@@ -168,6 +189,143 @@ fn post(b: &Board, who: &str, schema: &str, data: Value) -> Result<i64> {
 }
 
 #[test]
+fn taskless_reviews_follow_their_thread_through_revisions_and_read_grants() -> Result<()> {
+    use board_local::access::Rules;
+    let mut b = board()?;
+    let public = b
+        .post("project", "ada", "Fix public import", &Default::default())?
+        .id;
+    let private = b
+        .post("team", "ada", "Fix private export", &Default::default())?
+        .id;
+    link_work(&b, public)?;
+    link_work(&b, private)?;
+    let report = |id, who, schema, data: Value| -> Result<i64> {
+        Ok(b.reply(
+            id,
+            who,
+            &append_block("", schema, 1, &data)?,
+            &Default::default(),
+        )?
+        .id)
+    };
+    let rev = |digit: &str| json!({"kind":"sha256","value":digit.repeat(64)});
+    let handoff = |thread, digit| {
+        report(
+            thread,
+            "ada/impl",
+            "handoff",
+            json!({
+                "to":"verify","changes":["fix"],"summary":"Ready","revision":rev(digit)
+            }),
+        )
+    };
+    let fail = |handoff, digit| {
+        report(
+            handoff,
+            "ada/verify",
+            "verification",
+            json!({
+                "handoff":handoff,"revision":rev(digit),"summary":"Failed check",
+                "checks":[{"name":"unit","status":"fail","command":"test"}]
+            }),
+        )
+    };
+    let old = handoff(public, "a")?;
+    let public_check = fail(old, "a")?;
+    let hidden = handoff(private, "b")?;
+    let private_check = fail(hidden, "b")?;
+    let attention = b.attention("ada")?;
+    for id in [public_check, private_check] {
+        assert!(attention.iter().any(|item| item.message_id == id));
+    }
+    let latest = handoff(public, "c")?;
+    let full = b.swarm_observe("ada", "audit", Some(0), 0, 100)?;
+    assert!(full.tasks.is_empty());
+    assert_eq!(
+        full.actions
+            .iter()
+            .map(|a| (a.thread_id, a.message_id, a.task_id))
+            .collect::<Vec<_>>(),
+        [(private, private_check, None), (public, latest, None)]
+    );
+    for (thread_id, handoff, check) in [
+        (public, latest, None),
+        (private, hidden, Some(private_check)),
+    ] {
+        let t = full.threads.iter().find(|t| t.id == thread_id).unwrap();
+        assert_eq!(t.briefed_workers, [format!("work-{thread_id}")]);
+        assert!(t.assignee.is_none());
+        assert_eq!(
+            (t.state.as_str(), t.latest_handoff, t.latest_check),
+            ("thread", Some(handoff), check)
+        );
+    }
+    let receipt = b.swarm_receipt("ada", "audit")?;
+    assert_eq!(
+        receipt
+            .handoffs
+            .iter()
+            .map(|h| (h.id, h.thread_id, h.superseded))
+            .collect::<Vec<_>>(),
+        [
+            (old, public, true),
+            (hidden, private, false),
+            (latest, public, false)
+        ]
+    );
+    assert_eq!(
+        b.attention("ada")?
+            .iter()
+            .map(|i| i.message_id)
+            .collect::<Vec<_>>(),
+        [private_check]
+    );
+
+    let items = [serde_json::from_value(json!({"thread_id":public}))?];
+    let (tasks, _) = board_local::automation::create_plan_for_run(
+        &b,
+        "ada",
+        "project",
+        &items,
+        None,
+        Some("audit"),
+    )?;
+    assert_eq!((tasks[0].id, tasks[0].state.as_str()), (public, "ready"));
+    b.set_grant("ada", None, "guest", &Rules::parse("project=read")?)?;
+    let token = b.issue_credential("ada", "guest", None, None)?.token;
+    b.bind_token(&token)?;
+    let view = b.swarm_observe("guest", "audit", Some(0), 0, 100)?;
+    assert!(view.threads.iter().all(|t| t.id != private));
+    assert_eq!(
+        view.actions.iter().map(|a| a.thread_id).collect::<Vec<_>>(),
+        [public]
+    );
+    assert_eq!(
+        (view.actions[0].task_id, view.actions[0].message_id),
+        (Some(public), latest),
+        "queueing a thread retains its earlier taskless handoff"
+    );
+    assert!(
+        view.changes
+            .iter()
+            .all(|c| ![hidden, private_check].contains(&c.message_id))
+    );
+    assert!(b.attention("guest")?.is_empty());
+    assert_eq!(
+        b.swarm_receipt("guest", "audit")?
+            .handoffs
+            .iter()
+            .map(|h| h.id)
+            .collect::<Vec<_>>(),
+        [old, latest]
+    );
+    assert!(b.swarm_mark_public_seen("guest", "audit", hidden).is_err());
+    assert!(b.swarm_explain_task("guest", "audit", private, 5).is_err());
+    Ok(())
+}
+
+#[test]
 fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision() -> Result<()> {
     use board_local::access::Rules;
     use board_local::automation::{TaskTarget, create_task};
@@ -186,13 +344,14 @@ fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision()
             None,
         )
     };
-    let run = "swarms/audit";
+    let run = "project";
     let behind_hidden = task("shared", "Reachable only through a private task", &[])?;
     let hidden = task("private", "Private gate", &[behind_hidden.id])?;
     let outside = task("shared", "Shared input", &[hidden.id])?;
     let leaf = task(run, "Package", &[])?;
     let middle = task(run, "Release", &[leaf.id])?;
     let root = task(run, "Publish", &[middle.id, outside.id])?;
+    link_work(&b, root.id)?;
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
     let handoff = |r: &Value| {
         post(
@@ -217,10 +376,11 @@ fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision()
         &SwarmStart {
             slug: Some("other-run".into()),
             goal: "Independent review".into(),
+            channel: Some("project".into()),
             ..Default::default()
         },
     )?;
-    b.swarm_add_worker(
+    b.swarm_register_worker(
         "ada",
         &other.slug,
         &SwarmAddWorker {
@@ -236,7 +396,7 @@ fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision()
         "ada",
         None,
         "guest",
-        &Rules::parse("swarms/=read;shared=read")?,
+        &Rules::parse("project=read;shared=read")?,
     )?;
     let token = b.issue_credential("ada", "guest", None, None)?.token;
     b.bind_token(&token)?;
@@ -278,9 +438,7 @@ fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision()
 #[test]
 fn task_inputs_follow_the_latest_readable_revision_at_open_and_claim() -> Result<()> {
     use board_local::access::Rules;
-    use board_local::automation::{
-        ClaimTarget, TaskAction, TaskTarget, change_task, claim, create_task,
-    };
+    use board_local::automation::{TaskAction, TaskTarget, change_task, claim, create_task};
     let mut b = board()?;
     let opts = PostOptions::default();
     let task = |channel, text, needs: &[i64]| {
@@ -299,7 +457,7 @@ fn task_inputs_follow_the_latest_readable_revision_at_open_and_claim() -> Result
     let input = task("public", "Produce artifact", &[])?;
     let private = task("internal", "Independent private check", &[])?;
     let dependent = task("public", "Use both results", &[input.id, private.id])?;
-    let acquire = |id| claim(&b, "ada", ClaimTarget::Id(id), 120, &Default::default());
+    let acquire = |id| claim(&b, "ada", id, 120);
     for (id, result) in [
         (input.id, "artifact output"),
         (private.id, "sensitive output"),
@@ -392,12 +550,12 @@ fn task_inputs_follow_the_latest_readable_revision_at_open_and_claim() -> Result
 }
 
 #[test]
-fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<()> {
+fn readable_run_and_task_do_not_disclose_private_review_or_decision() -> Result<()> {
+    use board_local::access::Rules;
     use board_local::automation::{TaskTarget, create_task};
-    let b = board()?;
-    let mut opts = PostOptions::default();
-    opts.labels.insert("workstream".into(), "Storage".into());
-    let task = |channel, text| {
+    let mut b = board()?;
+    let opts = PostOptions::default();
+    let task = |channel, text, needs: &[i64]| {
         create_task(
             &b,
             "ada",
@@ -406,16 +564,146 @@ fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<
                 text,
                 options: &opts,
             },
+            needs,
+            None,
+        )
+    };
+    let input = task("project", "Public input", &[])?.id;
+    let dependent = task("project", "Public use", &[input])?.id;
+    let private = task("private", "Private investigation", &[])?.id;
+    let external = task("other", "Unlinked task", &[])?.id;
+    link_work(&b, input)?;
+    link_work(&b, private)?;
+    let publish = |thread_id, schema, who, data| -> Result<i64> {
+        Ok(b.swarm_post_to_thread(
+            who,
+            "audit",
+            Some(thread_id),
+            &append_block("", schema, 1, &data)?,
+            &opts,
+        )?
+        .message
+        .id)
+    };
+    let revision = json!({"kind":"sha256","value":"a".repeat(64)});
+    let handoff =
+        json!({"task":input,"to":"verify","changes":["fix"],"summary":"Ready","revision":revision});
+    let first = publish(input, "handoff", "ada/impl", handoff.clone())?;
+    let check = publish(
+        private,
+        "verification",
+        "ada/verify",
+        json!({"handoff":first,"revision":revision,
+        "summary":"Failed private check","checks":[{"name":"case","command":"private","status":"fail"}]}),
+    )?;
+    let latest = publish(private, "handoff", "ada/impl", handoff.clone())?;
+    let mut cross_reference = handoff;
+    cross_reference["task"] = json!(external);
+    let external_review = publish(input, "handoff", "ada/impl", cross_reference)?;
+    let owner = b.swarm_observe("ada", "audit", None, 0, 100)?;
+    assert!(owner.threads.iter().all(|t| t.id != external));
+    assert_eq!(owner.tasks["ready"], 2);
+    assert!(
+        owner
+            .actions
+            .iter()
+            .any(|a| a.message_id == external_review && a.task_id == Some(external))
+    );
+    assert!(
+        b.swarm_receipt("ada", "audit")?
+            .open_tasks
+            .contains(&external)
+    );
+    let decision = publish(
+        private,
+        "decision-request",
+        "ada/impl",
+        json!({"to":"ada","summary":"Private question"}),
+    )?;
+    let resolution = b
+        .swarm_resolve_decision("ada", "audit", decision, "Private answer")?
+        .message;
+    assert_eq!(
+        (resolution.channel.as_str(), resolution.re),
+        ("private", Some(private))
+    );
+    let root_handoff = |b: &Board| -> Result<_> {
+        Ok(b.conversation(dependent, &Default::default())?
+            .message
+            .task
+            .unwrap()
+            .inputs
+            .remove(0)
+            .handoff
+            .unwrap())
+    };
+    assert_eq!(root_handoff(&b)?.id, latest);
+    let rules = Rules::parse("project=read")?;
+    b.set_grant("ada", None, "guest", &rules)?;
+    let token = b.issue_credential("ada", "guest", None, None)?.token;
+    b.bind_token(&token)?;
+    let visible = root_handoff(&b)?;
+    assert_eq!(visible.id, first);
+    assert!(visible.verification.is_none());
+    assert_eq!(
+        b.swarm_explain_task("guest", "audit", input, 1)?.steps[0]
+            .handoff
+            .as_ref(),
+        Some(&visible)
+    );
+    assert!(b.swarm_explain_task("guest", "audit", private, 1).is_err());
+    let receipt = b.swarm_receipt("guest", "audit")?;
+    assert_eq!(receipt.open_tasks, [input]);
+    assert_eq!(receipt.handoffs.len(), 1);
+    assert_eq!(receipt.handoffs[0].id, first);
+    assert!(!receipt.handoffs[0].superseded);
+    assert!(receipt.handoffs[0].verification_id.is_none());
+    let view = b.swarm_observe("guest", "audit", Some(0), 0, 100)?;
+    assert_eq!(view.tasks["ready"], 1);
+    assert_eq!(view.actions.len(), 1);
+    assert_eq!(
+        (view.actions[0].kind.as_str(), view.actions[0].message_id),
+        ("awaiting_verification", first)
+    );
+    assert!(view.changes.iter().all(|c| {
+        ![
+            private,
+            check,
+            latest,
+            external_review,
+            decision,
+            resolution.id,
+        ]
+        .contains(&c.message_id)
+    }));
+    Ok(())
+}
+
+#[test]
+fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<()> {
+    use board_local::automation::{TaskTarget, create_task};
+    let b = board()?;
+    let task = |channel, text| {
+        create_task(
+            &b,
+            "ada",
+            TaskTarget::New {
+                channel,
+                text,
+                options: &Default::default(),
+            },
             &[],
             Some("ada/impl"),
         )
     };
     let first = task(
-        "swarms/audit",
+        "project",
         "Verify migration\nLong details stay in the thread",
     )?;
-    task("elsewhere", "Foreign queue")?;
-    let last = task("swarms/audit", "Check restore")?;
+    task("project", "Unrelated task in the very same channel")?;
+    let last = task("project", "Check restore")?;
+    link_work(&b, first.id)?;
+    link_work(&b, last.id)?;
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
     let publish = |r: &Value| {
         post(
@@ -434,17 +722,17 @@ fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<
         json!({"handoff":handoff,"revision":revision,"summary":"Tested",
         "checks":[{"name":"restore","status":"pass","command":"test restore"}]}),
     )?;
-    let view = b.swarm_observe("ada", "audit", None, 0, 1)?;
+    let anchor = b.swarm_observe("ada", "audit", None, 0, 1)?;
+    assert_eq!(anchor.threads[0].state, "thread");
+    assert_eq!(anchor.next_task_after, Some(anchor.thread_id));
+    let view = b.swarm_observe_page("ada", "audit", None, 0, anchor.thread_id, 1)?;
+    assert_eq!(view.tasks["ready"], 2);
     assert_eq!(view.next_task_after, Some(first.id));
     assert_eq!(view.goal, "Verify a revision");
     let thread = &view.threads[0];
     assert_eq!(
-        (
-            &*thread.title,
-            thread.workstream.as_deref(),
-            thread.assignee.as_deref()
-        ),
-        ("Verify migration", Some("Storage"), Some("ada/impl"))
+        (&*thread.title, thread.assignee.as_deref()),
+        ("Verify migration", Some("ada/impl"))
     );
     assert_eq!(
         (thread.latest_handoff, thread.latest_check),
@@ -454,7 +742,9 @@ fn ordinary_task_overview_pages_and_links_the_latest_exact_evidence() -> Result<
     assert_eq!(next.threads[0].id, last.id);
     assert!(next.next_task_after.is_none());
     let newer = publish(&json!({"kind":"sha256","value":"b".repeat(64)}))?;
-    let thread = &b.swarm_observe("ada", "audit", None, 0, 1)?.threads[0];
+    let thread = &b
+        .swarm_observe_page("ada", "audit", None, 0, anchor.thread_id, 1)?
+        .threads[0];
     assert_eq!(
         (thread.latest_handoff, thread.latest_check),
         (Some(newer), None)
@@ -689,45 +979,6 @@ fn handoffs_notify_verifiers_and_replayed_posts_do_not_duplicate_receipts() -> R
 }
 
 #[test]
-fn upgrade_preserves_assignments_and_does_not_fabricate_old_working_checkins() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("legacy.sqlite");
-    let b = Board::open(&path)?;
-    b.swarm_start(
-        "ada",
-        &SwarmStart {
-            goal: "Legacy run".into(),
-            slug: Some("audit".into()),
-            ..Default::default()
-        },
-    )?;
-    b.swarm_add_worker(
-        "ada",
-        "audit",
-        &SwarmAddWorker {
-            name: "impl".into(),
-            brief: "Original assignment".into(),
-            ..Default::default()
-        },
-    )?;
-    b.swarm_check_in("ada/impl", "audit", "impl")?;
-    let original = b.swarm_status("ada", "audit")?.workers[0].clone();
-    drop(b);
-    let fixture = rusqlite::Connection::open(&path)?;
-    fixture.execute_batch("ALTER TABLE swarm_workers DROP COLUMN checked_in_at; ALTER TABLE swarm_workers DROP COLUMN last_activity_at; ALTER TABLE swarm_workers DROP COLUMN launch_error; PRAGMA user_version=16;")?;
-    drop(fixture);
-    let b = Board::open(&path)?;
-    let current = b.swarm_status("ada", "audit")?.workers[0].clone();
-    assert_eq!(current.id, original.id);
-    assert_eq!(current.brief, "Original assignment");
-    assert_eq!(current.status, "registered");
-    assert!(current.checked_in_at.is_none() && current.last_activity_at.is_none());
-    b.swarm_check_in("ada/impl", "audit", "impl")?;
-    assert_eq!(b.swarm_status("ada", "audit")?.workers[0].status, "working");
-    Ok(())
-}
-
-#[test]
 fn attention_and_receipts_respect_channel_access() -> Result<()> {
     use board_local::access::Rules;
     let dir = tempfile::tempdir()?;
@@ -737,6 +988,7 @@ fn attention_and_receipts_respect_channel_access() -> Result<()> {
         "ada",
         &SwarmStart {
             goal: "Private run".into(),
+            channel: Some("private".into()),
             slug: Some("private".into()),
             ..Default::default()
         },
@@ -759,7 +1011,7 @@ fn attention_and_receipts_respect_channel_access() -> Result<()> {
     assert!(guest.attention("guest")?.is_empty());
     assert!(guest.swarm_receipt("guest", "private").is_err());
     assert!(guest.swarm_observe("guest", "private", None, 0, 2).is_err());
-    let grant = owner.set_grant("ada", None, "guest", &Rules::parse("swarms/private=read")?)?;
+    let grant = owner.set_grant("ada", None, "guest", &Rules::parse("private=read")?)?;
     assert_eq!(
         guest.swarm_observe("guest", "private", None, 0, 2)?.actions[0].assigned_to,
         "guest"
@@ -774,94 +1026,6 @@ fn attention_and_receipts_respect_channel_access() -> Result<()> {
 }
 
 #[test]
-fn v17_policy_upgrade_preserves_role_customization_and_uses_defaults_for_existing_runs()
--> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("previous");
-    let b = Board::open(&path)?;
-    b.swarm_start(
-        "ada",
-        &SwarmStart {
-            slug: Some("old".into()),
-            goal: "Preserve history".into(),
-            ..Default::default()
-        },
-    )?;
-    b.role_detach_skill("implementer", "board-implementer")?;
-    let head = b.cursor()?;
-    drop(b);
-    rusqlite::Connection::open(&path)?
-        .execute_batch("DROP TABLE swarm_policy; PRAGMA user_version=17;")?;
-    let b = Board::open(&path)?;
-    assert!(
-        !b.role_show("implementer")?
-            .skills
-            .iter()
-            .any(|s| s == "board-implementer")
-    );
-    assert_eq!(
-        b.swarm_observe("ada", "old", None, 0, 1)?
-            .available_capacity,
-        8
-    );
-    assert_eq!(b.cursor()?, head);
-    Ok(())
-}
-
-#[test]
-fn v18_swarm_plan_tasks_and_batch_receipts_survive_ledger_removal() -> Result<()> {
-    use board_local::automation::{create_plan, lookup_plan};
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("previous");
-    let b = Board::open(&path)?;
-    let run = b.swarm_start_with_policy(
-        "ada",
-        &SwarmStart {
-            goal: "Keep existing tasks".into(),
-            ..Default::default()
-        },
-        RunPolicy {
-            max_active: 3,
-            retry_budget: 1,
-        },
-    )?;
-    let key = format!("swarm-plan:{}:original", run.id);
-    let items = serde_json::from_value::<Vec<_>>(json!([
-        {"key":"one","text":"Original task","labels":{"swarm.plan":"original","swarm.item":"one"},"no_sync":true}
-    ]))?;
-    let tasks = create_plan(&b, "ada", &run.channel, &items, Some(&key))?;
-    let head = b.cursor()?;
-    drop(b);
-
-    let previous = rusqlite::Connection::open(&path)?;
-    previous.execute_batch(
-        "CREATE TABLE swarm_plans (run_id INTEGER NOT NULL REFERENCES swarm_runs(id),
-          key TEXT NOT NULL, actor TEXT NOT NULL, digest BLOB NOT NULL, PRIMARY KEY (run_id,key));
-          PRAGMA user_version=18;",
-    )?;
-    previous.execute(
-        "INSERT INTO swarm_plans VALUES (?,'original','ada',zeroblob(32))",
-        [run.id],
-    )?;
-    let upgraded = Board::open(&path)?;
-    assert_eq!(lookup_plan(&upgraded, "ada", &key)?, tasks);
-    assert_eq!(
-        upgraded
-            .swarm_observe("ada", &run.slug, None, 0, 1)?
-            .policy
-            .max_active,
-        3
-    );
-    assert_eq!(upgraded.cursor()?, head);
-    assert!(!previous.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='swarm_plans')",
-        [],
-        |row| row.get::<_, bool>(0)
-    )?);
-    Ok(())
-}
-
-#[test]
 fn agent_addressed_work_is_followup_for_the_operator_not_a_human_action() -> Result<()> {
     use board_local::automation::{TaskAction, TaskTarget, change_task, create_task};
     let b = board()?;
@@ -869,13 +1033,14 @@ fn agent_addressed_work_is_followup_for_the_operator_not_a_human_action() -> Res
         &b,
         "ada",
         TaskTarget::New {
-            channel: "swarms/audit",
+            channel: "project",
             text: "Repair the failing check",
             options: &Default::default(),
         },
         &[],
         Some("ada/impl"),
     )?;
+    link_work(&b, task.id)?;
     change_task(
         &b,
         task.id,
@@ -931,7 +1096,7 @@ fn agent_addressed_work_is_followup_for_the_operator_not_a_human_action() -> Res
 }
 
 #[test]
-fn ordinary_swarm_channel_posts_and_replies_record_the_same_evidence() -> Result<()> {
+fn ordinary_replies_to_a_swarm_thread_record_the_same_evidence() -> Result<()> {
     let b = board()?;
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
     let handoff_body = append_block(
@@ -940,12 +1105,8 @@ fn ordinary_swarm_channel_posts_and_replies_record_the_same_evidence() -> Result
         1,
         &json!({"revision":revision,"summary":"Ready","changes":["fields.rs"],"to":"verify"}),
     )?;
-    let h = b.post(
-        "swarms/audit",
-        "ada/impl",
-        &handoff_body,
-        &Default::default(),
-    )?;
+    let anchor = b.swarm_status("ada", "audit")?.thread_id;
+    let h = b.reply(anchor, "ada/impl", &handoff_body, &Default::default())?;
     assert_eq!(b.swarm_receipt("ada", "audit")?.handoffs.len(), 1);
     let verification = append_block(
         "",
@@ -961,7 +1122,7 @@ fn ordinary_swarm_channel_posts_and_replies_record_the_same_evidence() -> Result
         1,
         &json!({"to":"ada","summary":"Accept this revision?","handoff":h.id}),
     )?;
-    let d = b.post("swarms/audit", "ada/verify", &request, &Default::default())?;
+    let d = b.reply(anchor, "ada/verify", &request, &Default::default())?;
     assert!(
         b.attention("ada")?
             .iter()

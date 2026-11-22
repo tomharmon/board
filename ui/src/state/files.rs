@@ -1,3 +1,5 @@
+mod avif;
+
 use super::*;
 use anyhow::ensure;
 use board_local::{Attachment, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS};
@@ -14,7 +16,6 @@ pub struct AttachmentPreview {
 }
 
 pub enum Preview {
-    Clip(Clip),
     Image {
         pixels: Pixels,
         width: u32,
@@ -63,16 +64,9 @@ fn raster(bytes: &[u8], format: ImageFormat) -> Result<Preview> {
 }
 
 fn preview(file: &Attachment, bytes: &[u8]) -> Preview {
-    if let Some(format) = video::Format::detect(&file.content_type, bytes) {
-        return Clip::open(format, bytes).map_or_else(
-            |_| Preview::Other("Could not open a private video handle".into()),
-            Preview::Clip,
-        );
-    }
     if image::guess_format(bytes).ok() == Some(ImageFormat::Avif) {
         // The in-process AVIF decoder allocates a picture before ImageReader's limits apply.
-        // Decode only on explicit preview, with the same bounded local child as native video.
-        return video::avif_png(bytes)
+        return avif::png(bytes)
             .and_then(|png| raster(&png, ImageFormat::Png))
             .unwrap_or_else(|e| Preview::Other(e.to_string()));
     }
@@ -157,7 +151,11 @@ impl State {
                 .into_iter()
                 .find(|a| a.id == id && !m.deleted)
                 .context("Attachment is no longer on this message")?;
-            let content = if file.size > MAX_ATTACHMENT_BYTES as i64 {
+            let content = if file.content_type.starts_with("video/")
+                || file.content_type.starts_with("audio/")
+            {
+                Preview::Other("No inline preview for this file type".into())
+            } else if file.size > MAX_ATTACHMENT_BYTES as i64 {
                 Preview::Other("File exceeds the 4 MiB preview limit".into())
             } else {
                 let (_, bytes) = db.download_as(&self.actor, id)?;
@@ -173,11 +171,10 @@ impl State {
             Ok(p) => {
                 if matches!(
                     p.content,
-                    Preview::Clip(_)
-                        | Preview::Image {
-                            motion: Some(_),
-                            ..
-                        }
+                    Preview::Image {
+                        motion: Some(_),
+                        ..
+                    }
                 ) {
                     tx.wake_after(Duration::from_millis(30));
                 }
@@ -321,5 +318,59 @@ impl State {
             format!("Could not save {} (choose a new filename)", path.display())
         })?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rune::{Env, Runtime};
+
+    #[test]
+    fn a_video_offers_save_without_playback_and_rechecks_access_on_export() {
+        let original = include_bytes!("../../tests/fixtures/swatches.mp4");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("board.db");
+        let db = Board::open(&path).unwrap();
+        let message = db
+            .post(
+                "release",
+                "reader",
+                "Screen recording",
+                &PostOptions {
+                    files: vec![("recording.mp4".into(), original.to_vec())],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let id = message.attachments[0].id;
+        assert_eq!(message.attachments[0].content_type, "video/mp4");
+        db.set_grant(
+            "owner",
+            None,
+            "guest/view",
+            &board_local::access::Rules::parse("release=read").unwrap(),
+        )
+        .unwrap();
+        let credential = db
+            .issue_credential("owner", "guest/view", None, None)
+            .unwrap();
+        let mut viewer = Board::open(path).unwrap();
+        let actor = viewer.bind_token(&credential.token).unwrap();
+        let mut state = State::test_board(viewer, Some(&actor));
+        state.go(Page::Thread(message.id));
+        let mut ui = Runtime::new(state, crate::view::view, (820., 640.), Env::default());
+        ui.update(|s, tx| s.open_attachment(message.id, id, tx));
+        ui.frame(0.);
+        assert!(ui.find("preview-unavailable").is_some());
+        assert!(ui.find("export-preview").is_some());
+        let saved = tmp.path().join("saved.mp4");
+        ui.state.export_attachment(id, &saved).unwrap();
+        assert_eq!(std::fs::read(saved).unwrap(), original);
+        db.revoke_credential("owner", &credential.credential.id)
+            .unwrap();
+        let late = tmp.path().join("too-late.mp4");
+        assert!(ui.state.export_attachment(id, &late).is_err());
+        assert!(!late.exists());
     }
 }

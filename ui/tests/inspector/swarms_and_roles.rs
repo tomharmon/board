@@ -1,5 +1,5 @@
 use super::*;
-use board_local::swarm::{SpawnedWorker, SwarmAddWorker, SwarmRun, SwarmStart};
+use board_local::swarm::{RegisteredWorker, SwarmAddWorker, SwarmRun, SwarmStart};
 
 #[derive(Clone, Default)]
 struct Steps(Vec<Value>);
@@ -44,18 +44,20 @@ fn start(b: &Board) -> SwarmRun {
         "reader",
         &SwarmStart {
             goal: "Verify offline restores".into(),
+            channel: Some("recovery".into()),
             slug: Some("restore-audit".into()),
             ..Default::default()
         },
     )
     .unwrap()
 }
-fn add(b: &Board, run: &SwarmRun, name: &str, role: &str) -> SpawnedWorker {
-    b.swarm_add_worker(
+fn add(b: &Board, run: &SwarmRun, name: &str, role: &str) -> RegisteredWorker {
+    b.swarm_register_worker(
         "reader",
         &run.slug,
         &SwarmAddWorker {
             name: name.into(),
+            thread_id: None,
             role_slug: Some(role.into()),
             brief: format!("Own {name} checks for restore"),
             branch_name: Some(format!("test/{name}")),
@@ -76,25 +78,32 @@ fn has(t: &Tree, needle: &str) -> bool {
 }
 
 #[test]
-fn overview_shows_ordinary_workstreams_and_only_opens_history_on_demand() {
+fn overview_shows_linked_threads_and_only_opens_history_on_demand() {
     use board_local::automation::{TaskTarget, create_task};
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let run = seed(&b);
-    let mut options = board_local::PostOptions::default();
-    options
-        .labels
-        .insert("workstream".into(), "Recovery".into());
     let task = create_task(
         &b,
         "reader",
         TaskTarget::New {
             channel: &run.channel,
             text: "Check the backup",
-            options: &options,
+            options: &Default::default(),
         },
         &[],
         Some("reader/verify"),
+    )
+    .unwrap();
+    b.swarm_register_worker(
+        "reader",
+        &run.slug,
+        &SwarmAddWorker {
+            name: "audit".into(),
+            brief: "Follow the backup check".into(),
+            thread_id: Some(task.id),
+            ..Default::default()
+        },
     )
     .unwrap();
     for (width, height) in [(1200, 900), (390, 844)] {
@@ -112,10 +121,12 @@ fn overview_shows_ordinary_workstreams_and_only_opens_history_on_demand() {
             &format!("run-overview-{width}"),
         );
         tree.expect_key("swarm-overview-scroll");
+        tree.expect_key("swarm-goal-thread");
+        tree.expect_key(&format!("swarm-task-{}", run.thread_id));
+        assert!(!tree.has_key(&format!("swarm-explain-{}", run.thread_id)));
         tree.expect_key(&format!("swarm-task-{}", task.id));
         tree.expect_key(&format!("swarm-explain-step-{}", task.id));
         assert!(has(&tree, "Ready to claim"));
-        tree.expect_text("Recovery");
         assert!(has(&tree, "reader/verify"));
         assert!(!tree.has_key("swarm-feed") && !tree.has_key("swarm-receipt-scroll"));
         let bounds = tree.bounds("swarm-overview-scroll");
@@ -159,31 +170,32 @@ fn public_read_marker_survives_restart_without_consuming_worker_notifications() 
 
 #[test]
 fn suppressed_mention_is_visible_in_conversation_and_task_thread() {
-    use board_local::automation::{TaskTarget, create_task};
+    use board_local::automation::{PlanItem, create_plan_for_run};
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let run = seed(&b);
     b.swarm_set_limit("reader", &run.slug, 0).unwrap();
-    let task = create_task(
+    let (tasks, _) = create_plan_for_run(
         &b,
         "reader",
-        TaskTarget::New {
-            channel: &run.channel,
-            text: "Fix restore",
-            options: &Default::default(),
-        },
-        &[],
+        &run.channel,
+        &[PlanItem {
+            text: Some("Fix restore".into()),
+            ..Default::default()
+        }],
         None,
+        Some(&run.slug),
     )
     .unwrap();
     let post = b
         .reply(
-            task.id,
+            tasks[0].id,
             "reader/impl",
             "@verify Check my fix",
             &Default::default(),
         )
         .unwrap();
+    assert_eq!(post.suppressed, ["verify"]);
     let receipt = "Addressed @verify but not notified: run limit reached";
     let mut steps = Steps::swarm(run.id);
     steps.view(&f).expect_text(receipt);
@@ -194,35 +206,22 @@ fn suppressed_mention_is_visible_in_conversation_and_task_thread() {
 }
 
 #[test]
-fn evidence_cards_preserve_custom_schemas_from_before_v15() {
+fn evidence_cards_render_custom_schemas() {
     let f = Fixture::new();
-    let historical =
-        include_bytes!("../../../crates/board-core/tests/fixtures/swarm-v14.sqlite3.gz");
-    std::io::copy(
-        &mut flate2::read::GzDecoder::new(&historical[..]),
-        &mut File::create(&f.db).unwrap(),
-    )
-    .unwrap();
-    let old = rusqlite::Connection::open(&f.db).unwrap();
-    for (name, field) in [("verdict", "decision"), ("diff", "delta")] {
-        let definition = json!({"type":"object", "required":[field]});
-        old.execute(
-            "INSERT INTO schemas(name,version,description,definition) VALUES(?1,1,'Custom schema',?2)",
-            (name, definition.to_string()),
-        )
-        .unwrap();
-        old.execute(
-            "INSERT INTO schema_origins(name,version,builtin,actor) VALUES(?,1,0,'reader')",
-            [name],
+    let b = Board::open(&f.db).unwrap();
+    for (name, field) in [("custom-verdict", "decision"), ("custom-diff", "delta")] {
+        b.register_schema(
+            name,
+            1,
+            "Custom schema",
+            &json!({"type":"object", "required":[field]}),
         )
         .unwrap();
     }
-    drop(old);
-    let b = Board::open(&f.db).unwrap();
     let run = start(&b);
     let content = concat!(
-        "```json#verdict@1\n{\"decision\":\"Awaiting approval\"}\n```\n\n",
-        "```json#diff@1\n{\"delta\":\"Four records\",\"patch\":\"revision 3\"}\n```"
+        "```json#custom-verdict@1\n{\"decision\":\"Awaiting approval\"}\n```\n\n",
+        "```json#custom-diff@1\n{\"delta\":\"Four records\",\"patch\":\"revision 3\"}\n```"
     );
     b.swarm_post("reader", &run.slug, content, &Default::default())
         .unwrap();
@@ -238,14 +237,8 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let run = seed(&b);
-    b.swarm_set_worker_status(
-        "reader/verify",
-        &run.slug,
-        "verify",
-        "waiting",
-        Some(std::process::id()),
-    )
-    .unwrap();
+    b.swarm_check_in("reader/verify", &run.slug, None, None, None)
+        .unwrap();
     let content = concat!(
         "@verify ready\n\n",
         "```json#verdict@1\n{\"status\":\"pass\",\"artifact\":\"cycle-2\",\"summary\":\"Restore verified\",\"checks\":[{\"name\":\"Cold run\",\"status\":\"pass\",\"command\":\"cargo test restore\",\"output\":\"one test passed\"}]}\n```\n\n",
@@ -285,7 +278,7 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
             "Own impl checks for restore",
             "Branch: test/impl",
             "registered",
-            "waiting",
+            "working",
             "implementer",
             "verifier",
             "Brief for ",
@@ -337,12 +330,12 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
         after
             .workers
             .iter()
-            .map(|w| (&w.updated_at, w.waiter_pid))
+            .map(|w| (&w.updated_at, &w.status))
             .collect::<Vec<_>>(),
         before
             .workers
             .iter()
-            .map(|w| (&w.updated_at, w.waiter_pid))
+            .map(|w| (&w.updated_at, &w.status))
             .collect::<Vec<_>>()
     );
 }
@@ -405,24 +398,19 @@ fn open_observer_sees_an_external_peer_exchange_and_hides_unrelated_dms_from_a_s
     let live = f.at_mark(&mut cmd, "observer", || {
         b.swarm_dm("reader", &run.slug, "verify", "Restricted exchange")
             .unwrap();
-        b.swarm_set_worker_status(
-            "reader/impl",
-            &run.slug,
-            "impl",
-            "waiting",
-            Some(std::process::id()),
-        )
-        .unwrap();
+        b.swarm_check_in("reader/impl", &run.slug, None, None, None)
+            .unwrap();
     });
     live.expect_text("Restricted exchange");
-    live.expect_text("waiting");
+    live.expect_text("Last recorded: working");
+    assert!(!has(&live, "Offline waiter"));
     let actor = "reader/impl";
     let grant = b
         .set_grant(
             "reader",
             None,
             actor,
-            &board_local::access::Rules::parse("swarms/restore-audit=read,post").unwrap(),
+            &board_local::access::Rules::parse("recovery=read,post").unwrap(),
         )
         .unwrap();
     let token = b
@@ -502,7 +490,11 @@ fn role_prompt_restore_skill_import_attachment_and_guarded_library_delete_use_sq
     assert_eq!(changed.system_prompt, "Pinned backup procedure");
     assert!(changed.version > builtin.version);
     let pinned = add(&b, &run, "impl", "implementer");
-    assert!(pinned.assembled_prompt.contains("Pinned backup procedure"));
+    let binding = b.worker_binding(&pinned.selector).unwrap();
+    assert_eq!(
+        b.worker_assignment(&binding).unwrap().role_prompt,
+        "Pinned backup procedure"
+    );
     let mut reset = roles.clone();
     reset.tap("role-reset");
     reset.view(&f).expect_key("role-confirmation");
@@ -601,37 +593,6 @@ fn worker_filters_search_older_history_and_compact_roster_returns_to_activity() 
     t.expect_key("swarm-clear-worker");
 }
 
-#[cfg(unix)]
-#[test]
-fn a_stale_waiter_is_marked_offline_without_writing_agent_status_or_advancing_the_log() {
-    let f = Fixture::new();
-    let b = Board::open(&f.db).unwrap();
-    let run = seed(&b);
-    let pid = i32::MAX as u32;
-    b.swarm_set_worker_status("reader/verify", &run.slug, "verify", "waiting", Some(pid))
-        .unwrap();
-    let cursor = b.cursor().unwrap();
-    let s = Steps::swarm(run.id);
-    let out = f
-        .command(json!(s.0), DESKTOP, "6.7")
-        .arg("--realtime")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    f.tree().expect_text("Offline waiter");
-    assert_eq!(b.cursor().unwrap(), cursor);
-    let run = b.swarm_status("reader", &run.slug).unwrap();
-    assert!(
-        run.workers
-            .iter()
-            .any(|w| w.name == "verify" && w.status == "waiting" && w.waiter_pid == Some(pid))
-    );
-}
-
 #[test]
 fn custom_role_changes_reject_a_stale_editor_and_confirm_destructive_actions() {
     let f = Fixture::new();
@@ -652,15 +613,16 @@ fn custom_role_changes_reject_a_stale_editor_and_confirm_destructive_actions() {
     update.0.last_mut().unwrap()["t"] = json!(2.8);
     let mut cmd = f.command(json!(update.0), DESKTOP, "3.2");
     let tree = f.at_mark(&mut cmd, "editing", || {
-        b.role_edit(
-            &saved.slug,
-            &saved.slug,
-            &saved.name,
-            "",
-            "External edit",
-            Some(saved.version),
-        )
-        .unwrap();
+        b.role_library_as("reader")
+            .role_edit(
+                &saved.slug,
+                &saved.slug,
+                &saved.name,
+                "",
+                "External edit",
+                Some(saved.version),
+            )
+            .unwrap();
     });
     assert!(has(&tree, "Role changed outside this editor"));
     tree.expect_key("role-reload");

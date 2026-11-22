@@ -26,6 +26,7 @@ pub use queue::{
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum Provider {
     Local,
     Github,
@@ -90,6 +91,7 @@ pub struct SourceSettings {
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum GithubItems {
     #[default]
     All,
@@ -115,6 +117,7 @@ impl std::str::FromStr for GithubItems {
 /// Omitted fields retain their values, including under concurrent updates.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct SourcePatch {
     pub outbound: Option<bool>,
     pub mirror_roots: Option<bool>,
@@ -125,6 +128,7 @@ pub struct SourcePatch {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Import {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<crate::links::Link>,
@@ -147,6 +151,7 @@ pub struct Import {
 }
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct AuthorInfo {
     pub name: String,
     #[serde(default)]
@@ -155,6 +160,7 @@ pub struct AuthorInfo {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum Change {
     /// A recognized provider event that has no Board effect; retain its deduplication receipt.
     Ignore,
@@ -250,17 +256,13 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
     CREATE TABLE IF NOT EXISTS sync_settings(source TEXT PRIMARY KEY REFERENCES sync_sources(name),value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sync_import_context(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS sync_rendered(source TEXT NOT NULL,thread TEXT NOT NULL,message INTEGER NOT NULL,text TEXT NOT NULL,PRIMARY KEY(source,thread,message));
-    CREATE TABLE IF NOT EXISTS sync_responses(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,item INTEGER NOT NULL REFERENCES sync_queue(id),PRIMARY KEY(source,thread,external));
     CREATE TABLE IF NOT EXISTS sync_media_fetch(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,file TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,error TEXT,PRIMARY KEY(source,thread,external,file));
     CREATE TABLE IF NOT EXISTS sync_file_notes(source TEXT NOT NULL,thread TEXT NOT NULL,message INTEGER NOT NULL,asset INTEGER NOT NULL,PRIMARY KEY(source,thread,message,asset));
     CREATE TABLE IF NOT EXISTS sync_file_metadata(source TEXT NOT NULL,thread TEXT NOT NULL,external TEXT NOT NULL,file TEXT NOT NULL,message INTEGER NOT NULL,name TEXT NOT NULL,size INTEGER,PRIMARY KEY(source,thread,external,file));
     CREATE INDEX IF NOT EXISTS sync_file_metadata_message ON sync_file_metadata(message);
     CREATE TABLE IF NOT EXISTS message_links(message INTEGER NOT NULL REFERENCES messages(id),ordinal INTEGER NOT NULL,url TEXT NOT NULL,target INTEGER REFERENCES messages(id),author TEXT,text TEXT,reason TEXT,PRIMARY KEY(message,url));
     ")?;
-    targets::migrate_joins(c)?;
     c.execute_batch("
-    DROP TRIGGER IF EXISTS sync_outgoing;
-    DROP TRIGGER IF EXISTS sync_outgoing_reactions;
     CREATE TRIGGER sync_outgoing AFTER UPDATE OF message ON events
       WHEN NEW.message IS NOT NULL AND NEW.kind IN ('message.posted','message.edited','message.deleted')
        AND NOT EXISTS(SELECT 1 FROM private_messages WHERE id IN (NEW.message_id,json_extract(NEW.message,'$.re')))

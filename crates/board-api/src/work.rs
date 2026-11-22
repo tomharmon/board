@@ -2,58 +2,42 @@
 use super::messages::{FileInput, decode_files};
 use super::{ApiError, ApiResult, App, created, idempotency};
 use axum::{
-    Json, Router,
+    Json,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post, put},
 };
 use board_local::{
     PostOptions,
-    automation::{self as work, ClaimTarget, Task, TaskAction, TaskTarget},
+    automation::{self as work, Task, TaskAction, TaskTarget},
 };
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-
-type Labels = BTreeMap<String, String>;
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouterExt};
 type Data = ApiResult<Json<Value>>;
 
-pub(super) fn routes() -> Router<App> {
-    Router::new()
-        .route(
-            "/tasks",
-            get(tasks)
-                .post(create_task)
-                .layer(DefaultBodyLimit::max(56 * 1024 * 1024)),
+pub(super) fn routes() -> OpenApiRouter<App> {
+    OpenApiRouter::new()
+        .routes(
+            utoipa_axum::routes!(tasks, create_task).layer(DefaultBodyLimit::max(56 * 1024 * 1024)),
         )
-        .route("/tasks/{id}", get(task).patch(update_task))
-        .route("/tasks/{id}/assignment", put(assignment))
-        .route("/tasks/{id}/dependencies", put(dependencies))
-        .route(
-            "/tasks/{id}/claim",
-            get(get_claim).post(claim).patch(renew).delete(release),
-        )
-        .route("/task-claims", post(queue_claim))
-        .route("/task-claims/recover", post(recover))
-        .route("/task-batches", post(create_batch).get(batch_query))
-        .route("/task-batches/{key}", get(batch))
-        .route(
-            "/watchers",
-            get(watchers).post(watcher).put(replace_watchers),
-        )
-        .route("/watcher-matches", post(matches))
-        .route("/watchers/{name}", get(get_watcher).delete(remove_watcher))
-        .route("/watchers/{name}/next", get(peek))
-        .route("/watchers/{name}/deliveries", post(deliver))
-        .route(
-            "/watchers/{name}/deliveries/{cursor}",
-            axum::routing::patch(renew_delivery),
-        )
-        .route("/watchers/{name}/failures", get(failures))
-        .route("/watchers/{name}/acknowledgements/{cursor}", put(ack))
+        .routes(utoipa_axum::routes!(task, update_task))
+        .routes(utoipa_axum::routes!(assignment))
+        .routes(utoipa_axum::routes!(dependencies))
+        .routes(utoipa_axum::routes!(get_claim, claim, renew, release))
+        .routes(utoipa_axum::routes!(recover))
+        .routes(utoipa_axum::routes!(create_batch, batch_query))
+        .routes(utoipa_axum::routes!(batch))
+        .routes(utoipa_axum::routes!(watchers, watcher, replace_watchers))
+        .routes(utoipa_axum::routes!(matches))
+        .routes(utoipa_axum::routes!(get_watcher, remove_watcher))
+        .routes(utoipa_axum::routes!(peek))
+        .routes(utoipa_axum::routes!(deliver))
+        .routes(utoipa_axum::routes!(renew_delivery))
+        .routes(utoipa_axum::routes!(failures))
+        .routes(utoipa_axum::routes!(ack))
 }
 
 fn invalid(msg: &'static str) -> ApiError {
@@ -85,14 +69,13 @@ fn continuation<T, K>(rows: &mut Vec<T>, n: usize, key: impl FnOnce(&T) -> K) ->
     rows.last().map(key)
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
 struct TaskPage {
     latest: bool,
     channel: Option<String>,
     state: Option<String>,
     needs: Option<i64>,
-    label: Option<String>,
     by: Option<String>,
     owner: Option<String>,
     #[serde(rename = "for")]
@@ -100,6 +83,7 @@ struct TaskPage {
     after: Option<i64>,
     limit: Option<usize>,
 }
+#[utoipa::path(get, path = "/tasks", params(TaskPage), tag = "tasks")]
 async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
     if q.latest && q.after.is_some() {
         return Err(ApiError::new(
@@ -110,8 +94,6 @@ async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
     let (after, limit) = (after(q.after)?, limit(q.limit)?);
     let (cursor, mut rows) = app
         .call(move |b, actor| {
-            let label_terms =
-                board_local::LabelTerm::parse(&q.label.into_iter().collect::<Vec<_>>())?;
             work::filtered_tasks_page_as(
                 b,
                 Some(actor),
@@ -120,8 +102,6 @@ async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
                     channel: q.channel,
                     state: q.state,
                     needs: q.needs,
-                    labels: Labels::default(),
-                    label_terms,
                     by: q.by,
                     owner: q.owner,
                     assignee: q.assignee,
@@ -136,18 +116,22 @@ async fn tasks(State(app): State<App>, Query(q): Query<TaskPage>) -> Data {
         json!({"cursor":cursor,"next_after":next,"tasks":rows}),
     ))
 }
+#[utoipa::path(get, path="/tasks/{id}", params(("id" = i64, Path)), tag="tasks")]
 async fn task(State(app): State<App>, Path(id): Path<i64>) -> Data {
     Ok(Json(json!(
         app.call(move |b, _| work::get_task(b, id)).await?
     )))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct BatchInput {
     channel: String,
+    run: Option<String>,
+    #[schema(min_items = 1, max_items = 100)]
     tasks: Vec<work::PlanItem>,
 }
+#[utoipa::path(post, path = "/task-batches", tag = "task-batches")]
 async fn create_batch(
     State(app): State<App>,
     headers: HeaderMap,
@@ -164,7 +148,14 @@ async fn create_batch(
     let picked = key.clone();
     let (tasks, made) = app
         .call(move |db, actor| {
-            work::create_plan_with_outcome(db, actor, &b.channel, &b.tasks, Some(&picked))
+            work::create_plan_for_run(
+                db,
+                actor,
+                &b.channel,
+                &b.tasks,
+                Some(&picked),
+                b.run.as_deref(),
+            )
         })
         .await?;
     let mut resp = created(location, json!({"key":key,"tasks":tasks}));
@@ -173,14 +164,16 @@ async fn create_batch(
     }
     Ok(resp)
 }
+#[utoipa::path(get, path="/task-batches/{key}", params(("key" = String, Path)), tag="task-batches")]
 async fn batch(State(app): State<App>, Path(key): Path<String>) -> Data {
     lookup_batch(app, key).await
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 struct BatchKey {
     key: String,
 }
+#[utoipa::path(get, path = "/task-batches", params(BatchKey), tag = "task-batches")]
 async fn batch_query(State(app): State<App>, Query(q): Query<BatchKey>) -> Data {
     lookup_batch(app, q.key).await
 }
@@ -190,28 +183,30 @@ async fn lookup_batch(app: App, key: String) -> Data {
         json!({"key":key,"tasks":app.call(move|db,actor|work::lookup_plan(db,actor,&lookup)).await?}),
     ))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct NewTask {
     #[serde(default)]
     no_sync: bool,
     channel: Option<String>,
     text: Option<String>,
+    #[schema(minimum = 1)]
     thread_id: Option<i64>,
     assignee: Option<String>,
     #[serde(default)]
-    labels: Labels,
-    #[serde(default)]
     needs: Vec<i64>,
     #[serde(default)]
+    #[schema(max_items = 10)]
     attachments: Vec<FileInput>,
     #[serde(default)]
+    #[schema(max_items = 10)]
     attachment_ids: Vec<i64>,
     #[serde(default)]
     claim: bool,
     lease_seconds: Option<i64>,
     token: Option<String>,
 }
+#[utoipa::path(post, path = "/tasks", tag = "tasks")]
 async fn create_task(
     State(app): State<App>,
     headers: HeaderMap,
@@ -223,7 +218,6 @@ async fn create_task(
             let opts = PostOptions {
                 no_sync:body.no_sync,
                 key,
-                labels: body.labels,
                 files: decode_files(body.attachments)?,
                 attachment_ids:body.attachment_ids,
                 ..Default::default()
@@ -233,7 +227,7 @@ async fn create_task(
                 body.channel.as_deref(),
                 body.text.as_deref(),
             ) {
-                (Some(id), None, None) if !opts.no_sync && opts.key.is_none() && opts.labels.is_empty() && opts.files.is_empty() && opts.attachment_ids.is_empty() => {
+                (Some(id), None, None) if !opts.no_sync && opts.key.is_none() && opts.files.is_empty() && opts.attachment_ids.is_empty() => {
                     TaskTarget::Existing(id)
                 }
                 (None, Some(channel), text) => TaskTarget::New {
@@ -257,7 +251,7 @@ async fn create_task(
     Ok(response)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(tag = "state", rename_all = "lowercase", deny_unknown_fields)]
 enum StateChange {
     Completed {
@@ -281,6 +275,7 @@ enum StateChange {
     },
     Ready {},
 }
+#[utoipa::path(patch, path="/tasks/{id}", params(("id" = i64, Path)), tag="tasks")]
 async fn update_task(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -324,13 +319,14 @@ async fn update_task(
     Ok(Json(json!(t)))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Assignment {
-    // Explicit null selects the pool; a missing field is not an assignment.
+    // Explicit null clears the assignee; a missing field is not an assignment.
     #[serde(deserialize_with = "Deserialize::deserialize")]
     assignee: Option<String>,
 }
+#[utoipa::path(put, path="/tasks/{id}/assignment", params(("id" = i64, Path)), tag="tasks")]
 async fn assignment(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -349,11 +345,12 @@ async fn assignment(
         .await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Needs {
     needs: Vec<i64>,
 }
+#[utoipa::path(put, path="/tasks/{id}/dependencies", params(("id" = i64, Path)), tag="tasks")]
 async fn dependencies(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -372,23 +369,24 @@ async fn dependencies(
     )))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Lease {
     lease_seconds: Option<i64>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct TaskLease {
+struct TaskClaim {
     lease_seconds: Option<i64>,
     token: Option<String>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct Proof {
+struct RecoverClaim {
     token: String,
 }
-async fn recover(State(app): State<App>, Json(body): Json<Proof>) -> Data {
+#[utoipa::path(post, path = "/task-claims/recover", tag = "task-claims")]
+async fn recover(State(app): State<App>, Json(body): Json<RecoverClaim>) -> Data {
     Ok(Json(json!(
         app.call(move |b, a| work::recover_claim(b, a, &body.token))
             .await?
@@ -432,31 +430,32 @@ fn claimed((t, created_new): (Task, bool)) -> ApiResult<Response> {
     resp.headers_mut().insert(header::ETAG, tag);
     Ok(resp)
 }
+#[utoipa::path(post, path="/tasks/{id}/claim", params(("id" = i64, Path)), tag="tasks")]
 async fn claim(
     State(app): State<App>,
     Path(id): Path<i64>,
-    Json(body): Json<TaskLease>,
+    Json(body): Json<TaskClaim>,
 ) -> ApiResult<Response> {
     claimed(
         app.call(move |b, a| {
             let token = body
                 .token
                 .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-            work::claim_with_outcome(
+            work::claim_in_assignment(
                 b,
                 a,
-                ClaimTarget::Id(id),
+                id,
                 work::ClaimRequest {
                     lease_seconds: body.lease_seconds.unwrap_or(900),
                     token: &token,
                 },
-                &Labels::new(),
-                &[],
+                None,
             )
         })
         .await?,
     )
 }
+#[utoipa::path(get, path="/tasks/{id}/claim", params(("id" = i64, Path)), tag="tasks")]
 async fn get_claim(State(app): State<App>, Path(id): Path<i64>) -> Data {
     let t = app.call(move |b, _| work::get_task(b, id)).await?;
     if t.state != "claimed" {
@@ -466,87 +465,14 @@ async fn get_claim(State(app): State<App>, Path(id): Path<i64>) -> Data {
         json!({"id":id,"epoch":t.epoch,"holder":t.holder,"lease_until":t.lease_until}),
     ))
 }
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct QueueClaim {
-    channel: String,
-    lease_seconds: Option<i64>,
-    wait_seconds: Option<u64>,
-    token: Option<String>,
-    #[serde(default)]
-    labels: Labels,
-    #[serde(default)]
-    owners: Vec<String>,
-}
-async fn queue_claim(State(app): State<App>, Json(body): Json<QueueClaim>) -> ApiResult<Response> {
-    use std::{
-        sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        },
-        time::{Duration, Instant},
-    };
-    struct Waiting(Arc<AtomicBool>);
-    impl Drop for Waiting {
-        fn drop(&mut self) {
-            self.0.store(false, Ordering::Release);
-        }
-    }
-    let wait = body.wait_seconds.unwrap_or(0);
-    if wait > 300 {
-        return Err(invalid("wait_seconds must be 0..300"));
-    }
-    let until = Instant::now() + Duration::from_secs(wait);
-    let waiting = Waiting(Arc::new(AtomicBool::new(true)));
-    let token = body
-        .token
-        .clone()
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let body = Arc::new(body);
-    loop {
-        let (body, live, token) = (Arc::clone(&body), Arc::clone(&waiting.0), token.clone());
-        let t = app
-            .call(move |b, a| {
-                if !live.load(Ordering::Acquire) {
-                    return Ok(None);
-                }
-                match work::claim_while(
-                    b,
-                    a,
-                    ClaimTarget::Ready(&body.channel),
-                    work::ClaimRequest {
-                        lease_seconds: body.lease_seconds.unwrap_or(900),
-                        token: &token,
-                    },
-                    &body.labels,
-                    &body.owners,
-                    || live.load(Ordering::Acquire),
-                ) {
-                    Ok(t) => Ok(Some(t)),
-                    Err(e) if e.is::<work::NothingReady>() => Ok(None),
-                    Err(e) => Err(e),
-                }
-            })
-            .await?;
-        if let Some(t) = t {
-            return claimed(t);
-        }
-        if Instant::now() >= until {
-            return Ok(StatusCode::NO_CONTENT.into_response());
-        }
-        tokio::time::sleep(
-            Duration::from_millis(100).min(until.saturating_duration_since(Instant::now())),
-        )
-        .await;
-    }
-}
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Renew {
     epoch: i64,
     token: String,
     lease_seconds: Option<i64>,
 }
+#[utoipa::path(patch, path="/tasks/{id}/claim", params(("id" = i64, Path)), tag="tasks")]
 async fn renew(State(app): State<App>, Path(id): Path<i64>, Json(body): Json<Renew>) -> Data {
     Ok(Json(json!(
         app.call(move |b, a| work::change_task(
@@ -560,6 +486,7 @@ async fn renew(State(app): State<App>, Path(id): Path<i64>, Json(body): Json<Ren
         .await?
     )))
 }
+#[utoipa::path(delete, path="/tasks/{id}/claim", params(("id" = i64, Path)), tag="tasks")]
 async fn release(
     State(app): State<App>,
     Path(id): Path<i64>,
@@ -584,12 +511,13 @@ async fn release(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
 struct WatchPage {
     after: String,
     limit: Option<usize>,
 }
+#[utoipa::path(get, path = "/watchers", params(WatchPage), tag = "watchers")]
 async fn watchers(State(app): State<App>, Query(q): Query<WatchPage>) -> Data {
     let n = limit(q.limit)?;
     let (cursor, mut rows) = app
@@ -600,23 +528,26 @@ async fn watchers(State(app): State<App>, Query(q): Query<WatchPage>) -> Data {
         json!({"cursor":cursor,"next_after":next,"watchers":rows}),
     ))
 }
+#[utoipa::path(get, path="/watchers/{name}", params(("name" = String, Path)), tag="watchers")]
 async fn get_watcher(State(app): State<App>, Path(name): Path<String>) -> Data {
     Ok(Json(json!(
         app.call(move |b, _| work::get_watcher(b, &name)).await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct WatchSet {
     watchers: Vec<work::WatchSpec>,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct PullSet {
     limit: Option<usize>,
     lease_seconds: Option<i64>,
+    #[schema(maximum = 60)]
     wait_seconds: Option<u64>,
 }
+#[utoipa::path(post, path = "/watcher-matches", tag = "watcher-matches")]
 async fn matches(State(app): State<App>, Json(body): Json<PullSet>) -> Data {
     use std::time::{Duration, Instant};
     let wait = body.wait_seconds.unwrap_or(0);
@@ -639,22 +570,26 @@ async fn matches(State(app): State<App>, Json(body): Json<PullSet>) -> Data {
         .await;
     }
 }
+#[utoipa::path(put, path = "/watchers", tag = "watchers")]
 async fn replace_watchers(State(app): State<App>, Json(body): Json<WatchSet>) -> Data {
     Ok(Json(
         json!({"watchers":app.call(move|b,a|work::replace_watchers(b,a,&body.watchers)).await?}),
     ))
 }
+#[utoipa::path(post, path = "/watchers", tag = "watchers")]
 async fn watcher(State(app): State<App>, Json(body): Json<work::WatchSpec>) -> ApiResult<Response> {
     let w = app
         .call(move |b, a| work::add_watcher_spec(b, a, body))
         .await?;
     Ok(created(format!("/v1/watchers/{}", w.name), json!(w)))
 }
+#[utoipa::path(delete, path="/watchers/{name}", params(("name" = String, Path)), tag="watchers")]
 async fn remove_watcher(State(app): State<App>, Path(name): Path<String>) -> ApiResult<StatusCode> {
     app.call(move |b, a| work::remove_watcher_as(b, a, &name))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(get, path="/watchers/{name}/next", params(("name" = String, Path)), tag="watchers")]
 async fn peek(State(app): State<App>, Path(name): Path<String>) -> ApiResult<Response> {
     Ok(
         match app.call(move |b, _| work::next_event(b, &name)).await? {
@@ -663,6 +598,7 @@ async fn peek(State(app): State<App>, Path(name): Path<String>) -> ApiResult<Res
         },
     )
 }
+#[utoipa::path(post, path="/watchers/{name}/deliveries", params(("name" = String, Path)), tag="watchers")]
 async fn deliver(
     State(app): State<App>,
     Path(name): Path<String>,
@@ -679,21 +615,23 @@ async fn deliver(
     response.headers_mut().insert(header::ETAG, tag);
     Ok(response)
 }
+#[derive(Default, Deserialize, utoipa::ToSchema)]
+#[serde(default, deny_unknown_fields)]
+struct WatcherAck {
+    skip: bool,
+    error: Option<String>,
+    #[schema(default = false)]
+    if_pending: bool,
+}
+#[utoipa::path(put, path="/watchers/{name}/acknowledgements/{cursor}", request_body=Option<WatcherAck>, operation_id="work_ack", params(("name" = String, Path), ("cursor" = i64, Path),("If-Match"=Option<String>,Header,description="Quoted ETag for a leased delivery")), responses((status=204,description="Settled or replayed"),(status=412,description="Stale or conflicting receipt",body=crate::Problem,content_type="application/problem+json"),(status=428,description="Missing If-Match for if_pending",body=crate::Problem,content_type="application/problem+json")), tag="watchers")]
 async fn ack(
     State(app): State<App>,
     Path((name, cursor)): Path<(String, i64)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> ApiResult<StatusCode> {
-    #[derive(Default, Deserialize)]
-    #[serde(default, deny_unknown_fields)]
-    struct Ack {
-        skip: bool,
-        error: Option<String>,
-        if_pending: bool,
-    }
     let input = if body.is_empty() {
-        Ack::default()
+        WatcherAck::default()
     } else {
         let is_json = headers
             .get(header::CONTENT_TYPE)
@@ -746,6 +684,7 @@ async fn ack(
     })?;
     Ok(StatusCode::NO_CONTENT)
 }
+#[utoipa::path(patch, path="/watchers/{name}/deliveries/{cursor}", params(("name" = String, Path), ("cursor" = i64, Path)), tag="watchers")]
 async fn renew_delivery(
     State(app): State<App>,
     Path((name, cursor)): Path<(String, i64)>,
@@ -769,12 +708,13 @@ async fn renew_delivery(
     Ok(Json(json!({"lease_until":until})))
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, utoipa::IntoParams)]
 #[serde(default, deny_unknown_fields)]
 struct FailurePage {
     after: Option<i64>,
     limit: Option<usize>,
 }
+#[utoipa::path(get, path="/watchers/{name}/failures", params(("name" = String, Path), FailurePage), tag="watchers")]
 async fn failures(
     State(app): State<App>,
     Path(name): Path<String>,

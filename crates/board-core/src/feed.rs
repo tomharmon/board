@@ -16,6 +16,7 @@ fn normal(event: &Event) -> bool {
             "actor.updated"
                 | "actor.seen"
                 | "source.receipt"
+                | "source.metadata"
                 | "message.synced"
                 | "message.files_synced"
                 | "task.renewed"
@@ -23,9 +24,24 @@ fn normal(event: &Event) -> bool {
 }
 
 pub(crate) fn allowed(c: &Connection, a: &Access, mut event: Event) -> Result<Option<Event>> {
-    // Direct messages belong exclusively to the actor-scoped swarm feed.
+    // Private swarm messages and historical label changes are not board activity.
     if event.kind == "swarm.dm" {
         return Ok(None);
+    }
+    // A notification can be attached to a work thread in another channel. Its
+    // bookkeeping belongs to the swarm, even when the board post itself is public.
+    if event.kind.starts_with("swarm.")
+        && !a.everywhere(Action::Read)
+        && let Some(slug) = event.payload.get("run").and_then(|v| v.as_str())
+    {
+        let channel: Option<String> = c
+            .query_row("SELECT channel FROM swarm_runs WHERE slug=?", [slug], |r| {
+                r.get(0)
+            })
+            .optional()?;
+        if !channel.is_some_and(|ch| a.allows(Action::Read, &ch)) {
+            return Ok(None);
+        }
     }
     let source_control = event.kind.starts_with("source.")
         || matches!(
@@ -70,7 +86,6 @@ pub(crate) fn allowed(c: &Connection, a: &Access, mut event: Event) -> Result<Op
                 "rule.",
                 "credential.",
                 "watcher.",
-                "schedule.",
                 "upload.",
                 "attachment.",
             ]
@@ -241,14 +256,6 @@ fn current_event(
             "source.receipt" | "message.synced" | "message.files_synced" if current.deleted => {
                 return Ok(None);
             }
-            "labels.changed" => {
-                if let Some(set) = event.payload.get_mut("set").and_then(|s| s.as_object_mut()) {
-                    set.retain(|k, v| {
-                        v.as_str()
-                            .is_some_and(|s| current.labels.get(k).is_some_and(|v| v == s))
-                    });
-                }
-            }
             "reaction.added" | "reaction.removed"
                 if !event
                     .payload
@@ -304,7 +311,7 @@ impl Board {
         let mut count = 0;
         if a.is_trusted() {
             let count = tx.query_row(
-                "SELECT count(*) FROM events WHERE cursor>? AND actor<>?",
+                "SELECT count(*) FROM events WHERE cursor>? AND actor<>? AND kind!='swarm.dm'",
                 rusqlite::params![after, actor],
                 |r| r.get(0),
             )?;

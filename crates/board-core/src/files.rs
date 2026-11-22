@@ -23,11 +23,6 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
       CREATE TABLE IF NOT EXISTS message_files(message_id INTEGER NOT NULL REFERENCES messages(id),position INTEGER NOT NULL,
         asset INTEGER NOT NULL REFERENCES file_assets(id),PRIMARY KEY(message_id,position));
       CREATE INDEX IF NOT EXISTS file_placements ON message_files(asset,message_id);
-      INSERT OR IGNORE INTO file_assets(id,key,actor,origin,name,content_type,size,bytes)
-        SELECT a.id,lower(hex(randomblob(16))),m.actor,m.channel,a.name,'application/octet-stream',a.size,a.bytes
-        FROM attachments a JOIN messages m ON m.id=a.message_id;
-      INSERT OR IGNORE INTO message_files SELECT message_id,row_number() OVER (PARTITION BY message_id ORDER BY id)-1,id FROM attachments;
-      DELETE FROM attachments;
       CREATE TABLE IF NOT EXISTS pending_uploads(key TEXT PRIMARY KEY,actor TEXT NOT NULL,channel TEXT NOT NULL,name TEXT NOT NULL,
         content_type TEXT NOT NULL,size INTEGER NOT NULL,received INTEGER NOT NULL DEFAULT 0,sha256 TEXT,expires INTEGER NOT NULL,asset INTEGER REFERENCES file_assets(id));
       CREATE TABLE IF NOT EXISTS upload_parts(key TEXT NOT NULL REFERENCES pending_uploads(key) ON DELETE CASCADE,offset INTEGER NOT NULL,bytes BLOB NOT NULL,PRIMARY KEY(key,offset));")?;

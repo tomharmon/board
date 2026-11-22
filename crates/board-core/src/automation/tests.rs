@@ -1,7 +1,6 @@
 use super::*;
 use crate::{Board, Filter, PostOptions};
 use anyhow::Result;
-use std::collections::BTreeMap;
 
 fn create(board: &Board, needs: &[i64]) -> Result<Task> {
     create_task(
@@ -42,7 +41,7 @@ fn atomic_plan_with_forward_edges_replays_and_refuses_cycles() -> Result<()> {
         create_plan(&b, "ann", "work", &items, Some("release"))?[0].id,
         tasks[0].id
     );
-    items[1].needs.push(Prerequisite::Name("ship".into()));
+    items[1].needs.push(Prerequisite::Key("ship".into()));
     assert!(create_plan(&b, "ann", "work", &items, Some("release")).is_err());
     assert!(create_plan(&b, "ann", "work", &items, None).is_err());
     assert_eq!(head, b.cursor()?);
@@ -66,14 +65,8 @@ fn dependencies_leases_and_stale_epochs() -> Result<()> {
         )
         .is_err()
     );
-    let c = claim(
-        &b,
-        "ann/fix",
-        ClaimTarget::Ready("work"),
-        60,
-        &BTreeMap::new(),
-    )?;
-    assert!(claim(&b, "ann/other", ClaimTarget::Id(c.id), 60, &BTreeMap::new()).is_err());
+    let c = claim(&b, "ann/fix", first.id, 60)?;
+    assert!(claim(&b, "ann/other", c.id, 60).is_err());
     assert!(
         change_task(
             &b,
@@ -98,7 +91,7 @@ fn dependencies_leases_and_stale_epochs() -> Result<()> {
         "expired"
     );
     assert_eq!(head, b.cursor()?);
-    let c2 = claim(&b, "ann/fix", ClaimTarget::Id(c.id), 60, &BTreeMap::new())?;
+    let c2 = claim(&b, "ann/fix", c.id, 60)?;
     assert!(
         change_task(
             &b,
@@ -118,15 +111,9 @@ fn dependencies_leases_and_stale_epochs() -> Result<()> {
         c2.claim_token.as_deref(),
         TaskAction::Complete(Some("done")),
     )?;
-    assert_eq!(b.get(second.id)?.labels["board.task"], "ready");
+    assert_eq!(b.get(second.id)?.task.unwrap().state, "ready");
     assert_eq!(list_tasks(&b, None, None)?.len(), 1);
-    let granted = claim(
-        &b,
-        "ann/fix",
-        ClaimTarget::Id(second.id),
-        60,
-        &BTreeMap::new(),
-    )?;
+    let granted = claim(&b, "ann/fix", second.id, 60)?;
     let proof = granted.claim_token.as_deref().unwrap();
     assert_eq!(recover_claim(&b, "ann/fix", proof)?.inputs, granted.inputs);
     let renewed = change_task(
@@ -155,7 +142,7 @@ fn concurrent_claims_have_one_winner() -> Result<()> {
             let gate = gate.clone();
             std::thread::spawn(move || {
                 gate.wait();
-                claim(&b, actor, ClaimTarget::Id(id), 60, &BTreeMap::new()).is_ok()
+                claim(&b, actor, id, 60).is_ok()
             })
         })
         .collect();

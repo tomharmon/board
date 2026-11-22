@@ -30,8 +30,6 @@ mod source_settings;
 mod swarms_and_roles;
 #[path = "inspector/task_conversation.rs"]
 mod task_conversation;
-#[path = "inspector/video.rs"]
-mod video;
 #[path = "inspector/work_views.rs"]
 mod work_views;
 #[path = "inspector/zoom.rs"]
@@ -39,8 +37,9 @@ mod zoom;
 
 // Each shipped binary creates a whole graphics device, including a software
 // renderer's thread pool on CPU-only builders. Bound those devices independently
-// of libtest's CPU-based thread count.
-static RENDERERS: (Mutex<u8>, Condvar) = (Mutex::new(3), Condvar::new());
+// of libtest's CPU-based thread count. Nextest enforces its cross-process cap in
+// .config/nextest.toml.
+static RENDERERS: (Mutex<u8>, Condvar) = (Mutex::new(2), Condvar::new());
 const DESKTOP: &str = "1200x800";
 struct RendererSlot;
 impl RendererSlot {
@@ -537,10 +536,7 @@ fn composer_search_individual_reply_and_reaction() {
             root.id,
             "casey/builder",
             "Unique match inside a reply",
-            &PostOptions {
-                labels: [("stage".to_owned(), "tested".to_owned())].into(),
-                ..Default::default()
-            },
+            &Default::default(),
         )
         .unwrap();
     let t = f.render(
@@ -558,7 +554,6 @@ fn composer_search_individual_reply_and_reaction() {
         "2.6",
     );
     t.expect_text("Confirmed from the inspector");
-    t.expect_text("stage=tested");
     t.expect_key(&format!("reaction-{}-0", parent.id));
     assert_eq!(
         db.get(parent.id).unwrap().reactions.get("star").unwrap(),
@@ -899,15 +894,10 @@ fn metadata_revision_checked_edit_and_confirmed_tombstone() {
         json!([
             {"t":0.1,"type":"tap","key":thread},
             {"t":0.4,"type":"tap","key":inspect},
-            {"t":0.6,"type":"tap","key":"label-key"},
-            {"t":0.8,"paste":"stage"},
-            {"t":1.0,"type":"tap","key":"label-value"},
-            {"t":1.2,"paste":"verified"},
-            {"t":1.4,"type":"tap","key":"set-label"},
-            {"t":1.7,"type":"tap","key":"segment1"},
+            {"t":1.7,"type":"tap","key":"reaction-name"},
             {"t":1.9,"paste":"eyes"},
             {"t":2.1,"type":"tap","key":"add-reaction"},
-            {"t":2.3,"type":"tap","key":"segment2"},
+            {"t":2.3,"type":"tap","key":"segment1"},
             {"t":2.5,"type":"key","cmd":true,"name":"a"},
             {"t":2.7,"paste":"Edited **by owner**"},
             {"t":2.9,"type":"key","cmd":true,"name":"Enter"}
@@ -916,7 +906,6 @@ fn metadata_revision_checked_edit_and_confirmed_tombstone() {
         "3.2",
     );
     t.expect_key("conversation");
-    t.expect_text("stage=verified");
     t.expect_key(&format!("reaction-{}-0", m.id));
     t.expect_text("👀 1");
     let after = board.get(m.id).unwrap();
@@ -927,12 +916,9 @@ fn metadata_revision_checked_edit_and_confirmed_tombstone() {
         json!([
             {"t":0.1,"type":"tap","key":thread},
             {"t":0.3,"type":"tap","key":inspect},
-            {"t":0.5,"type":"tap","key":"label-row-0"},
-            {"t":0.7,"type":"tap","key":"unset-label"},
-            {"t":0.9,"type":"tap","key":"segment1"},
             {"t":1.1,"type":"tap","key":"reaction-row-0"},
             {"t":1.3,"type":"tap","key":"remove-reaction"},
-            {"t":1.5,"type":"tap","key":"segment2"},
+            {"t":1.5,"type":"tap","key":"segment1"},
             {"t":1.7,"type":"tap","key":"delete-message"}
         ]),
         "430x620",
@@ -941,12 +927,12 @@ fn metadata_revision_checked_edit_and_confirmed_tombstone() {
     t.expect_text(&format!("Delete message #{}?", m.id));
     t.expect_key("keep-message");
     let after = board.get(m.id).unwrap();
-    assert!(!after.deleted && after.labels.is_empty() && after.reactions.is_empty());
+    assert!(!after.deleted && after.reactions.is_empty());
     let t = f.render(
         json!([
             {"t":0.1,"type":"tap","key":thread},
             {"t":0.3,"type":"tap","key":inspect},
-            {"t":0.5,"type":"tap","key":"segment2"},
+            {"t":0.5,"type":"tap","key":"segment1"},
             {"t":0.7,"type":"tap","key":"delete-message"},
             {"t":0.9,"type":"tap","key":"confirm-delete"}
         ]),
@@ -970,7 +956,7 @@ fn open_editor_rejects_an_intervening_process_write() {
         json!([
             {"t":0.1,"type":"tap","key":format!("thread-{}",m.id)},
             {"t":0.4,"type":"tap","key":format!("inspect-{}",m.id)},
-            {"t":0.6,"type":"tap","key":"segment2"},
+            {"t":0.6,"type":"tap","key":"segment1"},
             {"t":0.8,"type":"key","cmd":true,"name":"a"},
             {"t":1.0,"paste":"My draft"},
             {"t":1.2,"type":"mark","name":"editing"},
@@ -1046,46 +1032,45 @@ fn native_file_dialog_and_drop_round_trip_attachment_bytes() {
 }
 
 #[test]
-fn label_editor_uses_the_value_seen_not_the_polled_value() {
+fn message_details_offer_reactions_without_a_label_editor() {
     let f = Fixture::new();
     let board = Board::open(&f.db).unwrap();
     let m = board
-        .post(
-            "work",
-            "other",
-            "Decision",
-            &PostOptions {
-                labels: [("status".into(), "open".into())].into(),
-                ..Default::default()
-            },
+        .post("work", "other", "Decision", &Default::default())
+        .unwrap();
+    let legacy = rusqlite::Connection::open(&f.db).unwrap();
+    legacy
+        .execute(
+            "INSERT INTO labels VALUES(?, 'phase', 'legacy-triage')",
+            [m.id],
         )
         .unwrap();
-    let mut cmd = f.command(
+    let tree = f.render(
         json!([
             {"t":0.1,"type":"tap","key":format!("thread-{}",m.id)},
-            {"t":0.4,"type":"tap","key":format!("inspect-{}",m.id)},
-            {"t":0.6,"type":"tap","key":"label-row-0"},
-            {"t":0.8,"type":"key","cmd":true,"name":"a"},
-            {"t":1.0,"paste":"mine"},
-            {"t":1.2,"type":"mark","name":"label"},
-            {"t":2.6,"type":"tap","key":"set-label"}
+            {"t":0.4,"type":"tap","key":format!("inspect-{}",m.id)}
         ]),
-        "620x630",
-        "3.2",
+        DESKTOP,
+        "0.7",
     );
-    let t = f.at_mark(&mut cmd, "label", || {
-        board
-            .label(m.id, "other", "status", Some("merged"))
-            .unwrap();
-    });
-    assert_eq!(board.get(m.id).unwrap().labels["status"], "merged");
-    t.expect_key("reload-message");
-    assert!(t.0.iter().any(|e| {
-        e["text"]
-            .as_str()
-            .is_some_and(|v| v.contains("label_conflict"))
-    }));
-    assert!(!t.0.iter().any(|e| e["text"] == "Edit"));
+    tree.expect_key("reaction-name");
+    assert!(!tree.has_key("label-key") && !tree.has_key("set-label"));
+    assert!(
+        !tree
+            .0
+            .iter()
+            .any(|e| e["text"] == "Edit" || e.to_string().contains("legacy-triage"))
+    );
+    assert_eq!(
+        legacy
+            .query_row(
+                "SELECT value FROM labels WHERE message_id=? AND key='phase'",
+                [m.id],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        "legacy-triage"
+    );
 }
 
 #[test]
@@ -1245,74 +1230,6 @@ fn task_board_claims_and_completes_using_a_fenced_lease() {
     t.expect_key("conversation");
     t.expect_key("task-detail-scroll");
     t.expect_text("Checks passed");
-}
-
-#[test]
-fn administers_event_watchers_and_local_schemas() {
-    let f = Fixture::new();
-    let t = f.render(
-        json!([
-            {"t":0.1,"type":"tap","key":"workspace"},
-            {"t":0.3,"type":"tap","key":"work-watchers"},
-            {"t":0.5,"type":"tap","key":"add-resource"},
-            {"t":0.7,"type":"tap","key":"resource-name"},
-            {"t":0.9,"paste":"observer"},
-            {"t":1.1,"type":"tap","key":"resource-channel"},
-            {"t":1.3,"paste":"dev/"},
-            {"t":1.5,"type":"tap","key":"resource-value"},
-            {"t":1.7,"paste":"message.posted"},
-            {"t":1.9,"type":"tap","key":"save-resource"}
-        ]),
-        "910x860",
-        "2.2",
-    );
-    t.expect_key("watcher-observer");
-    t.expect_text("observer");
-    assert!(!t.has_key("work-schedules"));
-    let b = Board::open(&f.db).unwrap();
-    let watcher = board_local::automation::get_watcher(&b, "observer").unwrap();
-    assert_eq!(watcher.filter.channel.as_deref(), Some("dev/"));
-    assert_eq!(watcher.kind.as_deref(), Some("message.posted"));
-    b.post("other", "author", "Unrelated", &Default::default())
-        .unwrap();
-    let message = b
-        .post("dev/build", "author", "Build ready", &Default::default())
-        .unwrap();
-    let delivery = board_local::automation::next_event(&b, "observer")
-        .unwrap()
-        .unwrap();
-    assert_eq!(delivery.message.unwrap().id, message.id);
-    board_local::automation::ack_event(&b, "observer", delivery.cursor).unwrap();
-    assert!(
-        board_local::automation::next_event(&b, "observer")
-            .unwrap()
-            .is_none()
-    );
-    let t = f.render(
-        json!([
-            {"t":0.1,"type":"tap","key":"workspace"},
-            {"t":0.3,"type":"tap","key":"work-schemas"},
-            {"t":0.5,"type":"tap","key":"add-resource"},
-            {"t":0.7,"type":"tap","key":"resource-name"},
-            {"t":0.9,"paste":"build-result"},
-            {"t":1.1,"type":"tap","key":"save-resource"},
-            {"t":1.4,"type":"tap","key":"schema-build-result-1"}
-        ]),
-        "910x860",
-        "1.7",
-    );
-    t.expect_text("build-result@1");
-    assert!(t.0.iter().any(|e| {
-        e["text"]
-            .as_str()
-            .is_some_and(|v| v.contains("\"type\": \"object\""))
-    }));
-    assert!(
-        b.schemas()
-            .unwrap()
-            .iter()
-            .any(|schema| schema.name == "build-result")
-    );
 }
 
 #[test]
@@ -1767,11 +1684,11 @@ fn guarded_reply_pins_visible_id_across_external_write_restart_and_explicit_rese
 }
 
 #[test]
-fn schema_examples_append_to_real_drafts_and_unsolved_shapes_offer_only_the_definition() {
+fn authored_schema_examples_append_to_drafts_and_missing_examples_leave_the_definition() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     b.register_schema("approval",3,"Local approval",&json!({"type":"object",
-        "additionalProperties":false,"required":["answer"],"properties":{"answer":{"const":"pending"}}})).unwrap();
+        "examples":[{"answer":"wrong"},{"answer":"pending"}],"additionalProperties":false,"required":["answer"],"properties":{"answer":{"const":"pending"}}})).unwrap();
     b.register_schema(
         "impossible",
         1,
@@ -2144,19 +2061,7 @@ fn query_filters_replies_before_paging_and_separates_imported_origins() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let root = b
-        .post(
-            "ops/build",
-            "lead",
-            "Target thread",
-            &PostOptions {
-                labels: [
-                    ("stage".to_string(), "review".into()),
-                    ("empty".into(), String::new()),
-                ]
-                .into(),
-                ..Default::default()
-            },
-        )
+        .post("ops/build", "lead", "Target thread", &Default::default())
         .unwrap();
     let reply = b
         .reply(
@@ -2207,7 +2112,6 @@ fn query_filters_replies_before_paging_and_separates_imported_origins() {
         {"t":0.1,"type":"tap","key":"nav-ops:"},{"t":0.3,"type":"key","cmd":true,"shift":true,"name":"f"},
         {"t":0.5,"paste":"worker"},{"t":0.7,"type":"tap","key":"filter-mention"},{"t":0.9,"paste":"reader"},
         {"t":1.1,"type":"tap","key":"filter-text"},{"t":1.3,"paste":"signoff"},
-        {"t":1.5,"type":"tap","key":"filter-labels"},{"t":1.7,"paste":"stage=ready|review\nempty="},
         {"t":1.9,"type":"tap","key":"apply-filters"}
     ]);
     let t = f.render(steps.clone(), DESKTOP, "2.2");
@@ -2314,62 +2218,7 @@ fn directory_edits_local_presentation_and_composer_inserts_exact_mention() {
 }
 
 #[test]
-fn task_routing_filters_query_all_pages() {
-    let f = Fixture::new();
-    let b = Board::open(&f.db).unwrap();
-    let make = |name: &str, actor: &str, ch: &str, needs: &[i64], labels: PostOptions| {
-        create_task(
-            &b,
-            actor,
-            TaskTarget::New {
-                channel: ch,
-                text: name,
-                options: &labels,
-            },
-            needs,
-            Some(&format!("{actor}/builder")),
-        )
-        .unwrap()
-    };
-    let prereq = make("First job", "reader", "ops/work", &[], Default::default());
-    for n in 0..43 {
-        make(
-            &format!("Other task {n}"),
-            "other",
-            "other",
-            &[],
-            Default::default(),
-        );
-    }
-    let target = make(
-        "Filtered job",
-        "reader",
-        "ops/work",
-        &[prereq.id],
-        PostOptions {
-            labels: [("batch".into(), "nightly".into())].into(),
-            ..Default::default()
-        },
-    );
-    let t=f.render(json!([
-        {"t":0.1,"type":"tap","key":"tasks"},{"t":0.3,"type":"tap","key":"task-criteria"},
-        {"t":0.5,"type":"tap","key":"criteria-owner"},{"t":0.7,"paste":"reader"},
-        {"t":0.9,"type":"tap","key":"criteria-assignee"},{"t":1.1,"paste":"reader/builder"},
-        {"t":1.3,"type":"tap","key":"criteria-channel"},{"t":1.5,"paste":"ops/"},
-        {"t":1.7,"type":"tap","key":"criteria-needs"},{"t":1.9,"paste":format!("#{}",prereq.id)},
-        {"t":2.1,"type":"tap","key":"criteria-labels"},{"t":2.3,"paste":"batch=weekly|nightly"},
-        {"t":2.5,"type":"tap","key":"apply-task-filters"}
-    ]),DESKTOP,"2.8");
-    t.expect_text("Filtered job");
-    t.expect_key(&format!("task-row-{}", target.id));
-    assert!(
-        !t.0.iter()
-            .any(|e| e["text"] == "First job" || e["key"] == "next-page")
-    );
-}
-
-#[test]
-fn private_reply_composer_recovers_labels_target_and_files_without_clock_controls() {
+fn private_reply_composer_recovers_target_and_files_without_clock_controls() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
     let root = b
@@ -2386,14 +2235,13 @@ fn private_reply_composer_recovers_labels_target_and_files_without_clock_control
         json!([
             {"t":0.2,"type":"tap","key":format!("reply-{}",parent.id)},{"t":0.4,"paste":"Private follow-up"},
             {"t":0.6,"type":"tap","key":"attach-file"},{"t":0.8,"type":"file-dialog","path":file},
-            {"t":1.0,"type":"tap","key":"delivery-options"},{"t":1.2,"type":"tap","key":"compose-no-sync"},
-            {"t":1.4,"type":"tap","key":"compose-labels"},{"t":1.6,"paste":"stage=classified"}
+            {"t":1.0,"type":"tap","key":"delivery-options"},{"t":1.2,"type":"tap","key":"compose-no-sync"}
         ]),
         parent.id,
         "2.2",
     );
     t.expect_key("compose-no-sync");
-    t.expect_key("compose-labels");
+    assert!(!t.has_key("compose-labels"));
     for key in [
         "compose-later",
         "compose-due",
@@ -2404,14 +2252,14 @@ fn private_reply_composer_recovers_labels_target_and_files_without_clock_control
         assert!(!t.has_key(key), "obsolete delivery option {key}");
     }
     let saved = b.load_composer("reader", &scope).unwrap().unwrap();
-    assert!(saved.settings.no_sync && !saved.settings.review_before_send);
+    assert!(saved.settings.no_sync);
     assert_eq!(saved.draft.reply_to, Some(parent.id));
     assert_eq!(saved.files[0].1, [42, 0, 29]);
     assert_eq!(b.thread(root.id).unwrap().len(), 2);
     let t = run_at(&f, json!([]), root.id, "0.5");
     t.expect_key("reply-composer");
     t.expect_key("send");
-    t.expect_text("stage=classified");
+    t.expect_key("draft-local-only");
     t.expect_text("sample.bin (3 bytes)");
     assert!(!t.has_key("compose-schedule"));
     let t = run_at(
@@ -2427,90 +2275,8 @@ fn private_reply_composer_recovers_labels_target_and_files_without_clock_control
     assert!(reply.no_sync);
     assert_eq!(reply.text, "Private follow-up");
     assert_eq!(reply.reply_to, Some(parent.id));
-    assert_eq!(reply.labels["stage"], "classified");
     assert_eq!(b.download(reply.attachments[0].id).unwrap().1, [42, 0, 29]);
     assert!(b.load_composer("reader", &scope).unwrap().is_none());
-}
-
-#[test]
-fn legacy_delayed_draft_stays_unsent_across_edits_and_restart_until_explicit_review() {
-    let f = Fixture::new();
-    let historical = include_bytes!("../../crates/board-core/tests/fixtures/swarm-v14.sqlite3.gz");
-    std::io::copy(
-        &mut flate2::read::GzDecoder::new(&historical[..]),
-        &mut File::create(&f.db).unwrap(),
-    )
-    .unwrap();
-    let old = rusqlite::Connection::open(&f.db).unwrap();
-    old.execute("INSERT INTO channels(name) VALUES('held')", [])
-        .unwrap();
-    old.execute(
-        "INSERT INTO composer_drafts(actor,scope,body,channel) VALUES('reader','new','Review before sending','held')",
-        [],
-    ).unwrap();
-    let legacy_settings = json!({
-        "later": true, "due":"2000-01-01T00:00:00Z", "every":"60", "times":"2",
-        "no_sync":true, "labels":"stage=private"
-    });
-    assert_eq!(
-        old.execute(
-            "UPDATE composer_settings SET settings=? WHERE actor='reader' AND scope='new'",
-            [legacy_settings.to_string()],
-        )
-        .unwrap(),
-        1
-    );
-    old.execute(
-        "INSERT INTO composer_files VALUES('reader','new',0,'notes.txt',X'4869')",
-        [],
-    )
-    .unwrap();
-    drop(old);
-
-    let t = f.render(
-        json!([
-            {"t":0.2,"type":"tap","key":"message-body"},
-            {"t":0.4,"type":"key","cmd":true,"name":"a"},
-            {"t":0.6,"paste":"Reviewed text"},
-            {"t":0.8,"type":"key","name":"Enter"},
-            {"t":1.2,"type":"tap","key":"send"}
-        ]),
-        DESKTOP,
-        "1.6",
-    );
-    t.expect_key("enable-manual-send");
-    t.expect_text("notes.txt (2 bytes)");
-    assert!(!t.has_key("compose-schedule"));
-    let b = Board::open(&f.db).unwrap();
-    let held = Filter {
-        channel: Some("held".into()),
-        ..Default::default()
-    };
-    let saved = b.load_composer("reader", "new").unwrap().unwrap();
-    assert_eq!(saved.draft.body, "Reviewed text");
-    assert!(saved.settings.review_before_send && saved.settings.no_sync);
-    assert!(b.messages(&held, 5).unwrap().is_empty());
-
-    let t = f.render(
-        json!([
-            {"t":0.2,"type":"tap","key":"message-body"},
-            {"t":0.4,"type":"key","name":"Enter"},
-            {"t":0.6,"type":"tap","key":"enable-manual-send"}
-        ]),
-        DESKTOP,
-        "1.0",
-    );
-    assert!(!t.has_key("enable-manual-send"));
-    assert!(b.messages(&held, 5).unwrap().is_empty());
-    let t = f.render(json!([{"t":0.2,"type":"tap","key":"send"}]), DESKTOP, "0.6");
-    let posted = b.messages(&held, 5).unwrap();
-    assert_eq!(posted.len(), 1);
-    t.expect_key(&format!("message-{}", posted[0].id));
-    assert!(posted[0].no_sync);
-    assert_eq!(posted[0].text, "Reviewed text");
-    assert_eq!(posted[0].labels["stage"], "private");
-    assert_eq!(b.download(posted[0].attachments[0].id).unwrap().1, b"Hi");
-    assert!(b.load_composer("reader", "new").unwrap().is_none());
 }
 
 #[test]
@@ -2711,74 +2477,6 @@ fn exact_message_delivery_failures_are_scoped_and_local_only_replies_are_not_que
     t.expect_key(&format!("quote-{}-0", quote.id));
     t.expect_text(&format!("Quoted message #{}", root.id));
     t.expect_text("Mirrored root updated");
-}
-
-#[test]
-fn opt_in_h264_playback_steps_real_frames_and_degrades_without_the_decoder() {
-    let f = Fixture::new();
-    let b = Board::open(&f.db).unwrap();
-    let m = b
-        .post(
-            "video",
-            "reader",
-            "Color swatches",
-            &PostOptions {
-                files: vec![(
-                    "motion.mp4".into(),
-                    include_bytes!("fixtures/swatches.mp4").to_vec(),
-                )],
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    let open =
-        json!({"t":0.1,"type":"tap","key":format!("preview-{}-{}",m.id,m.attachments[0].id)});
-    let mut missing = f.command(json!([open]), "820x640", "1.0");
-    let output = missing
-        .env("PATH", f.dir.path())
-        .arg("--thread")
-        .arg(m.id.to_string())
-        .arg("--realtime")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    f.tree()
-        .expect_text("Video playback needs local ffmpeg and ffprobe executables");
-    if !video::available("h264") {
-        return;
-    }
-    let shot = f.dir.path().join("frame.png");
-    let mut cmd = f.command(
-        json!([open,{"t":1.0,"type":"tap","key":"clip-next"},
-        {"t":1.4,"type":"tap","key":"clip-play"}]),
-        "820x640",
-        "4.3",
-    );
-    let o = cmd
-        .arg("--thread")
-        .arg(m.id.to_string())
-        .arg("--realtime")
-        .arg("--snap")
-        .arg(&shot)
-        .output()
-        .unwrap();
-    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    let t = f.tree();
-    t.expect_key("clip-frame");
-    t.expect_text("Silent video   0:01 / 0:02   Frame 24 of 24");
-    let painted = image::open(&shot).unwrap().into_rgb8();
-    assert!(
-        painted
-            .pixels()
-            .filter(|p| p.0[0] > 220 && p.0[1] < 30 && p.0[2] > 220)
-            .count()
-            > 7000,
-        "the last decoded magenta frame must actually reach the Rune framebuffer"
-    );
 }
 
 #[path = "inspector/sidebar.rs"]

@@ -198,30 +198,19 @@ fn scrolling_to_the_oldest_loaded_row_prepends_history_without_losing_the_readin
 }
 
 #[test]
-fn scoped_inline_mentions_and_label_suggestions_apply_exact_visible_values() {
+fn scoped_inline_mentions_apply_exact_visible_values() {
     let f = Fixture::new();
     let b = Board::open(&f.db).unwrap();
-    for (channel, author, phase) in [
-        ("ops", "sam-visible", "review"),
-        ("staff", "sam-private", "secret-internal"),
-    ] {
-        b.post(
-            channel,
-            author,
-            "A labeled message",
-            &PostOptions {
-                labels: [("phase".into(), phase.into())].into(),
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    for (channel, author) in [("ops", "sam-visible"), ("staff", "sam-private")] {
+        b.post(channel, author, "An update", &Default::default())
+            .unwrap();
     }
     let actor = "reader/ops";
     b.set_grant(
         "reader",
         None,
         actor,
-        &board_local::access::Rules::parse("ops=read,post,label").unwrap(),
+        &board_local::access::Rules::parse("ops=read,post").unwrap(),
     )
     .unwrap();
     let secret = b
@@ -250,29 +239,14 @@ fn scoped_inline_mentions_and_label_suggestions_apply_exact_visible_values() {
     t.expect_key("mention-choice-0");
     assert!(!t.has_key("mention-choice-1"));
     assert!(!t.0.iter().any(|e| e.to_string().contains("sam-private")));
-    let t = run(
+    run(
         json!([
             {"t":0.1,"type":"tap","key":"nav-ops"},{"t":0.35,"type":"tap","key":"message-body"},
             {"t":0.5,"type":"key","name":"End"},{"t":0.7,"paste":"-v"},{"t":0.95,"type":"key","name":"Tab"},
-            {"t":1.2,"type":"tap","key":"delivery-options"},{"t":1.45,"type":"tap","key":"compose-labels"},{"t":1.7,"paste":"ph"}
+            {"t":1.2,"type":"tap","key":"send"}
         ]),
-        "2.0",
+        "1.8",
     );
-    t.expect_key("compose-labels-suggest-0");
-    t.expect_text("phase=review");
-    assert!(
-        !t.0.iter()
-            .any(|e| e.to_string().contains("secret-internal"))
-    );
-    let t = run(
-        json!([
-            {"t":0.1,"type":"tap","key":"nav-ops"},{"t":0.4,"type":"tap","key":"delivery-options"},
-            {"t":0.65,"type":"tap","key":"compose-labels"},{"t":0.85,"type":"key","name":"End"},{"t":1.1,"type":"tap","key":"compose-labels-suggest-0"},
-            {"t":1.35,"type":"tap","key":"done-delivery"},{"t":1.6,"type":"tap","key":"send"}
-        ]),
-        "1.9",
-    );
-    t.expect_text("phase=review");
     let rows = b
         .messages(
             &Filter {
@@ -284,21 +258,6 @@ fn scoped_inline_mentions_and_label_suggestions_apply_exact_visible_values() {
         .unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[1].text.trim_end(), "Thanks @[sam-visible]");
-    assert_eq!(rows[1].labels["phase"], "review");
-    let filtered = run(
-        json!([
-            {"t":0.1,"type":"tap","key":"nav-ops"},{"t":0.35,"type":"tap","key":"filter-messages"},
-            {"t":0.6,"type":"tap","key":"filter-labels"},{"t":0.8,"paste":"phase=other|r"},
-            {"t":1.0,"type":"tap","key":"filter-labels-suggest-0"},{"t":1.3,"type":"tap","key":"apply-filters"}
-        ]),
-        "1.6",
-    );
-    filtered.expect_key(&format!("thread-{}", rows[1].id));
-    assert!(filtered.0.iter().any(|e| {
-        e["text"]
-            .as_str()
-            .is_some_and(|s| s.contains("phase=other|review"))
-    }));
 }
 
 #[test]
@@ -374,7 +333,7 @@ fn channel_activity_and_task_drafts_reopen_independently_with_private_bytes_and_
         {"t":2.0,"type":"tap","key":"tasks"},{"t":2.2,"type":"tap","key":"new-task"},{"t":2.45,"type":"tap","key":"task-channel"},
         {"t":2.65,"type":"key","cmd":true,"name":"a"},{"t":2.85,"paste":"ops"},{"t":3.05,"type":"tap","key":"task-body"},{"t":3.25,"paste":"Verify manifest"},
         {"t":3.45,"type":"tap","key":"assignee"},{"t":3.65,"paste":"reader/agent"},{"t":3.85,"type":"tap","key":"task-needs"},{"t":4.05,"paste":format!("#{prior}")},
-        {"t":4.25,"type":"tap","key":"task-labels"},{"t":4.45,"paste":"phase=verify"},{"t":4.65,"type":"tap","key":"task-local"},
+        {"t":4.65,"type":"tap","key":"task-local"},
         {"t":4.85,"type":"tap","key":"task-attach"},{"t":5.05,"type":"file-dialog","path":file},{"t":5.35,"type":"tap","key":"nav-ops"}
     ]),DESKTOP,"5.7");
     for (scope, body, private) in [
@@ -435,7 +394,6 @@ fn channel_activity_and_task_drafts_reopen_independently_with_private_bytes_and_
     assert_eq!(new.assignee.as_deref(), Some("reader/agent"));
     let msg = b.get(new.id).unwrap();
     assert!(msg.no_sync);
-    assert_eq!(msg.labels["phase"], "verify");
     assert_eq!(
         b.download(msg.attachments[0].id).unwrap().1,
         b"private manifest"

@@ -23,35 +23,21 @@ CREATE INDEX IF NOT EXISTS mentions_by_handle ON mentions(handle,message_id);
 CREATE TABLE IF NOT EXISTS labels(message_id INTEGER NOT NULL REFERENCES messages(id), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY(message_id,key));
 CREATE INDEX IF NOT EXISTS labels_by_value ON labels(key,value,message_id);
 CREATE TABLE IF NOT EXISTS reactions(message_id INTEGER NOT NULL REFERENCES messages(id), emoji TEXT NOT NULL, actor TEXT NOT NULL, PRIMARY KEY(message_id,emoji,actor));
-CREATE TABLE IF NOT EXISTS attachments(id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL REFERENCES messages(id), name TEXT NOT NULL, size INTEGER NOT NULL, bytes BLOB NOT NULL);
-CREATE INDEX IF NOT EXISTS attachments_by_message ON attachments(message_id);
-CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, actor TEXT NOT NULL, message_id INTEGER, created_at TEXT NOT NULL, payload TEXT NOT NULL, message TEXT, previous TEXT, root_labels TEXT NOT NULL DEFAULT '{}');
+CREATE TABLE IF NOT EXISTS events(cursor INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, actor TEXT NOT NULL, message_id INTEGER, created_at TEXT NOT NULL, payload TEXT NOT NULL, message TEXT, previous TEXT);
 CREATE INDEX IF NOT EXISTS events_by_message ON events(message_id,cursor DESC);
-CREATE TABLE IF NOT EXISTS write_keys(actor TEXT NOT NULL, key TEXT NOT NULL, fingerprint BLOB NOT NULL, message_id INTEGER NOT NULL REFERENCES messages(id), PRIMARY KEY(actor,key));
-CREATE TABLE IF NOT EXISTS schemas(name TEXT NOT NULL, version INTEGER NOT NULL, description TEXT NOT NULL, definition TEXT NOT NULL, PRIMARY KEY(name,version));
-";
-
-// V1 let different authors claim the same string. Keep every historical row and
-// event; the earliest successful write owns the upgraded board-wide replay key.
-const REPLAY_KEYS: &str = "
-CREATE TABLE IF NOT EXISTS client_posts(key TEXT PRIMARY KEY NOT NULL,message_id INTEGER NOT NULL REFERENCES messages(id));
+CREATE TABLE IF NOT EXISTS schemas(name TEXT NOT NULL, version INTEGER NOT NULL, description TEXT NOT NULL, definition TEXT NOT NULL, builtin INTEGER NOT NULL, actor TEXT, at TEXT, PRIMARY KEY(name,version));
+CREATE TABLE IF NOT EXISTS client_posts(key TEXT PRIMARY KEY NOT NULL,message_id INTEGER NOT NULL REFERENCES messages(id),swarm_run_id INTEGER REFERENCES swarm_runs(id));
 CREATE TABLE IF NOT EXISTS client_batches(key TEXT PRIMARY KEY NOT NULL,actor TEXT NOT NULL,fingerprint BLOB NOT NULL,ids TEXT NOT NULL);
-INSERT OR IGNORE INTO client_posts(key,message_id) SELECT key,message_id FROM write_keys ORDER BY message_id;
-INSERT OR IGNORE INTO client_batches(key,actor,fingerprint,ids)
- SELECT key,actor,fingerprint,ids FROM task_requests t
- WHERE NOT EXISTS(SELECT 1 FROM write_keys w WHERE w.actor=t.actor AND w.key=t.key
- AND w.message_id=json_extract(t.ids,'$[0]'))
- ORDER BY json_extract(t.ids,'$[0]');
 ";
 
 pub struct Board {
     pub(crate) conn: Connection,
-    pub(crate) swarm_scratch: std::cell::OnceCell<tempfile::TempDir>,
     pub(crate) session: crate::access::Session,
     pub(crate) request_avatar: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Attachment {
     pub id: i64,
     #[serde(default)]
@@ -66,6 +52,7 @@ pub const MAX_ATTACHMENTS: usize = 10;
 pub const MAX_ATTACHMENT_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Message {
     pub id: i64,
     pub re: Option<i64>,
@@ -93,7 +80,6 @@ pub struct Message {
     /// This message (and, for a root, its entire thread) never leaves through a connector.
     #[serde(default)]
     pub no_sync: bool,
-    pub labels: BTreeMap<String, String>,
     pub reactions: BTreeMap<String, Vec<String>>,
     pub attachments: Vec<Attachment>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -107,18 +93,16 @@ pub struct Message {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<crate::automation::Task>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<crate::automation::ScheduledSend>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<crate::sources::Copy>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PostOptions {
     #[serde(default)]
     pub no_sync: bool,
     pub key: Option<String>,
     pub after: Option<i64>,
-    pub labels: BTreeMap<String, String>,
     pub files: Vec<(String, Vec<u8>)>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_ids: Vec<i64>,
@@ -127,7 +111,7 @@ pub struct PostOptions {
 pub(crate) enum PublicDestination<'a> {
     Channel(&'a str),
     Reply(i64),
-    Run(&'a crate::swarm::SwarmRun),
+    Run(&'a crate::swarm::SwarmRun, i64),
 }
 
 #[derive(Clone, Copy)]
@@ -191,29 +175,6 @@ pub fn validate_channel(s: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_key(s: &str) -> Result<()> {
-    validate_label_key(s)?;
-    ensure!(
-        !s.starts_with("board."),
-        Invalid.error("reserved_label", format!("reserved label: {s}"))
-    );
-    Ok(())
-}
-pub(crate) fn validate_label_key(s: &str) -> Result<()> {
-    ensure!(
-        s.len() <= 64
-            && s.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-            && s.bytes().all(|b| b.is_ascii_lowercase()
-                || b.is_ascii_digit()
-                || matches!(b, b'_' | b'-' | b'.')),
-        "invalid label key: {s}"
-    );
-    ensure!(
-        !matches!(s, "constructor" | "prototype"),
-        "invalid label key: {s}"
-    );
-    Ok(())
-}
 pub fn validate_actor(s: &str) -> Result<()> {
     ensure!(
         s.len() <= 256
@@ -258,20 +219,8 @@ pub fn validate_post(channel: &str, actor: &str, text: &str, opts: &PostOptions)
         );
         crate::files::valid_name(name)?;
     }
-    for (k, v) in &opts.labels {
-        validate_key(k)?;
-        validate_value(v)?;
-    }
     Ok(())
 }
-fn validate_value(v: &str) -> Result<()> {
-    ensure!(
-        v.encode_utf16().count() <= 256 && !v.chars().any(char::is_control),
-        "label values must be at most 256 characters without controls"
-    );
-    Ok(())
-}
-
 pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
@@ -287,8 +236,13 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn fingerprint(data: impl Serialize) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+    Ok(Sha256::digest(serde_json::to_vec(&data)?).to_vec())
+}
+
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 20;
+const DB_VERSION: i64 = 25;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -368,78 +322,42 @@ impl Board {
             |args| Ok(args.get::<String>(0)?.to_lowercase()),
         )?;
         conn.pragma_update(None, "foreign_keys", true)?;
-        let app: i64 = conn.pragma_query_value(None, "application_id", |r| r.get(0))?;
-        let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(app == 0 || app == APPLICATION_ID, "not a Board database");
-        ensure!(
-            version <= DB_VERSION,
-            "this board was created by a newer version"
-        );
-        if app == 0 {
-            let known:bool=conn.query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%') OR
-                (SELECT count(*) FROM sqlite_schema WHERE type='table' AND name IN ('messages','events','channels','write_keys','tasks','schemas'))=6",[],|r|r.get(0))?;
-            ensure!(known, "not a Board database");
-        }
-        enable_wal(&conn)?;
-        if version == DB_VERSION && app == APPLICATION_ID {
-            return Ok(Self {
-                conn,
-                swarm_scratch: Default::default(),
-                session: Default::default(),
-                request_avatar: None,
-            });
-        }
-        let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
-        // Another opener may have migrated while this connection waited for the writer.
-        let locked_version: i64 = tx.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        ensure!(
-            locked_version <= DB_VERSION,
-            "this board was created by a newer version"
-        );
-        if locked_version == DB_VERSION
-            && tx.pragma_query_value(None, "application_id", |r| r.get::<_, i64>(0))?
-                == APPLICATION_ID
-        {
-            tx.commit()?;
-            return Ok(Self {
-                conn,
-                swarm_scratch: Default::default(),
-                session: Default::default(),
-                request_avatar: None,
-            });
-        }
-        if locked_version < 17 {
-            tx.execute_batch(SCHEMA)?;
-            crate::schemas::init(&tx)?;
-            crate::automation::init_automation(&tx)?;
-            tx.execute_batch(REPLAY_KEYS)?;
-            crate::access::init(&tx)?;
-            crate::sources::init(&tx)?;
-            tx.execute_batch(
-                "DROP TABLE IF EXISTS write_rules;
-            DROP TABLE IF EXISTS rule_internal;
-            DROP TABLE IF EXISTS sync_renderers;
-            DROP TABLE IF EXISTS source_renderers;",
+        // Read the header and catalog in one snapshot, including during concurrent first opens.
+        let is_new = |db: &Connection| -> Result<bool> {
+            let (app, version, empty): (i64, i64, bool) = db.query_row(
+                "SELECT application_id,user_version,CASE WHEN application_id=0 AND user_version=0 THEN NOT EXISTS(SELECT 1 FROM sqlite_schema) ELSE 0 END FROM pragma_application_id,pragma_user_version",
+                [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )?;
-            crate::roles::init(&tx)?;
-            crate::swarm::init(&tx)?;
-            crate::presence::init(&tx)?;
-            crate::files::init(&tx)?;
-            crate::actors::init(&tx)?;
-            crate::projections::init(&tx)?;
-            if locked_version < 14 {
-                crate::schemas::migrate_imported_blocks(&tx)?;
+            ensure!(empty || app == APPLICATION_ID, "not a Board database");
+            ensure!(
+                empty || version == DB_VERSION,
+                "unsupported Board database version {version}; use a new database (expected {DB_VERSION})"
+            );
+            Ok(empty)
+        };
+        let fresh = is_new(&conn)?;
+        enable_wal(&conn)?;
+        if fresh {
+            let tx = Transaction::new_unchecked(&conn, TransactionBehavior::Immediate)?;
+            if is_new(&tx)? {
+                tx.execute_batch(SCHEMA)?;
+                crate::schemas::init(&tx)?;
+                crate::automation::init_automation(&tx)?;
+                crate::access::init(&tx)?;
+                crate::sources::init(&tx)?;
+                crate::roles::init(&tx)?;
+                crate::swarm::init(&tx)?;
+                crate::presence::init(&tx)?;
+                crate::files::init(&tx)?;
+                crate::actors::init(&tx)?;
+                crate::projections::init(&tx)?;
+                tx.pragma_update(None, "application_id", APPLICATION_ID)?;
+                tx.pragma_update(None, "user_version", DB_VERSION)?;
             }
+            tx.commit()?;
         }
-        tx.execute_batch(include_str!("swarm/orchestration.sql"))?;
-        // The task IDs and checkpoints already live in the ordinary plan tables.
-        tx.execute_batch("DROP TABLE IF EXISTS swarm_plans;")?;
-        tx.pragma_update(None, "application_id", APPLICATION_ID)?;
-        tx.pragma_update(None, "user_version", DB_VERSION)?;
-        tx.commit()?;
         Ok(Self {
             conn,
-            swarm_scratch: Default::default(),
             session: Default::default(),
             request_avatar: None,
         })
@@ -525,11 +443,10 @@ impl Board {
         Ok(message)
     }
     pub(crate) fn get_on(c: &Connection, id: i64) -> Result<Message> {
-        let (channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,no_sync) = c.query_row(
-            "SELECT channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,EXISTS(SELECT 1 FROM private_messages p WHERE p.id=m.id) FROM messages m WHERE id=?",
-            [id], |r| Ok((r.get(0)?,r.get::<_,String>(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get::<_,String>(8)?,r.get(9)?)),
+        let (channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,no_sync,has_task) = c.query_row(
+            "SELECT channel,actor,text,re,reply_to,created_at,revision,deleted,blocks,EXISTS(SELECT 1 FROM private_messages p WHERE p.id=m.id),EXISTS(SELECT 1 FROM tasks WHERE id=m.id) FROM messages m WHERE id=?",
+            [id], |r| Ok((r.get(0)?,r.get::<_,String>(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get::<_,String>(8)?,r.get(9)?,r.get::<_,bool>(10)?)),
         ).optional()?.with_context(||Missing.error("message_not_found",format!("message #{id} not found")))?;
-        let labels = labels_on(c, id)?;
         let mut reactions: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for row in c
             .prepare("SELECT emoji,actor FROM reactions WHERE message_id=? ORDER BY rowid")?
@@ -542,8 +459,8 @@ impl Board {
         }
         let attachments = crate::files::on_message(c, id)?;
         let edited_at=c.query_row("SELECT created_at FROM events WHERE message_id=? AND kind='message.edited' ORDER BY cursor DESC LIMIT 1",[id],|r|r.get(0)).optional()?;
-        let version=c.query_row("SELECT coalesce(max(cursor),?1) FROM events WHERE message_id=?1 AND (kind IN ('message.edited','message.deleted','message.links','attachment.added','attachment.unavailable','labels.changed','reaction.added','reaction.removed') OR kind LIKE 'task.%')",[id],|r|r.get(0))?;
-        let task = if labels.contains_key("board.task") || deleted {
+        let version=c.query_row("SELECT coalesce(max(cursor),?1) FROM events WHERE message_id=?1 AND (kind IN ('message.edited','message.deleted','message.links','attachment.added','attachment.unavailable','source.metadata','reaction.added','reaction.removed') OR kind LIKE 'task.%')",[id],|r|r.get(0))?;
+        let task = if has_task {
             crate::automation::task_optional(c, id)?
         } else {
             None
@@ -566,7 +483,6 @@ impl Board {
             revision,
             deleted,
             no_sync,
-            labels,
             reactions,
             attachments,
             links: if deleted {
@@ -582,7 +498,6 @@ impl Board {
             blocks: serde_json::from_str(&blocks)?,
             version,
             task,
-            schedule: crate::automation::send_info(c, id)?,
             origin,
         })
     }
@@ -854,7 +769,6 @@ impl Board {
             );
         }
         let blocks = origin.blocks(tx, text)?;
-        let labels = &opts.labels;
         tx.execute("INSERT OR IGNORE INTO channels VALUES (?)", [channel])?;
         let ts = now();
         tx.execute(
@@ -865,9 +779,6 @@ impl Board {
         tx.execute("INSERT INTO messages(id,channel,actor,text,re,reply_to,created_at,revision,blocks) VALUES(?1,?2,?3,?4,?5,?6,?7,?1,?8)",params![id,channel,actor,text,re,reply_to,ts,serde_json::to_string(&blocks)?])?;
         if opts.no_sync {
             tx.execute("INSERT INTO private_messages VALUES(?)", [id])?;
-        }
-        for (k, v) in labels {
-            tx.execute("INSERT INTO labels VALUES(?,?,?)", params![id, k, v])?;
         }
         update_mentions(tx, id, text)?;
         crate::links::capture(tx, id, channel, text)?;
@@ -888,17 +799,12 @@ impl Board {
         m: &Message,
         previous: Option<&Message>,
     ) -> Result<()> {
-        let root_labels = match m.re {
-            Some(root) => labels_on(tx, root)?,
-            None => BTreeMap::new(),
-        };
         tx.execute(
-            "UPDATE events SET message_id=?,message=?,previous=?,root_labels=? WHERE cursor=?",
+            "UPDATE events SET message_id=?,message=?,previous=? WHERE cursor=?",
             params![
                 m.id,
                 serde_json::to_string(m)?,
                 previous.map(serde_json::to_string).transpose()?,
-                serde_json::to_string(&root_labels)?,
                 cursor
             ],
         )?;
@@ -1025,7 +931,6 @@ impl Board {
             let mut m = Self::delete_tx(tx, id, actor, revision)?;
             if blind {
                 m.task = None;
-                m.schedule = None;
             }
             a.view(tx, m)
         })
@@ -1080,88 +985,6 @@ impl Board {
         Self::changed(tx, "message.deleted", actor, &before, json!({}), true)?;
         Self::get_on(tx, id)
     }
-    pub fn label(&self, id: i64, actor: &str, key: &str, value: Option<&str>) -> Result<Message> {
-        let mut set = BTreeMap::new();
-        let mut unset = Vec::new();
-        if let Some(v) = value {
-            set.insert(key.to_owned(), v.to_owned());
-        } else {
-            unset.push(key.to_owned());
-        }
-        self.labels(id, actor, &set, &unset, &BTreeMap::new())
-    }
-    pub fn labels(
-        &self,
-        id: i64,
-        actor: &str,
-        set: &BTreeMap<String, String>,
-        unset: &[String],
-        conditions: &BTreeMap<String, Option<String>>,
-    ) -> Result<Message> {
-        self.write(|tx| {
-            let a = self.access_on(tx)?;
-            a.actor(actor)?;
-            a.message(tx, id, Action::Label)?;
-            a.view(tx, Self::labels_tx(tx, id, actor, set, unset, conditions)?)
-        })
-    }
-    pub(crate) fn labels_tx(
-        tx: &Transaction<'_>,
-        id: i64,
-        actor: &str,
-        set: &BTreeMap<String, String>,
-        unset: &[String],
-        conditions: &BTreeMap<String, Option<String>>,
-    ) -> Result<Message> {
-        validate_actor(actor)?;
-        ensure!(conditions.len() <= 16, "at most 16 label conditions");
-        for (key, value) in conditions {
-            validate_label_key(key)?;
-            ensure!(
-                value
-                    .as_ref()
-                    .is_none_or(|s| s.encode_utf16().count() <= 256 && !s.contains('\0')),
-                "invalid expected label value"
-            );
-        }
-        for k in set.keys().chain(unset.iter()) {
-            validate_key(k)?;
-        }
-        for (k, v) in set {
-            validate_value(v)?;
-            ensure!(!unset.contains(k), "key both set and unset: {k}");
-        }
-        let old = Self::get_on(tx, id)?;
-        ensure!(!old.deleted, Gone.error("deleted", "message removed"));
-        for (k, v) in conditions {
-            ensure!(
-                old.labels.get(k) == v.as_ref(),
-                Conflict.error("label_conflict", k.clone())
-            );
-        }
-        if set.iter().all(|(k, v)| old.labels.get(k) == Some(v))
-            && unset.iter().all(|k| !old.labels.contains_key(k))
-        {
-            return Ok(old);
-        }
-        for (k, v) in set {
-            tx.execute("INSERT INTO labels VALUES (?,?,?) ON CONFLICT(message_id,key) DO UPDATE SET value=excluded.value",params![id,k,v])?;
-        }
-        for k in unset {
-            tx.execute(
-                "DELETE FROM labels WHERE message_id=? AND key=?",
-                params![id, k],
-            )?;
-        }
-        Self::changed(
-            tx,
-            "labels.changed",
-            actor,
-            &old,
-            json!({"set":set,"unset":unset}),
-            false,
-        )
-    }
     pub fn react(&self, id: i64, actor: &str, emoji: &str, remove: bool) -> Result<Message> {
         self.write(|tx| {
             let a = self.access_on(tx)?;
@@ -1211,13 +1034,6 @@ pub fn owned_by(owner: &str, actor: &str) -> bool {
             .is_some_and(|(person, _)| person == actor)
 }
 
-pub(crate) fn labels_on(c: &Connection, id: i64) -> Result<BTreeMap<String, String>> {
-    Ok(
-        c.prepare("SELECT key,value FROM labels WHERE message_id=?")?
-            .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<_>>()?,
-    )
-}
 pub(crate) fn mentions(text: &str) -> impl Iterator<Item = String> + '_ {
     crate::prose::tokens(text)
         .into_iter()

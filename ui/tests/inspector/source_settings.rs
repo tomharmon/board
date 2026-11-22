@@ -113,105 +113,49 @@ fn an_inspect_launcher_non_utf8_board_path_opens_that_board_without_offering_a_c
 }
 
 #[test]
-fn empty_board_sync_settings_create_all_four_sources_and_opt_in_only_after_confirmation() {
+fn native_source_form_persists_to_the_selected_database() {
     let f = Fixture::new();
-    assert!(!f.db.exists());
-    let empty = Steps::sync().render(&f);
-    empty.expect_key("source-add");
-    empty.expect_text("No sources configured for this profile.");
-    for (provider, name, remote, kind) in [
-        ("github", "bugs", "sample/repo", Provider::Github),
-        ("slack", "chat", "C01234", Provider::Slack),
-        ("linear", "tickets", "ENG", Provider::Linear),
-        ("local", "stream", "events", Provider::Local),
-    ] {
-        let mut steps = Steps::sync();
-        steps.create(provider, name, remote, "work/review");
-        let tree = steps.render(&f);
-        tree.expect_key("source-configure");
-        tree.expect_key("source-copy-command");
-        tree.expect_text("Publishing off");
-        let command = if kind == Provider::Local {
-            format!("board sync import {name} event.json")
-        } else {
-            format!("board sync pull {name}")
-        };
-        tree.expect_text(&command);
-        let db = Board::open(&f.db).unwrap();
-        let cfg = db.source("reader", name).unwrap();
-        assert_eq!(cfg.provider, kind);
-        assert_eq!(cfg.remote, remote);
-        assert_eq!(cfg.channel, "work/review");
-        assert!(!cfg.outbound && !cfg.settings.mirror_roots && !cfg.settings.mirror_files);
-        if let Some(bin) = std::env::var_os("BOARD_UI_TEST_CLI") {
-            let out = Command::new(bin)
-                .args([
-                    "--db",
-                    f.db.to_str().unwrap(),
-                    "--json",
-                    "sources",
-                    "show",
-                    name,
-                ])
-                .env("BOARD_USER", "reader")
-                .env_remove("BOARD_PROFILE")
-                .env_remove("BOARD_TOKEN")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let source: Value = serde_json::from_slice(&out.stdout).unwrap();
-            assert_eq!(source["remote"], remote);
-            assert_eq!(source["outbound"], false);
-        }
+    let mut steps = Steps::sync();
+    steps.create("github", "bugs", "sample/repo", "work/review");
+    let tree = steps.render(&f);
+    tree.expect_key("source-configure");
+    tree.expect_text("Publishing off");
+    let cfg = Board::open(&f.db)
+        .unwrap()
+        .source("reader", "bugs")
+        .unwrap();
+    assert_eq!(cfg.remote, "sample/repo");
+    assert!(!cfg.outbound);
+    if let Some(bin) = std::env::var_os("BOARD_UI_TEST_CLI") {
+        let out = Command::new(bin)
+            .args([
+                "--db",
+                f.db.to_str().unwrap(),
+                "--json",
+                "sources",
+                "show",
+                "bugs",
+            ])
+            .env("BOARD_USER", "reader")
+            .env_remove("BOARD_PROFILE")
+            .env_remove("BOARD_TOKEN")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let source: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(source["remote"], cfg.remote);
+        assert_eq!(source["outbound"], false);
     }
-    let db = Board::open(&f.db).unwrap();
-    let mut settings = Steps::sync();
-    settings.tap("source-chat");
-    settings.tap("source-configure");
-    settings.tap("source-publish");
-    settings.tap("source-mirror-roots");
-    settings.tap("source-mirror-files");
-    settings.tap("source-display-authors");
-    settings.tap("source-settings-save");
-    settings.render(&f).expect_key("source-settings-confirm");
-    assert!(!db.source("reader", "chat").unwrap().outbound);
-    settings.tap("source-settings-confirm");
-    settings.render(&f).expect_text("Publishing on");
-    let chat = db.source("reader", "chat").unwrap();
-    assert!(
-        chat.outbound
-            && chat.settings.mirror_roots
-            && chat.settings.mirror_files
-            && chat.settings.display_authors
-    );
-    let mut github = Steps::sync();
-    github.tap("source-bugs");
-    github.tap("source-configure");
-    github.tap("source-gh-pulls");
-    github.tap("source-settings-save");
-    github.render(&f).expect_key("source-configure");
-    let gh = db.source("reader", "bugs").unwrap();
-    assert_eq!(gh.settings.github_items, GithubItems::Pulls);
-    assert!(!gh.outbound);
 }
 
 #[test]
-fn source_creation_retains_invalid_input_can_cancel_and_does_not_offer_setup_to_read_only_users() {
+fn delegated_source_form_requires_sync_permission_in_the_destination() {
     let f = Fixture::new();
-    let mut invalid = Steps::sync();
-    invalid.create("github", "demo", "not-a-repo", "work");
-    let tree = invalid.render(&f);
-    tree.expect_key("source-error");
-    tree.expect_text("expected GitHub OWNER/REPO");
-    invalid.tap("source-cancel");
-    let tree = invalid.render(&f);
-    assert!(!tree.has_key("source-name"));
     let db = Board::open(&f.db).unwrap();
-    assert!(db.sources("reader").unwrap().is_empty());
     db.set_grant("reader", None, "guest", &Rules::parse("work=read").unwrap())
         .unwrap();
     let bearer = db.issue_credential("reader", "guest", None, None).unwrap();

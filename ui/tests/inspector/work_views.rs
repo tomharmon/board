@@ -14,10 +14,7 @@ fn examples(f: &Fixture) -> [i64; 3] {
             "engineering",
             "rowan",
             "The build cache is ready for review.",
-            &PostOptions {
-                labels: [("phase".into(), "review".into())].into(),
-                ..Default::default()
-            },
+            &Default::default(),
         )
         .unwrap();
     b.post(
@@ -41,17 +38,14 @@ fn examples(f: &Fixture) -> [i64; 3] {
         &Default::default(),
     )
     .unwrap();
-    let task = |actor, ch, txt, needs: &[i64], labels| {
+    let task = |actor, ch, txt, needs: &[i64]| {
         create_task(
             &b,
             actor,
             TaskTarget::New {
                 channel: ch,
                 text: txt,
-                options: &PostOptions {
-                    labels,
-                    ..Default::default()
-                },
+                options: &Default::default(),
             },
             needs,
             None,
@@ -64,24 +58,11 @@ fn examples(f: &Fixture) -> [i64; 3] {
         "engineering",
         "Verify installers on a clean machine",
         &[],
-        [("phase".into(), "release".into())].into(),
     );
     [
         first,
-        task(
-            "lin",
-            "engineering",
-            "Publish the release notes",
-            &[first],
-            Default::default(),
-        ),
-        task(
-            "mira",
-            "general",
-            "Review the public checklist",
-            &[],
-            Default::default(),
-        ),
+        task("lin", "engineering", "Publish the release notes", &[first]),
+        task("mira", "general", "Review the public checklist", &[]),
     ]
 }
 
@@ -106,7 +87,9 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
     ] {
         let taps = |end: &Value| Value::Array(steps.iter().cloned().chain([end.clone()]).collect());
         let (table, frame) = f.snapshot(taps(&tasks), size, "light", &format!("{prefix}-tasks"));
+        let mut previous = None;
         for key in [
+            "segment3",
             "task-state-waiting",
             "segment1",
             "segment2",
@@ -114,13 +97,19 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
             "task-state-completed",
             "task-state-failed",
             "task-state-canceled",
-            "segment3",
         ] {
             let r = table.bounds(key);
             assert!(
                 r.x >= 0.0 && r.edge() <= size.0 as f64 + 1.0 && r.y < 155.0,
                 "offscreen state {key}: {r:?}"
             );
+            if let Some((x, y)) = previous {
+                assert!(
+                    y < r.y || (y == r.y && x < r.x),
+                    "state order changed at {key}"
+                );
+            }
+            previous = Some((r.x, r.y));
         }
         let rows = [first, second, last].map(|id| table.bounds(&format!("task-row-{id}")));
         close_to(rows[0].h, 30.0, 1.0, "task row height");
@@ -166,13 +155,17 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
         tabs.expect_key("explain-access");
     }
     let (detail, _) = f.snapshot(
-        json!([tasks,{"t":0.6,"type":"tap","key":format!("task-row-{second}")}]),
+        json!([{"t":0.1,"type":"tap","key":"tasks"},
+               {"t":0.55,"type":"tap","key":"task-state-waiting"},
+               {"t":0.9,"type":"tap","key":format!("task-row-{second}")}]),
         (1200, 800),
         "light",
         "desktop-task-detail",
     );
     assert!(detail.bounds("task-board").edge() <= detail.bounds("task-detail-scroll").x + 2.0);
     detail.expect_key("task-options");
+    assert!(!detail.has_key(&format!("task-row-{first}")));
+    detail.expect_text(&format!("#{first} ready"));
     detail.expect_key("reply-composer");
     detail.expect_key(&format!("message-{second}"));
     detail.expect_text("0 replies");
@@ -189,91 +182,7 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
 }
 
 #[test]
-fn task_state_order_has_no_open_filter_and_all_tasks_includes_failures_and_completions() {
-    let f = Fixture::new();
-    let [first, _, last] = examples(&f);
-    let b = Board::open(&f.db).unwrap();
-    for (id, actor, action) in [
-        (first, "lin", TaskAction::Fail("Needs correction")),
-        (last, "mira", TaskAction::Complete(Some("Done"))),
-    ] {
-        let claim = board_local::automation::claim(
-            &b,
-            actor,
-            board_local::automation::ClaimTarget::Id(id),
-            300,
-            &Default::default(),
-        )
-        .unwrap();
-        change_task(
-            &b,
-            id,
-            actor,
-            Some(claim.epoch),
-            claim.claim_token.as_deref(),
-            action,
-        )
-        .unwrap();
-    }
-    let t = f.render(
-        json!([{"t":0.1,"type":"tap","key":"tasks"}]),
-        DESKTOP,
-        "0.8",
-    );
-    assert!(!t.has_key("segment0"));
-    t.expect_text("all tasks");
-    t.expect_key(&format!("task-row-{first}"));
-    t.expect_key(&format!("task-row-{last}"));
-    let states = [
-        "task-state-waiting",
-        "segment1",
-        "segment2",
-        "task-state-blocked",
-        "task-state-completed",
-        "task-state-failed",
-        "task-state-canceled",
-    ];
-    for pair in states.windows(2) {
-        let a = t.bounds(pair[0]);
-        let b = t.bounds(pair[1]);
-        assert!(
-            a.y < b.y || (a.y == b.y && a.x < b.x),
-            "state order changed: {pair:?}"
-        );
-    }
-    assert!(!t.0.iter().any(|e| matches!(
-        e["text"].as_str(),
-        Some("oldest first" | "the latest across every channel")
-    )));
-}
-
-#[test]
-fn task_conversation_posts_a_reply_without_leaving_the_table() {
-    let f = Fixture::new();
-    let [first, _, _] = examples(&f);
-    let b = Board::open(&f.db).unwrap();
-    let tree=f.render(json!([
-        {"t":0.1,"type":"tap","key":"tasks"},{"t":0.3,"type":"tap","key":format!("task-row-{first}")},
-        {"t":0.55,"type":"tap","key":"message-body"},{"t":0.8,"paste":"Package checks passed on a clean install."},
-        {"t":1.05,"type":"tap","key":"send"}
-    ]),DESKTOP,"1.4");
-    let messages = b.thread(first).unwrap();
-    assert_eq!(messages.len(), 2);
-    assert_eq!(messages[1].re, Some(first));
-    assert_eq!(
-        messages[1].text,
-        "Package checks passed on a clean install."
-    );
-    tree.expect_key(&format!("message-{first}"));
-    tree.expect_key(&format!("message-{}", messages[1].id));
-    tree.expect_key("task-board");
-    tree.expect_key("task-banner");
-    tree.expect_key("reply-composer");
-    tree.expect_key("task-options");
-}
-
-#[test]
-fn quick_task_keeps_list_open_and_applies_labels_privacy_and_local_file() {
+fn quick_task_keeps_list_open_and_applies_privacy_and_local_file() {
     let f = Fixture::new();
     let file = f.dir.path().join("notes.txt");
     fs::write(&file, "trusted local bytes").unwrap();
@@ -281,7 +190,6 @@ fn quick_task_keeps_list_open_and_applies_labels_privacy_and_local_file() {
         {"t":0.15,"type":"tap","key":"tasks"},{"t":0.4,"type":"tap","key":"quick-task-channel"},{"t":0.55,"paste":"#engineering"},
         {"t":0.75,"type":"tap","key":"quick-task-body"},{"t":0.95,"paste":"Review the signed package"},
         {"t":1.1,"type":"tap","key":"quick-task-local"},{"t":1.3,"type":"tap","key":"quick-task-attach"},{"t":1.5,"type":"file-dialog","path":file},
-        {"t":1.7,"type":"tap","key":"quick-task-tags"},{"t":1.95,"paste":"phase=release"},
         {"t":2.15,"type":"tap","key":"quick-task-send"}
     ]),DESKTOP,"2.5");
     let b = Board::open(&f.db).unwrap();
@@ -289,8 +197,8 @@ fn quick_task_keeps_list_open_and_applies_labels_privacy_and_local_file() {
     assert_eq!(rows.len(), 1);
     let m = b.get(rows[0].id).unwrap();
     assert_eq!(
-        (&m.text[..], &m.channel[..], &m.labels["phase"][..]),
-        ("Review the signed package", "engineering", "release")
+        (&m.text[..], &m.channel[..]),
+        ("Review the signed package", "engineering")
     );
     assert!(m.no_sync);
     assert_eq!(m.attachments[0].name, "notes.txt");

@@ -24,6 +24,7 @@ pub struct MediaRequest {
     pub error: Option<String>,
 }
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct FileNotice {
     pub name: String,
     pub size: Option<i64>,

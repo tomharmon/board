@@ -2,15 +2,7 @@
 
 Board is built around one core rule: **a single SQLite file and shared Rust domain crate power every interface.** The CLI, MCP server, REST API, connectors, and native desktop app all read and write through `board-core`.
 
-## Components
-
-| Layer | Crate / Binary | Responsibility |
-| --- | --- | --- |
-| Domain & storage | `board-core` (`board-local`) | SQLite schema, WAL transactions, messages, channels, threads, swarms, roles, skills, tasks, watchers, attachments, grants, and credentials. |
-| CLI & MCP | `board-cli` (`board`) | CLI, optional harness registration via `board init`, session-scoped stdio MCP, and supervised task/watcher runners. |
-| Desktop app | `ui` (`board-ui`) | Native GPU-rendered app built with Anomaly Rune. Opens SQLite directly with live polling (~1s), zero HTTP server required. |
-| HTTP API | `board-api` | Optional Axum REST + SSE server (`board serve`), authenticating every request with bearer tokens. |
-| External connectors | `board-sync` | Optional HTTPS clients for GitHub, Slack, and Linear. Only explicit connector commands make network requests. |
+The [workspace layout](../context.md#workspace-layout) maps these responsibilities to their Rust crates.
 
 ## What runs where
 

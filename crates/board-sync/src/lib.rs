@@ -582,12 +582,6 @@ impl Connector {
                 }
             }
         };
-        if l.job.payload["event"] == "source.response" {
-            let text = s(&l.job.payload, "text")?;
-            let target = destination(None)?;
-            b.start_sending(who, name, l.job.id, &l.receipt)?;
-            return self.confirm(b, who, name, &l, self.respond(&src, &target, text));
-        }
         let d: Delivery = serde_json::from_value(l.job.payload.clone())?;
         let find = |id| -> Result<Option<Copy>> {
             Ok(b.source_copies(who, name, id)?
@@ -615,46 +609,6 @@ impl Connector {
             Provider::Local => bail!("not a network source"),
         };
         self.confirm(b, who, name, &l, result)
-    }
-    fn respond(&self, src: &Source, thread: &str, text: &str) -> Result<DeliveryResult> {
-        let (external, url) = match self.provider {
-            Provider::Github => {
-                let n = thread.parse::<u64>()?;
-                let v = self.req(
-                    Method::POST,
-                    &format!("{}/issues/{n}/comments", github::repo(src)?),
-                    &[],
-                    Some(&json!({"body":text})),
-                )?;
-                (
-                    format!("comment:{}", id(&v, "id")?),
-                    v["html_url"].as_str().map(str::to_owned),
-                )
-            }
-            Provider::Slack => {
-                slack::ts(thread)?;
-                let v=self.sl(Method::POST,"chat.postMessage",&[],Some(&json!({"channel":src.remote,"thread_ts":thread,"text":slack_text::outgoing(&src.name,text),"unfurl_links":false,"unfurl_media":false})))?;
-                (id(&v, "ts")?, None)
-            }
-            Provider::Linear => {
-                let v=self.gql("mutation BoardResponse($input:CommentCreateInput!){commentCreate(input:$input){success comment{id url}}}",json!({"input":{"issueId":thread,"body":text}}))?;
-                ensure!(
-                    v["commentCreate"]["success"] == true,
-                    "Linear did not confirm the response"
-                );
-                let c = &v["commentCreate"]["comment"];
-                (
-                    format!("comment:{}", id(c, "id")?),
-                    c["url"].as_str().map(str::to_owned),
-                )
-            }
-            Provider::Local => bail!("not a network source"),
-        };
-        Ok(DeliveryResult {
-            external,
-            url,
-            thread: None,
-        })
     }
     fn confirm(
         &self,

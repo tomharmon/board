@@ -14,27 +14,10 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
       CREATE TABLE IF NOT EXISTS exact_mentions(message_id INTEGER NOT NULL REFERENCES messages(id),actor TEXT NOT NULL,PRIMARY KEY(message_id,actor));
       CREATE INDEX IF NOT EXISTS exact_mention_actor ON exact_mentions(actor,message_id);
       CREATE TABLE IF NOT EXISTS composer_drafts(actor TEXT NOT NULL,scope TEXT NOT NULL,body TEXT NOT NULL,channel TEXT NOT NULL,reply_to INTEGER,PRIMARY KEY(actor,scope));")?;
-    crate::drafts::init(c)?;
-    // V4 indexed raw @ signs (including code); rebuild in bounded batches.
-    let mut after = 0;
-    loop {
-        let rows = c
-            .prepare("SELECT id,text FROM messages WHERE id>? ORDER BY id LIMIT 128")?
-            .query_map([after], |r| {
-                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        if rows.is_empty() {
-            break;
-        }
-        for (id, text) in rows {
-            crate::core::update_mentions(c, id, &text)?;
-            after = id;
-        }
-    }
-    Ok(())
+    crate::drafts::init(c)
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct ActorEntry {
     pub id: String,
     pub handle: String,
@@ -46,12 +29,16 @@ pub struct ActorEntry {
     pub local: bool,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MentionActor {
     pub id: String,
     pub handle: String,
     pub name: String,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct MentionResolution {
     pub written: String,
     pub actor: Option<MentionActor>,

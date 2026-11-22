@@ -28,68 +28,6 @@ fn field(
         )
 }
 
-fn labels(p: &Properties, m: &Message) -> El {
-    let mut list = col().w_full().gap(5.0);
-    if m.labels.is_empty() {
-        list = list.child(label("No labels", 13.0, 450.0, MUTED));
-    }
-    for (i, (key, value)) in m.labels.iter().enumerate() {
-        let (k, v) = (key.clone(), value.clone());
-        list = list.child(
-            click(
-                row()
-                    .key(format!("label-row-{i}"))
-                    .w_full()
-                    .center_y()
-                    .gap(10.0)
-                    .py(7.0)
-                    .border_sides([0.0, 0.0, 1.0, 0.0], c(EDGE)),
-                &format!("Edit label {key}"),
-            )
-            .child(mono(key, DIM).w(100.0).wrap_anywhere())
-            .child(
-                label(value, 14.0, 500.0, INK)
-                    .grow(1.0)
-                    .min_w(0.0)
-                    .wrap_anywhere(),
-            )
-            .disabled(key.starts_with("board."))
-            .on_press_tx(move |s: &mut State, tx| {
-                if let Some(p) = &mut s.properties {
-                    p.select_label(&k, &v);
-                }
-                tx.focus_when_shown("label-value", true);
-            }),
-        );
-    }
-    let empty = p.label_key.text.trim().is_empty();
-    col()
-        .w_full()
-        .gap(13.0)
-        .child(list)
-        .child(field(&p.label_key, "label-key", "Label key", |p| {
-            &mut p.label_key
-        }))
-        .child(field(&p.label_value, "label-value", "Value", |p| {
-            &mut p.label_value
-        }))
-        .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .child(
-                    action("set-label", "Set label", true)
-                        .disabled(empty)
-                        .on_press(|s: &mut State| s.change_label(false)),
-                )
-                .child(
-                    action("unset-label", "Remove label", false)
-                        .disabled(empty)
-                        .on_press(|s: &mut State| s.change_label(true)),
-                ),
-        )
-}
-
 fn reactions(p: &Properties, m: &Message, actor: &str) -> El {
     let mut list = col().w_full().gap(5.0);
     if m.reactions.is_empty() {
@@ -305,14 +243,13 @@ pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
     );
     let can_edit = board_local::owned_by(&m.actor, &s.actor);
     let tabs: &[&str] = if can_edit {
-        &["Labels", "Reactions", "Edit"]
+        &["Reactions", "Edit"]
     } else {
-        &["Labels", "Reactions"]
+        &["Reactions"]
     };
     let (index, body) = match p.property {
-        Property::Labels => (0, labels(p, m)),
-        Property::Reactions => (1, reactions(p, m, &s.actor)),
-        Property::Body => (2, editor(p)),
+        Property::Reactions => (0, reactions(p, m, &s.actor)),
+        Property::Body => (1, editor(p)),
     };
     panel = panel
         .child(
@@ -322,8 +259,7 @@ pub(super) fn view(s: &State, p: &Properties, m: &Message, inset: f32) -> El {
                 .on_pick(|s: &mut State, i, tx| {
                     if let Some(p) = &mut s.properties {
                         let (prop, key) = match i {
-                            0 => (Property::Labels, "label-key"),
-                            1 => (Property::Reactions, "reaction-name"),
+                            0 => (Property::Reactions, "reaction-name"),
                             _ => (Property::Body, "edit-body"),
                         };
                         p.property = prop;

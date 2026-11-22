@@ -5,56 +5,20 @@ use crate::{
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, params, params_from_iter, types::Value as Bind};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 
 #[derive(Default, Clone, Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Filter {
     pub channel: Option<String>,
     pub from: Option<String>,
     pub by: Option<String>,
     pub text: Option<String>,
-    pub labels: BTreeMap<String, String>,
-    /// Structured query terms distinguish "key" (present) from "key=" (exactly empty).
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub label_terms: Vec<LabelTerm>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tasks_only: bool,
     pub after: Option<i64>,
     pub re: Option<i64>,
     pub mentions: Option<String>,
-}
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct LabelTerm {
-    pub key: String,
-    pub values: Option<Vec<String>>,
-}
-impl LabelTerm {
-    pub fn parse(raw: &[String]) -> Result<Vec<Self>> {
-        ensure!(raw.len() <= 32, "at most 32 label filters");
-        raw.iter()
-            .map(|term| {
-                let (k, v) = term
-                    .split_once('=')
-                    .map_or((term.as_str(), None), |(k, v)| (k, Some(v)));
-                crate::core::validate_label_key(k)?;
-                ensure!(
-                    v.is_none_or(|s| s.len() <= 2048),
-                    "label filter is too long"
-                );
-                Ok(Self {
-                    key: k.into(),
-                    values: v.map(|v| v.split('|').map(str::to_string).collect()),
-                })
-            })
-            .collect()
-    }
-    fn matches(&self, v: Option<&String>) -> bool {
-        v.is_some_and(|v| {
-            self.values
-                .as_ref()
-                .is_none_or(|options| options.contains(v))
-        })
-    }
 }
 impl Filter {
     /// Resolve viewer-relative selectors before persisting or reusing a filter.
@@ -87,17 +51,6 @@ impl Filter {
                 && !s.chars().any(char::is_control)),
             "invalid source filter"
         );
-        ensure!(
-            self.labels.len() + self.label_terms.len() <= 32,
-            "at most 32 label filters"
-        );
-        for k in self
-            .labels
-            .keys()
-            .chain(self.label_terms.iter().map(|t| &t.key))
-        {
-            crate::core::validate_label_key(k)?;
-        }
         Ok(())
     }
 }
@@ -154,8 +107,6 @@ pub struct Event {
     pub payload: serde_json::Value,
     #[serde(skip)]
     previous: Option<Message>,
-    #[serde(skip)]
-    root_labels: BTreeMap<String, String>,
 }
 
 fn channel_match(f: &str, s: &str) -> bool {
@@ -164,9 +115,6 @@ fn channel_match(f: &str, s: &str) -> bool {
     } else {
         s == f
     }
-}
-pub(crate) fn label_match(f: &str, actual: Option<&String>) -> bool {
-    actual.is_some_and(|s| f.is_empty() || f.split('|').any(|p| p == s))
 }
 impl Event {
     pub fn matches(&self, f: &Filter) -> bool {
@@ -201,12 +149,7 @@ impl Event {
                 && f.mentions.as_ref().is_none_or(|who| {
                     crate::core::mentions(&m.text).any(|h| crate::prose::matches(&h, who))
                 })
-                && f.label_terms.iter().all(|t| {
-                    t.matches(m.labels.get(&t.key)) || t.matches(self.root_labels.get(&t.key))
-                })
-                && f.labels.iter().all(|(k, v)| {
-                    label_match(v, m.labels.get(k)) || label_match(v, self.root_labels.get(k))
-                })
+                && (!f.tasks_only || m.task.is_some())
         };
         self.message.as_ref().is_some_and(matches)
             || self.previous.as_ref().is_some_and(matches)
@@ -216,8 +159,7 @@ impl Event {
                 && f.by.is_none()
                 && f.re.is_none()
                 && f.text.is_none()
-                && f.labels.is_empty()
-                && f.label_terms.is_empty()
+                && !f.tasks_only
                 && f.mentions.is_none())
     }
 }
@@ -282,27 +224,8 @@ pub(crate) fn predicate(f: &Filter) -> (String, Vec<Bind>) {
             bind.push(format!("{h}{sep}").into());
         }
     }
-    for (k, v) in &f.labels {
-        sql.push_str(" AND EXISTS(SELECT 1 FROM labels l WHERE (l.message_id=m.id OR l.message_id=m.re) AND l.key=?");
-        bind.push(k.clone().into());
-        if !v.is_empty() {
-            sql.push_str(" AND l.value IN (SELECT value FROM json_each(?))");
-            bind.push(
-                serde_json::json!(v.split('|').collect::<Vec<_>>())
-                    .to_string()
-                    .into(),
-            );
-        }
-        sql.push(')');
-    }
-    for term in &f.label_terms {
-        sql.push_str(" AND EXISTS(SELECT 1 FROM labels l WHERE (l.message_id=m.id OR l.message_id=m.re) AND l.key=?");
-        bind.push(term.key.clone().into());
-        if let Some(v) = &term.values {
-            sql.push_str(" AND l.value IN (SELECT value FROM json_each(?))");
-            bind.push(serde_json::json!(v).to_string().into());
-        }
-        sql.push(')');
+    if f.tasks_only {
+        sql.push_str(" AND EXISTS(SELECT 1 FROM tasks t WHERE t.id=m.id)");
     }
     (sql, bind)
 }
@@ -545,8 +468,7 @@ impl Board {
             || f.mentions.is_some()
             || f.re.is_some()
             || f.text.is_some()
-            || !f.labels.is_empty()
-            || !f.label_terms.is_empty()
+            || f.tasks_only
         {
             let filter = Filter {
                 after: None,
@@ -622,7 +544,7 @@ impl Board {
             .1)
     }
     pub(crate) fn events_on(conn: &Connection, after: i64, limit: usize) -> Result<Vec<Event>> {
-        let mut stmt=conn.prepare("SELECT cursor,kind,actor,created_at,payload,message,previous,root_labels FROM events WHERE cursor>? ORDER BY cursor LIMIT ?")?;
+        let mut stmt=conn.prepare("SELECT cursor,kind,actor,created_at,payload,message,previous FROM events WHERE cursor>? ORDER BY cursor LIMIT ?")?;
         let mut rs = stmt.query(params![after, limit.min(1000) as i64])?;
         let mut out = Vec::new();
         while let Some(r) = rs.next()? {
@@ -640,7 +562,6 @@ impl Board {
                 payload: serde_json::from_str(&r.get::<_, String>(4)?)?,
                 message: msg(5)?,
                 previous: msg(6)?,
-                root_labels: serde_json::from_str(&r.get::<_, String>(7)?)?,
             });
         }
         Ok(out)

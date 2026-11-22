@@ -9,6 +9,16 @@ fn badge(s: &str, ink: &str, bg: &str) -> El {
         .radius(3.)
         .fill(c(bg))
 }
+fn thread_link(key: String, title: String, id: i64) -> El {
+    click(
+        label(&title, 13., 500., INK)
+            .key(key)
+            .wrap_anywhere()
+            .py(3.),
+        &title,
+    )
+    .on_press(move |s: &mut State| s.open_message_thread(id))
+}
 fn pager(s: &State, runs: bool) -> El {
     let o = &s.desk.swarm;
     let (key, older, prev) = if runs {
@@ -134,8 +144,6 @@ fn roster(s: &State, run: &SwarmRun) -> El {
         let expand = name.clone();
         let selected = o.worker.as_deref() == Some(&name);
         let expanded = o.briefs.contains(&name);
-        let off = o.offline.contains(&w.id);
-        let state = if off { "Offline waiter" } else { &w.status };
         let mut member = col()
             .key(format!("swarm-member-{name}"))
             .w_full()
@@ -202,21 +210,17 @@ fn roster(s: &State, run: &SwarmRun) -> El {
                     .flex_wrap()
                     .child(badge(w.role_slug.as_deref().unwrap_or("worker"), DIM, TINT))
                     .child(
-                        mono(state, if off { ERROR } else { MUTED })
-                            .key(format!("swarm-state-{name}")),
+                        mono(format!("Last recorded: {}", w.status), MUTED)
+                            .key(format!("swarm-state-{name}"))
+                            .wrap_anywhere(),
                     ),
             );
         member = member.child(
             mono(
-                w.last_activity_at
-                    .as_ref()
-                    .map(|at| {
-                        format!(
-                            "Last swarm activity {}",
-                            messages::relative(at, chrono::Utc::now())
-                        )
-                    })
-                    .unwrap_or_else(|| "No worker activity recorded".into()),
+                format!(
+                    "Updated {}",
+                    messages::relative(&w.updated_at, chrono::Utc::now())
+                ),
                 FAINT,
             )
             .w_full()
@@ -226,6 +230,13 @@ fn roster(s: &State, run: &SwarmRun) -> El {
             member = member.child(label(error, 12., 400., ERROR).w_full().wrap_anywhere());
         }
         if expanded {
+            if let Some(id) = w.thread_id {
+                member = member.child(thread_link(
+                    format!("swarm-brief-thread-{name}"),
+                    format!("Work thread #{id}"),
+                    id,
+                ));
+            }
             member = member
                 .child(
                     label(&w.brief, 13., 400., DIM)
@@ -245,6 +256,7 @@ fn roster(s: &State, run: &SwarmRun) -> El {
                 ("Reported model", w.model.as_deref()),
                 ("Workspace mode", w.workspace_mode.as_deref()),
                 ("Session reference", w.session_ref.as_deref()),
+                ("Last swarm activity", w.last_activity_at.as_deref()),
             ] {
                 if let Some(v) = val {
                     member = member.child(
@@ -421,17 +433,6 @@ fn overview(s: &State) -> El {
     let o = &s.desk.swarm;
     let Some(view) = &o.overview else { return el() };
     let mut body = col().w_full().px(10.).py(8.).gap(5.);
-    let link = |key: String, title: String, id: i64| {
-        click(
-            label(&title, 13., 500., INK)
-                .key(key)
-                .w_full()
-                .wrap_anywhere()
-                .py(3.),
-            &title,
-        )
-        .on_press(move |s: &mut State| s.open_message_thread(id))
-    };
     let pages = |tasks: bool, back: bool, next: Option<i64>| {
         let prefix = if tasks {
             "swarm-threads"
@@ -481,7 +482,7 @@ fn overview(s: &State) -> El {
         body = body.child(mono("No open actions on this page", MUTED));
     }
     for a in &view.actions {
-        body = body.child(link(
+        body = body.child(thread_link(
             format!("swarm-action-{}", a.cursor),
             format!(
                 "{} · {} · {}",
@@ -499,88 +500,85 @@ fn overview(s: &State) -> El {
             view.next_action_after,
         ))
         .child(rule())
-        .child(label("Task threads", 15., 600., INK));
+        .child(label("Work threads", 15., 600., INK));
     if view.threads.is_empty() {
-        body = body.child(mono("No task threads on this page", MUTED));
+        body = body.child(mono("No work threads on this page", MUTED));
     }
-    let mut groups = std::collections::BTreeMap::new();
     for t in &view.threads {
-        groups
-            .entry(t.workstream.as_deref().unwrap_or("Ungrouped"))
-            .or_insert_with(Vec::new)
-            .push(t);
-    }
-    for (group, tasks) in groups {
-        body = body.child(label(group, 13., 600., DIM).py(3.).wrap_anywhere());
-        for t in tasks {
-            let id = t.id;
-            let expanded = o.explain_task == Some(id);
-            let owner = t
-                .claimant
-                .as_deref()
-                .or(t.assignee.as_deref())
-                .unwrap_or("Unassigned");
-            body = body
-                .child(link(
-                    format!("swarm-task-{}", t.id),
-                    format!("#{}  {}", t.id, t.title),
-                    t.id,
-                ))
+        let id = t.id;
+        let expanded = o.explain_task == Some(id);
+        let owner = t
+            .claimant
+            .as_deref()
+            .or(t.assignee.as_deref())
+            .unwrap_or("Unassigned");
+        body = body.child(thread_link(
+            format!("swarm-task-{}", t.id),
+            format!("#{}  {}", t.id, t.title),
+            t.id,
+        ));
+        let mut status = row().center_y().gap(6.);
+        if !t.briefed_workers.is_empty() {
+            let names = t
+                .briefed_workers
+                .iter()
+                .map(|w| format!("@{w}"))
+                .collect::<Vec<_>>();
+            status = status.child(mono(names.join(", "), MUTED).wrap_anywhere());
+        }
+        if t.state != "thread" {
+            status = status
+                .child(mono(format!("{} · {owner}", t.state), MUTED).wrap_anywhere())
                 .child(
-                    row()
-                        .center_y()
-                        .gap(6.)
-                        .child(mono(format!("{} · {owner}", t.state), MUTED).wrap_anywhere())
-                        .child(
-                            tool(
-                                &format!("swarm-explain-{id}"),
-                                "Explain task status",
-                                if expanded {
-                                    &glyphs::CHEVRON_UP
-                                } else {
-                                    &glyphs::CHEVRON_DOWN
-                                },
-                            )
-                            .expanded(expanded)
-                            .on_press(move |s: &mut State| {
-                                s.desk.swarm.explain_task = (!expanded).then_some(id);
-                                s.refresh();
-                            }),
-                        ),
+                    tool(
+                        &format!("swarm-explain-{id}"),
+                        "Explain task status",
+                        if expanded {
+                            &glyphs::CHEVRON_UP
+                        } else {
+                            &glyphs::CHEVRON_DOWN
+                        },
+                    )
+                    .expanded(expanded)
+                    .on_press(move |s: &mut State| {
+                        s.desk.swarm.explain_task = (!expanded).then_some(id);
+                        s.refresh();
+                    }),
                 );
-            if let Some(why) = o.explanation.as_ref().filter(|e| e.task_id == id) {
-                for step in &why.steps {
-                    body = body.child(link(
-                        format!("swarm-explain-step-{}", step.id),
-                        format!(
-                            "#{} {} · {}: {}",
-                            step.id, step.title, step.state, step.reason
-                        ),
-                        step.id,
+        }
+        body = body.child(status);
+        if let Some(why) = o.explanation.as_ref().filter(|e| e.task_id == id) {
+            for step in &why.steps {
+                body = body.child(thread_link(
+                    format!("swarm-explain-step-{}", step.id),
+                    format!(
+                        "#{} {} · {}: {}",
+                        step.id, step.title, step.state, step.reason
+                    ),
+                    step.id,
+                ));
+                if let Some((source, title)) = step.review_link() {
+                    body = body.child(thread_link(
+                        format!("swarm-explain-review-{source}"),
+                        title,
+                        source,
                     ));
-                    if let Some((source, title)) = step.review_link() {
-                        body = body.child(link(
-                            format!("swarm-explain-review-{source}"),
-                            title,
-                            source,
-                        ));
-                    }
-                }
-                if why.truncated {
-                    body = body.child(mono("Further prerequisites omitted.", MUTED));
                 }
             }
-            for (name, id) in [
-                ("Handoff", t.latest_handoff),
-                ("Verification", t.latest_check),
-            ] {
-                if let Some(id) = id {
-                    body = body.child(link(
-                        format!("swarm-task-{}-{name}", t.id),
-                        format!("{name} #{id}"),
-                        id,
-                    ));
-                }
+            if why.truncated {
+                body = body.child(mono("Further prerequisites omitted.", MUTED));
+            }
+        }
+        for (name, id) in [
+            ("Handoff", t.latest_handoff),
+            ("Verification", t.latest_check),
+        ] {
+            if let Some(id) = id {
+                body = body.child(thread_link(
+                    format!("swarm-task-{}-{name}", t.id),
+                    format!("{name} #{id}"),
+                    id,
+                ));
             }
         }
     }
@@ -716,25 +714,28 @@ pub(super) fn view(s: &State, inset: f32, narrow: bool) -> El {
                 .help(&run.goal)
                 .selectable(true),
         );
-    let mut meta = row().w_full().center_y().gap(7.).flex_wrap().child(
-        mono(
-            format!(
-                "#{} · {} entries · {} workers",
-                run.channel,
-                run.activity_count,
-                run.workers.len()
-            ),
-            MUTED,
-        )
-        .wrap_anywhere(),
-    );
-    if !o.offline.is_empty() {
-        meta = meta.child(badge(
-            &format!("{} offline", o.offline.len()),
-            DEL_INK,
-            DEL_BG,
-        ));
-    }
+    let mut meta = row()
+        .w_full()
+        .center_y()
+        .gap(7.)
+        .flex_wrap()
+        .child(thread_link(
+            "swarm-goal-thread".into(),
+            format!("Goal thread #{}", run.thread_id),
+            run.thread_id,
+        ))
+        .child(
+            mono(
+                format!(
+                    "#{} · {} entries · {} workers",
+                    run.channel,
+                    run.activity_count,
+                    run.workers.len()
+                ),
+                MUTED,
+            )
+            .wrap_anywhere(),
+        );
     if run.status == "active" && run.notifications_sent >= run.max_notifications {
         meta = meta.child(badge("Notification limit reached", DEL_INK, DEL_BG));
     }

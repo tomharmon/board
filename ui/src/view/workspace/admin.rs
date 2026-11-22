@@ -178,7 +178,7 @@ fn actions<'a>(values: impl IntoIterator<Item = &'a board_local::access::Action>
             Read => "read",
             Post => "post",
             React => "react",
-            Label => "label",
+            Task => "task",
             Sync => "sync",
             Manage => "manage",
         })

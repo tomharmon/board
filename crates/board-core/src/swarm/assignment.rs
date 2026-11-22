@@ -1,11 +1,13 @@
 use super::*;
-use crate::roles::{PinnedSkill, SWARM_WORKER_PROTOCOL};
+use crate::roles::SWARM_WORKER_PROTOCOL;
 
 #[derive(Serialize)]
 pub struct Assignment {
     pub run: String,
     pub channel: String,
+    pub thread_id: i64,
     pub goal: String,
+    pub repo_root: Option<String>,
     pub worker: SwarmWorker,
     pub protocol: &'static str,
     pub role_prompt: String,
@@ -28,26 +30,17 @@ pub struct AssignmentFile {
 }
 
 impl Board {
-    pub(super) fn pinned_assignment(c: &Connection, id: i64) -> Result<(String, Vec<PinnedSkill>)> {
-        let (prompt, json): (String, String) = c.query_row(
-            "SELECT pinned_system_prompt,pinned_skills_json FROM swarm_workers WHERE id=?",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok((prompt, serde_json::from_str(&json)?))
-    }
-
     fn own_worker(
         &self,
         c: &Connection,
         binding: &WorkerBinding,
     ) -> Result<(SwarmRun, SwarmWorker)> {
-        let (_, run) = self.swarm_record(c, &binding.actor, &binding.run, Action::Read)?;
+        let (a, run) = self.swarm_record(c, &binding.actor, &binding.run, Action::Read)?;
         let worker = c
             .query_row(
                 &format!("{WORKER_SELECT} WHERE w.run_id=? AND w.actor=? AND w.name=?"),
                 params![run.id, binding.actor, binding.name],
-                worker,
+                |s| worker(s, &a),
             )
             .optional()?
             .filter(|_| run.id == binding.run_id)
@@ -89,7 +82,9 @@ impl Board {
         Ok(Assignment {
             run: r.slug,
             channel: r.channel,
+            thread_id: r.thread_id,
             goal: r.goal,
+            repo_root: r.repo_root,
             worker,
             protocol: SWARM_WORKER_PROTOCOL,
             role_prompt,

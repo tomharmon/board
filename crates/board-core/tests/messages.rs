@@ -1,7 +1,6 @@
 use anyhow::Result;
 use board_local::{Board, Filter, PostOptions};
 use serde_json::json;
-use std::collections::BTreeMap;
 use std::sync::{Arc, Barrier};
 use std::thread;
 
@@ -9,7 +8,6 @@ use std::thread;
 fn message_workflow_profiles_attachments_and_tombstones() -> Result<()> {
     let db = Board::memory()?;
     let opts = PostOptions {
-        labels: BTreeMap::from([("status".into(), "open".into())]),
         files: vec![("evidence.bin".into(), vec![0, 10, 255])],
         ..Default::default()
     };
@@ -28,13 +26,11 @@ fn message_workflow_profiles_attachments_and_tombstones() -> Result<()> {
     assert!(db.edit(root.id, "ada/sibling", "not mine", None).is_err());
     assert!(db.delete(root.id, "bob", None).is_err());
     let reacted = db.react(root.id, "bob", ":eyes:", false)?;
-    let labeled = db.label(root.id, "ada", "status", Some("closed"))?;
     assert_eq!(reacted.revision, root.revision);
-    assert_eq!(labeled.revision, root.revision);
-    assert!(root.version < reacted.version && reacted.version < labeled.version);
+    assert!(root.version < reacted.version);
     assert_eq!(
         db.react(root.id, "bob", "eyes", false)?.version,
-        labeled.version
+        reacted.version
     );
     let edited = db.edit(root.id, "ada", "corrected", Some(root.revision))?;
     assert!(edited.revision > root.revision);
@@ -42,10 +38,7 @@ fn message_workflow_profiles_attachments_and_tombstones() -> Result<()> {
     let removed = db.delete(root.id, "ada", Some(edited.revision))?;
     assert!(removed.deleted && removed.revision > edited.revision);
     assert!(
-        removed.text.is_empty()
-            && removed.attachments.is_empty()
-            && removed.labels.is_empty()
-            && removed.reactions.is_empty()
+        removed.text.is_empty() && removed.attachments.is_empty() && removed.reactions.is_empty()
     );
     assert_eq!(db.thread(root.id)?.len(), 3);
     assert_eq!(
@@ -54,7 +47,6 @@ fn message_workflow_profiles_attachments_and_tombstones() -> Result<()> {
         "a tombstone drops its placement, not the immutable upload"
     );
     assert!(db.edit(root.id, "ada", "revive", None).is_err());
-    assert!(db.label(root.id, "bob", "status", Some("open")).is_err());
     assert!(db.react(root.id, "bob", "eyes", false).is_err());
     Ok(())
 }
@@ -162,31 +154,6 @@ fn local_deployment_schema_validates_without_opening_its_address() -> Result<()>
 }
 
 #[test]
-fn a_v1_deployment_schema_keeps_its_meaning_and_registrant_after_upgrade() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("schemas.db");
-    let schema = json!({"type":"object","required":["run"]});
-    let db = Board::open(&path)?;
-    db.register_schema_as("old-name", 7, "legacy", &schema, "old-editor")?;
-    drop(db);
-    let fixture = rusqlite::Connection::open(&path)?;
-    fixture.execute_batch("DROP TABLE schema_origins; DELETE FROM schemas WHERE name IN ('deployment','diff','verdict');
-        UPDATE schemas SET name='deployment' WHERE name='old-name';
-        UPDATE events SET payload=json_set(payload,'$.name','deployment') WHERE kind='schema.registered';
-        PRAGMA user_version=1;")?;
-    drop(fixture);
-    let db = Board::open(&path)?;
-    let rows = db.schemas()?;
-    assert_eq!(rows.len(), 8);
-    let legacy = rows.iter().find(|row| row.id == "deployment@7").unwrap();
-    assert_eq!(legacy.schema, schema);
-    assert!(!legacy.built_in && legacy.by.as_deref() == Some("old-editor"));
-    assert!(!db.register_schema_as("deployment", 7, "legacy", &schema, "other")?);
-    assert!(db.register_schema_as("deployment", 8, "legacy", &schema, "old-editor")?);
-    Ok(())
-}
-
-#[test]
 fn idempotency_and_latest_guards_survive_changes_and_restart() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("test.db");
@@ -211,7 +178,6 @@ fn idempotency_and_latest_guards_survive_changes_and_restart() -> Result<()> {
         (first.clone(), false)
     );
     opts.files[0].1.push(1);
-    opts.labels.insert("status".into(), "different".into());
     assert_eq!(
         db.reply(root.id, "ada/test", "different words", &opts)?,
         first
@@ -318,7 +284,7 @@ where
 }
 
 #[test]
-fn independent_writers_linearize_retry_revision_labels_and_latest_reply() -> Result<()> {
+fn independent_writers_linearize_retry_revision_and_latest_reply() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("race.db");
     let db = Board::open(&path)?;
@@ -338,17 +304,6 @@ fn independent_writers_linearize_retry_revision_labels_and_latest_reply() -> Res
         b.edit(id, "ada", &format!("edit {i}"), Some(id))
     })?;
     assert_eq!(wins.iter().filter(|r| r.is_ok()).count(), 1);
-    let cond = BTreeMap::from([("owner".into(), None)]);
-    let wins = race(&path, |b, i| {
-        b.labels(
-            id,
-            "ada",
-            &BTreeMap::from([("owner".into(), format!("p{i}"))]),
-            &[],
-            &cond,
-        )
-    })?;
-    assert_eq!(wins.iter().filter(|r| r.is_ok()).count(), 1);
     let opts = PostOptions {
         after: Some(id),
         ..Default::default()
@@ -357,7 +312,7 @@ fn independent_writers_linearize_retry_revision_labels_and_latest_reply() -> Res
         b.reply(id, "ada", &format!("reply {i}"), &opts)
     })?;
     assert_eq!(wins.iter().filter(|r| r.is_ok()).count(), 1);
-    assert_eq!(db.events(0, 100)?.len(), 4);
+    assert_eq!(db.events(0, 100)?.len(), 3);
     let competing = PostOptions {
         key: Some("board-wide".into()),
         ..Default::default()
@@ -366,7 +321,7 @@ fn independent_writers_linearize_retry_revision_labels_and_latest_reply() -> Res
         b.post("dev", &format!("actor{i}"), "one owner", &competing)
     })?;
     assert_eq!(wins.iter().filter(|r| r.is_ok()).count(), 1);
-    assert_eq!(db.events(0, 100)?.len(), 5);
+    assert_eq!(db.events(0, 100)?.len(), 4);
     Ok(())
 }
 
@@ -431,10 +386,7 @@ fn subtree_search_event_snapshots_and_filtered_page_resume() -> Result<()> {
         "inbox/a",
         "ada/agent",
         "Caf\u{e9} @bo/helper",
-        &PostOptions {
-            labels: BTreeMap::from([("stage".into(), "open".into())]),
-            ..Default::default()
-        },
+        &Default::default(),
     )?;
     let other = db.post("inbox", "ada", "caf\u{c9} @bo", &Default::default())?;
     let late = db.reply(
@@ -481,23 +433,7 @@ fn subtree_search_event_snapshots_and_filtered_page_resume() -> Result<()> {
         f.after = Some(next);
     }
     assert_eq!(ids, [root.id, other.id, late.id]);
-    let watched = Filter {
-        labels: BTreeMap::from([("stage".into(), "open|held".into())]),
-        ..scope
-    };
-    let event = db.label(root.id, "ada", "stage", Some("done"))?;
-    let matches = db
-        .events(0, 100)?
-        .into_iter()
-        .filter(|e| e.matches(&watched))
-        .map(|e| e.cursor)
-        .collect::<Vec<_>>();
-    assert_eq!(
-        matches,
-        [root.id, late.id, event.version],
-        "root labels are frozen at delivery time; closing event matches before state"
-    );
-    assert!(db.messages(&watched, 100)?.is_empty());
+    assert!(serde_json::from_value::<Filter>(serde_json::json!({"labels":{}})).is_err());
     Ok(())
 }
 

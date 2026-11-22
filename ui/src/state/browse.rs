@@ -1,6 +1,5 @@
 use super::*;
 use anyhow::ensure;
-use board_local::LabelTerm;
 
 const REPLIES: usize = 40;
 
@@ -51,7 +50,6 @@ pub struct Browse {
     pub from: TextEdit,
     pub words: TextEdit,
     pub mention: TextEdit,
-    pub labels: TextEdit,
     pub jump_open: bool,
     pub jump: TextEdit,
     pub position: Position,
@@ -76,7 +74,6 @@ impl Default for Browse {
             from: TextEdit::new(""),
             words: TextEdit::new(""),
             mention: TextEdit::new(""),
-            labels: TextEdit::new(""),
             jump_open: false,
             jump: TextEdit::new(""),
             position: Position::Latest,
@@ -147,10 +144,7 @@ impl Browse {
         Ok(std::iter::once(latest.message).chain(replies).collect())
     }
     pub fn has_filters(&self) -> bool {
-        self.filter.by.is_some()
-            || self.filter.from.is_some()
-            || self.filter.mentions.is_some()
-            || !self.filter.label_terms.is_empty()
+        self.filter.by.is_some() || self.filter.from.is_some() || self.filter.mentions.is_some()
     }
 }
 impl State {
@@ -214,48 +208,22 @@ impl State {
             b.author = TextEdit::new(b.filter.by.as_deref().unwrap_or(""));
             b.from = TextEdit::new(b.filter.from.as_deref().unwrap_or(""));
             b.mention = TextEdit::new(b.filter.mentions.as_deref().unwrap_or(""));
-            b.labels = TextEdit::new(
-                b.filter
-                    .label_terms
-                    .iter()
-                    .map(|l| {
-                        l.values
-                            .as_ref()
-                            .map_or_else(|| l.key.clone(), |v| format!("{}={}", l.key, v.join("|")))
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            );
             tx.focus_when_shown("filter-author", true);
         }
     }
 
     pub fn apply_filters(&mut self) {
         let b = &mut self.browse;
-        let terms = b
-            .labels
-            .text
-            .lines()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        match LabelTerm::parse(&terms) {
-            Ok(labels) => {
-                let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
-                b.filter.by = opt(&b.author.text);
-                b.filter.from = opt(&b.from.text);
-                b.filter.mentions = opt(&b.mention.text);
-                b.filter.label_terms = labels;
-                self.query = TextEdit::new(b.words.text.trim());
-                b.filter_open = false;
-                self.reset_feed();
-                self.desk.first_page();
-                self.error = None;
-                self.refresh();
-            }
-            Err(e) => self.error = Some(e.to_string()),
-        }
+        let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_owned());
+        b.filter.by = opt(&b.author.text);
+        b.filter.from = opt(&b.from.text);
+        b.filter.mentions = opt(&b.mention.text);
+        self.query = TextEdit::new(b.words.text.trim());
+        b.filter_open = false;
+        self.reset_feed();
+        self.desk.first_page();
+        self.error = None;
+        self.refresh();
     }
 
     pub fn clear_filters(&mut self) {
@@ -335,7 +303,7 @@ mod tests {
             .unwrap();
         let mut db = Board::open(&path).unwrap();
         db.bind_token(&token.token).unwrap();
-        let mut state = State::opened(Ok((db, Some("reader".to_owned()))));
+        let mut state = State::test_board(db, Some("reader"));
         state.go(Page::Thread(root.id));
         let mut rt = Runtime::new(state, crate::view::view, (1200., 800.), Env::default());
         let clip = clipboard::memory();

@@ -6,22 +6,21 @@ use board_local::{
 };
 
 #[test]
-fn adding_sidebar_marks_preserves_an_existing_version_ten_board() -> Result<()> {
+fn unsupported_boards_are_rejected_without_rewriting_them() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("previous.db");
-    let board = Board::open(&path)?;
-    let root = board.post("dev", "tester", "before upgrade", &Default::default())?;
-    let head = board.cursor()?;
-    drop(board);
-    {
-        let previous = rusqlite::Connection::open(&path)?;
-        previous.execute_batch("DROP TABLE channel_seen; PRAGMA user_version=10;")?;
+    for (app, version) in [(0x424f4152, 24), (0x424f4152, 999), (0, 0)] {
+        let path = dir.path().join(format!("board-{version}.db"));
+        let db = rusqlite::Connection::open(&path)?;
+        db.execute_batch(
+            "CREATE TABLE sentinel(value TEXT); INSERT INTO sentinel VALUES('untouched')",
+        )?;
+        db.pragma_update(None, "application_id", app)?;
+        db.pragma_update(None, "user_version", version)?;
+        drop(db);
+        let bytes = std::fs::read(&path)?;
+        assert!(Board::open(&path).is_err());
+        assert_eq!(std::fs::read(&path)?, bytes);
     }
-    let reopened = Board::open(&path)?;
-    assert_eq!(reopened.get(root.id)?, root);
-    reopened.mark_channels_read("reader", &[("dev", root.id)])?;
-    assert_eq!(reopened.channel_read_marks("reader")?["dev"], root.id);
-    assert_eq!(reopened.cursor()?, head);
     Ok(())
 }
 

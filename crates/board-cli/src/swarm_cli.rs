@@ -2,7 +2,7 @@ use crate::{attachments, cli::Body, roles_cli::output};
 use anyhow::{Context, Result, ensure};
 use board_local::{
     Board,
-    swarm::{RunPolicy, SwarmAddWorker, SwarmStart},
+    swarm::{SwarmAddWorker, SwarmStart},
 };
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -19,21 +19,36 @@ use std::{
 
 #[derive(Subcommand)]
 pub enum Swarm {
+    /// Read your pinned assignment, or one named text file from a pinned skill.
+    Assignment {
+        #[arg(long, requires = "path")]
+        skill: Option<String>,
+        #[arg(long, requires = "skill")]
+        path: Option<String>,
+    },
     /// Create a local run. No agent process is started.
     Start {
         goal: String,
+        /// Coordinate on this existing thread, without moving or claiming it.
+        #[arg(
+            long = "thread",
+            visible_alias = "thread-id",
+            conflicts_with = "channel",
+            required_unless_present = "channel"
+        )]
+        thread_id: Option<i64>,
+        /// Publish a new goal thread in this channel instead.
+        #[arg(long)]
+        channel: Option<String>,
+        /// Stable run name for safe retries. Omit it to create a new run each time.
         #[arg(long)]
         slug: Option<String>,
         #[arg(long)]
         repo: Option<PathBuf>,
         #[arg(long)]
         max_notifications: Option<i64>,
-        #[arg(long, default_value_t = 8)]
-        max_active: i64,
-        #[arg(long, default_value_t = 0)]
-        retry_budget: i64,
     },
-    /// Register a worker and render the pinned prompt and environment for your harness.
+    /// Register a named worker and pin its instructions. Use --json for bound CLI arguments.
     Add {
         worker_name: String,
         #[arg(long)]
@@ -42,13 +57,13 @@ pub enum Swarm {
         role: Option<String>,
         #[arg(long)]
         brief: String,
+        /// Follow this existing work thread in the run overview.
+        #[arg(long = "thread", visible_alias = "thread-id")]
+        thread_id: Option<i64>,
         #[arg(long)]
         workspace: Option<PathBuf>,
         #[arg(long)]
         branch: Option<String>,
-        /// Register only, without rendering local skill files or CLI arguments.
-        #[arg(long)]
-        portable: bool,
     },
     Status {
         run: Option<String>,
@@ -73,8 +88,6 @@ pub enum Swarm {
     CheckIn {
         #[arg(long)]
         run: Option<String>,
-        #[arg(long)]
-        compact: bool,
         #[arg(long)]
         model: Option<String>,
         #[arg(long)]
@@ -116,6 +129,9 @@ pub enum Swarm {
         body: Body,
         #[arg(long)]
         run: Option<String>,
+        /// Reply to this message in a linked thread instead of the run's goal thread.
+        #[arg(long)]
+        reply_to: Option<i64>,
         /// Append a structured diff@1 block from git diff (use --diff=RANGE for a revision range).
         #[arg(
             long,
@@ -136,8 +152,6 @@ pub enum Swarm {
         /// File containing JSON (or - for stdin) for --schema alongside prose text.
         #[arg(long, requires = "schema", value_name = "FILE")]
         schema_file: Option<PathBuf>,
-        #[arg(long, value_name = "KEY=VALUE")]
-        label: Vec<String>,
         /// Retry this write without duplicating it.
         #[arg(long = "idempotency-key", visible_alias = "id")]
         key: Option<String>,
@@ -221,7 +235,9 @@ impl Swarm {
             | Self::Add { run, .. }
             | Self::SetLimit { run, .. }
             | Self::Stop { run } => run,
-            Self::Start { .. } | Self::List { .. } | Self::Attention => return Ok(()),
+            Self::Assignment { .. } | Self::Start { .. } | Self::List { .. } | Self::Attention => {
+                return Ok(());
+            }
         };
         if let Some(binding) = binding {
             *run = Some(binding.select_run(run.as_deref())?);
@@ -388,34 +404,40 @@ fn wait(
     )?)?)
 }
 
-pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
+pub fn run(
+    b: &Board,
+    actor: &str,
+    binding: Option<&board_local::swarm::WorkerBinding>,
+    cmd: Swarm,
+    js: bool,
+) -> Result<()> {
     match cmd {
+        Swarm::Assignment { skill, path } => {
+            let binding = binding.context("swarm assignment requires --worker RUN/NAME")?;
+            if let Some((skill, path)) = skill.zip(path) {
+                let file = b.worker_skill_file(binding, &skill, &path)?;
+                output(js, &file, || file.text.clone())
+            } else {
+                let assignment = b.worker_assignment(binding)?;
+                println!("{}", serde_json::to_string_pretty(&assignment)?);
+                Ok(())
+            }
+        }
         Swarm::CheckIn {
             run,
-            compact,
             model,
             workspace_mode,
             session_ref,
         } => {
             let run = reference(run.as_deref())?;
-            let (target, _) = b.swarm_wait_target(actor, run)?;
-            b.swarm_check_in_with_runtime(
+            let ack = b.swarm_check_in(
                 actor,
                 run,
-                &target,
                 model.as_deref(),
                 workspace_mode.as_deref(),
                 session_ref.as_deref(),
             )?;
-            if compact {
-                return output(
-                    js,
-                    &json!({"run":run,"worker":target,"actor":actor,"status":"working"}),
-                    || "Checked in".into(),
-                );
-            }
-            let v = b.swarm_status(actor, run)?;
-            output(js, &v, || "Checked in".into())
+            output(js, &ack, || "Checked in".into())
         }
         Swarm::LaunchFailed {
             worker_name,
@@ -463,23 +485,21 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
         }
         Swarm::Start {
             goal,
+            thread_id,
+            channel,
             slug,
             repo,
             max_notifications,
-            max_active,
-            retry_budget,
         } => {
-            let v = b.swarm_start_with_policy(
+            let v = b.swarm_start(
                 actor,
                 &SwarmStart {
                     goal,
+                    thread_id,
+                    channel,
                     slug,
                     repo_root: repo.map(local_path).transpose()?,
                     max_notifications,
-                },
-                RunPolicy {
-                    max_active,
-                    retry_budget,
                 },
             )?;
             output(js, &v, || v.slug.clone())
@@ -521,8 +541,8 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             )?;
             output(js, &v, || {
                 let mut lines = vec![format!(
-                    "{}: {}\n{} | available slots {} | tasks {:?} | cursor {}",
-                    v.run, v.goal, v.status, v.available_capacity, v.tasks, v.cursor
+                    "{}: {}\n{} | workers {:?} | tasks {:?} | cursor {}",
+                    v.run, v.goal, v.status, v.workers, v.tasks, v.cursor
                 )];
                 lines.extend(v.actions.iter().map(|a| {
                     format!(
@@ -539,20 +559,19 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                     )
                 }));
                 lines.extend(v.threads.iter().map(|t| {
-                    format!(
-                        "#{} [{} · {}] {}: {}",
-                        t.id,
-                        t.workstream.as_deref().unwrap_or("Ungrouped"),
-                        t.state,
-                        t.claimant
-                            .as_deref()
-                            .or(t.assignee.as_deref())
-                            .unwrap_or("Unassigned"),
-                        t.title
-                    )
+                    let mut line = format!("#{} [{}] {}", t.id, t.state, t.title);
+                    if let Some(actor) = &t.claimant {
+                        line.push_str(&format!(" (claimed by {actor})"));
+                    } else if let Some(actor) = &t.assignee {
+                        line.push_str(&format!(" (assigned to {actor})"));
+                    }
+                    if !t.briefed_workers.is_empty() {
+                        line.push_str(&format!(" [brief: {}]", t.briefed_workers.join(", ")));
+                    }
+                    line
                 }));
                 if let Some(at) = v.next_task_after {
-                    lines.push(format!("More tasks: --task-after {at}"));
+                    lines.push(format!("More threads: --task-after {at}"));
                 }
                 lines.join("\n")
             })
@@ -562,24 +581,21 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             run,
             role,
             brief,
+            thread_id,
             workspace,
             branch,
-            portable,
         } => {
             let run = reference(run.as_deref())?;
             let args = SwarmAddWorker {
                 name: worker_name,
                 role_slug: role,
                 brief,
+                thread_id,
                 workspace_path: workspace.map(local_path).transpose()?,
                 branch_name: branch,
             };
-            if portable {
-                let v = b.swarm_register_worker(actor, run, &args)?;
-                return output(js, &v, || v.selector.clone());
-            }
-            let v = b.swarm_add_worker(actor, run, &args)?;
-            output(js, &v, || v.assembled_prompt.clone())
+            let v = b.swarm_register_worker(actor, run, &args)?;
+            output(js, &v, || v.selector.clone())
         }
         Swarm::Status { run } => {
             let v = b.swarm_status(actor, reference(run.as_deref())?)?;
@@ -600,7 +616,7 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             })
         }
         Swarm::List { before, limit } => {
-            let v = b.swarm_list(actor, before, limit)?;
+            let v = b.swarm_summaries(actor, before, limit)?;
             output(js, &v, || {
                 v.iter()
                     .map(|r| format!("{}  {}  {}", r.slug, r.status, r.goal))
@@ -611,17 +627,19 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
         Swarm::Post {
             mut body,
             run,
+            reply_to,
             diff,
             schema_data,
             schema_file,
-            label,
             key,
             attach,
         } => {
             let run = reference(run.as_deref())?;
-            let channel = b.swarm_status(actor, run)?.channel;
+            let target = format!(
+                "#{}",
+                reply_to.unwrap_or(b.swarm_status(actor, run)?.thread_id)
+            );
             let key = crate::automation_cli::output_key(b, actor, key.as_deref())?;
-            let labels = crate::pairs(&label, false)?;
             let mut opts = if let Some(key) = &key
                 && !attach.is_empty()
                 && match b.posted(actor, key) {
@@ -636,9 +654,8 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                 } {
                 board_local::PostOptions::default()
             } else {
-                attachments::placements(b, actor, &channel, &attach, &[])?
+                attachments::placements(b, actor, &target, &attach, &[])?
             };
-            opts.labels = labels;
             opts.key = key;
             let mut text = if schema_data.is_some() || schema_file.is_some() {
                 let schema = body
@@ -667,7 +684,7 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             if let Some(range) = diff {
                 with_diff(&mut text, &range, &mut opts)?;
             }
-            let v = b.swarm_post(actor, run, &text, &opts)?;
+            let v = b.swarm_post_to_thread(actor, run, reply_to, &text, &opts)?;
             output(js, &v, || {
                 if !v.suppressed.is_empty() {
                     format!(

@@ -5,7 +5,6 @@ pub(crate) use feed::read_mention_routing;
 mod assignment;
 mod coordination;
 pub use assignment::{Assignment, AssignmentFile};
-mod materialize;
 mod observe;
 pub use observe::{RunAction, RunChange, RunThread, SwarmObservation, TaskExplanation};
 mod wait;
@@ -18,74 +17,24 @@ use anyhow::{Context, Result, ensure};
 pub use coordination::*;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
-};
+use std::collections::{BTreeMap, BTreeSet};
 pub use wait::{SwarmInboxWait, SwarmWaitOutcome};
 
 pub(crate) fn init(c: &Connection) -> Result<()> {
-    let legacy: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='swarm_workers') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('swarm_workers') WHERE name='checked_in_at')", [], |r| r.get(0))?;
-    if legacy {
-        c.execute_batch("ALTER TABLE swarm_workers RENAME TO swarm_workers_legacy;")?;
-    }
     c.execute_batch(include_str!("swarm/schema.sql"))?;
-    if legacy {
-        // Old working rows did not prove a worker ever started. Do not invent check-ins.
-        c.execute_batch("INSERT INTO swarm_workers(id,run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at)
-            SELECT id,run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,CASE WHEN status='working' THEN 'registered' ELSE status END,waiter_pid,last_read_cursor,created_at,updated_at,CASE WHEN status='waiting' THEN updated_at END,CASE WHEN status='waiting' THEN updated_at END FROM swarm_workers_legacy;
-            DROP TABLE swarm_workers_legacy;
-            CREATE INDEX IF NOT EXISTS swarm_workers_by_run ON swarm_workers(run_id,id);")?;
-    }
+    c.execute_batch(include_str!("swarm/threads.sql"))?;
+    c.execute_batch(include_str!("swarm/orchestration.sql"))?;
     Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SwarmStart {
     pub goal: String,
+    pub channel: Option<String>,
+    pub thread_id: Option<i64>,
     pub slug: Option<String>,
     pub repo_root: Option<String>,
     pub max_notifications: Option<i64>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct RunPolicy {
-    pub max_active: i64,
-    pub retry_budget: i64,
-}
-impl Default for RunPolicy {
-    fn default() -> Self {
-        Self {
-            max_active: 8,
-            retry_budget: 0,
-        }
-    }
-}
-impl RunPolicy {
-    fn validate(self) -> Result<()> {
-        ensure!(
-            (1..=128).contains(&self.max_active) && (0..=1000).contains(&self.retry_budget),
-            Invalid.error(
-                "invalid_policy",
-                "max_active must be 1..128 and retry_budget 0..1000"
-            )
-        );
-        Ok(())
-    }
-    fn read(c: &Connection, id: i64) -> Result<Self> {
-        Ok(c.query_row(
-            "SELECT max_active,retry_budget FROM swarm_policy WHERE run_id=?",
-            [id],
-            |r| {
-                Ok(Self {
-                    max_active: r.get(0)?,
-                    retry_budget: r.get(1)?,
-                })
-            },
-        )
-        .optional()?
-        .unwrap_or_default())
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -93,6 +42,7 @@ pub struct SwarmAddWorker {
     pub name: String,
     pub role_slug: Option<String>,
     pub brief: String,
+    pub thread_id: Option<i64>,
     pub workspace_path: Option<String>,
     pub branch_name: Option<String>,
 }
@@ -102,6 +52,7 @@ pub struct SwarmSummary {
     pub slug: String,
     pub goal: String,
     pub channel: String,
+    pub thread_id: i64,
     pub coordinator_actor: String,
     pub status: String,
     pub worker_count: i64,
@@ -123,8 +74,7 @@ pub struct SwarmRun {
     pub ended_at: Option<String>,
     pub workers: Vec<SwarmWorker>,
     pub activity_count: i64,
-    #[serde(skip)]
-    root_id: i64,
+    pub thread_id: i64,
 }
 impl SwarmRun {
     fn operator(&self, actor: &str) -> bool {
@@ -145,7 +95,7 @@ impl SwarmRun {
         );
         Ok(())
     }
-    fn active(&self) -> Result<()> {
+    pub(crate) fn active(&self) -> Result<()> {
         ensure!(
             self.status == "active",
             Conflict.error("swarm_stopped", "the swarm has ended")
@@ -175,10 +125,11 @@ pub struct SwarmWorker {
     pub role_slug: Option<String>,
     pub pinned_role_version: Option<i64>,
     pub brief: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<i64>,
     pub workspace_path: Option<String>,
     pub branch_name: Option<String>,
     pub status: String,
-    pub waiter_pid: Option<u32>,
     pub last_read_cursor: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -192,15 +143,6 @@ pub struct SwarmWorker {
     pub workspace_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_ref: Option<String>,
-}
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SpawnedWorker {
-    pub worker: SwarmWorker,
-    pub assembled_prompt: String,
-    pub skills_dir: PathBuf,
-    pub env_vars: BTreeMap<String, String>,
-    /// Arguments before the subcommand. An in-memory board cannot be shared between processes.
-    pub cli_args: Option<Vec<String>>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct WorkerBinding {
@@ -237,6 +179,8 @@ impl WorkerBinding {
 }
 #[derive(Debug, Serialize)]
 pub struct RegisteredWorker {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cli_args: Option<Vec<String>>,
     pub run: String,
     pub channel: String,
     pub selector: String,
@@ -320,8 +264,8 @@ fn location(s: Option<&str>) -> Result<()> {
 fn rows<T>(it: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
     Ok(it.collect::<rusqlite::Result<_>>()?)
 }
-const WORKER_SELECT: &str = "SELECT w.id,w.run_id,w.name,w.actor,w.role_slug,w.pinned_role_version,w.brief,w.workspace_path,w.branch_name,w.status,w.waiter_pid,w.last_read_cursor,w.created_at,w.updated_at,w.checked_in_at,w.last_activity_at,w.launch_error,p.model,p.workspace_mode,p.session_ref FROM swarm_workers w LEFT JOIN swarm_worker_runtime p ON p.worker_id=w.id";
-fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
+const WORKER_SELECT: &str = "SELECT w.id,w.run_id,w.name,w.actor,w.role_slug,w.pinned_role_version,w.brief,w.workspace_path,w.branch_name,w.status,w.last_read_cursor,w.created_at,w.updated_at,w.checked_in_at,w.last_activity_at,w.launch_error,w.model,w.workspace_mode,w.session_ref,w.thread_id,m.channel FROM swarm_workers w LEFT JOIN messages m ON m.id=w.thread_id";
+fn worker(r: &rusqlite::Row, a: &Access) -> rusqlite::Result<SwarmWorker> {
     Ok(SwarmWorker {
         id: r.get(0)?,
         run_id: r.get(1)?,
@@ -330,19 +274,22 @@ fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
         role_slug: r.get(4)?,
         pinned_role_version: r.get(5)?,
         brief: r.get(6)?,
+        thread_id: r.get::<_, Option<i64>>(19)?.filter(|_| {
+            r.get::<_, String>(20)
+                .is_ok_and(|ch| a.allows(Action::Read, &ch))
+        }),
         workspace_path: r.get(7)?,
         branch_name: r.get(8)?,
         status: r.get(9)?,
-        waiter_pid: r.get(10)?,
-        last_read_cursor: r.get(11)?,
-        created_at: r.get(12)?,
-        updated_at: r.get(13)?,
-        checked_in_at: r.get(14)?,
-        last_activity_at: r.get(15)?,
-        launch_error: r.get(16)?,
-        model: r.get(17)?,
-        workspace_mode: r.get(18)?,
-        session_ref: r.get(19)?,
+        last_read_cursor: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
+        checked_in_at: r.get(13)?,
+        last_activity_at: r.get(14)?,
+        launch_error: r.get(15)?,
+        model: r.get(16)?,
+        workspace_mode: r.get(17)?,
+        session_ref: r.get(18)?,
     })
 }
 
@@ -365,10 +312,10 @@ impl Board {
         // Select from the roster, not the caller's inherited chat profile. A scoped session
         // must match the actor AND be allowed to read the run before anything is returned.
         let access = self.access_on(&tx)?;
-        access.require(Action::Read, &format!("swarms/{slug}"))?;
-        let (actor,run_id):(String,i64)=tx.query_row(
-            "SELECT w.actor,w.run_id FROM swarm_workers w JOIN swarm_runs r ON r.id=w.run_id WHERE r.slug=? AND w.name=?",
-            params![slug,name], |r|Ok((r.get(0)?,r.get(1)?))).optional()?
+        let (actor,run_id,_):(String,i64,String)=tx.query_row(
+            "SELECT w.actor,w.run_id,r.channel FROM swarm_workers w JOIN swarm_runs r ON r.id=w.run_id WHERE r.slug=? AND w.name=?",
+            params![slug,name], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional()?
+            .filter(|(_,_,ch): &(String,i64,String)| access.allows(Action::Read,ch))
             .context(Forbidden.error("worker_identity_mismatch","no matching worker assignment for this actor and run"))?;
         access.actor(&actor)?;
         tx.commit()?;
@@ -395,7 +342,7 @@ impl Board {
             .parse::<i64>()
             .ok();
         let rn=c.query_row("SELECT id,slug,goal,channel,repo_root,coordinator_actor,status,max_notifications,notifications_sent,created_at,ended_at,root_id FROM swarm_runs WHERE slug=?1 OR id=?2 ORDER BY (slug=?1) DESC LIMIT 1",
-            params![reference,number],|r| Ok(SwarmRun{id:r.get(0)?,slug:r.get(1)?,goal:r.get(2)?,channel:r.get(3)?,repo_root:r.get(4)?,coordinator_actor:r.get(5)?,can_control:false,status:r.get(6)?,max_notifications:r.get(7)?,notifications_sent:r.get(8)?,created_at:r.get(9)?,ended_at:r.get(10)?,root_id:r.get(11)?,workers:vec![],activity_count:0})).optional()?;
+            params![reference,number],|r| Ok(SwarmRun{id:r.get(0)?,slug:r.get(1)?,goal:r.get(2)?,channel:r.get(3)?,repo_root:r.get(4)?,coordinator_actor:r.get(5)?,can_control:false,status:r.get(6)?,max_notifications:r.get(7)?,notifications_sent:r.get(8)?,created_at:r.get(9)?,ended_at:r.get(10)?,thread_id:r.get(11)?,workers:vec![],activity_count:0})).optional()?;
         let mut run = rn
             .filter(|v| a.allows(Action::Read, &v.channel))
             .context(Missing.error("swarm_not_found", "swarm not found"))?;
@@ -413,15 +360,19 @@ impl Board {
         let (a, mut run) = self.swarm_record(c, actor, reference, action)?;
         run.workers = rows(
             c.prepare(&format!("{WORKER_SELECT} WHERE w.run_id=? ORDER BY w.id"))?
-                .query_map([run.id], worker)?,
+                .query_map([run.id], |row| worker(row, &a))?,
         )?;
         Ok((a, run))
     }
     fn swarm_overview(&self, c: &Connection, actor: &str, reference: &str) -> Result<SwarmRun> {
         let (a, mut run) = self.swarm_on(c, actor, reference, Action::Read)?;
         let full = run.can_see_dm(actor, &a, true);
-        run.activity_count=c.query_row("SELECT (SELECT count(*) FROM messages WHERE channel=?1 AND id>=?2)+(SELECT count(*) FROM swarm_dms WHERE run_id=?3 AND (?4 OR from_actor=?5 OR to_worker=?6))",
-            params![run.channel,run.root_id,run.id,full,actor,run.name_for(actor)],|r|r.get(0))?;
+        let channels = a.read_channels_json(c)?;
+        run.activity_count=c.query_row("SELECT (SELECT count(*) FROM messages WHERE coalesce(re,id) IN
+            (SELECT thread_id FROM swarm_threads WHERE run_id=?1)
+            AND (?2 IS NULL OR channel IN (SELECT value FROM json_each(?2))))
+            +(SELECT count(*) FROM swarm_dms WHERE run_id=?1 AND (?3 OR from_actor=?4 OR to_worker=?5))",
+            params![run.id,channels,full,actor,run.name_for(actor)],|r|r.get(0))?;
         Ok(run)
     }
     pub fn swarm_status(&self, actor: &str, run: &str) -> Result<SwarmRun> {
@@ -444,14 +395,11 @@ impl Board {
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
         a.actor(actor)?;
-        let channels = a
-            .channels(&tx, Action::Read)?
-            .map(|c| serde_json::to_string(&c))
-            .transpose()?;
+        let channels = a.read_channels_json(&tx)?;
         let result = rows(
             tx.prepare(
                 "SELECT r.id,r.slug,r.goal,r.channel,r.coordinator_actor,r.status,
-                    (SELECT count(*) FROM swarm_workers w WHERE w.run_id=r.id)
+                    (SELECT count(*) FROM swarm_workers w WHERE w.run_id=r.id),r.root_id
              FROM swarm_runs r WHERE r.id<coalesce(?1,9223372036854775807)
                 AND (?2 IS NULL OR r.channel IN (SELECT value FROM json_each(?2)))
              ORDER BY r.id DESC LIMIT ?3",
@@ -465,59 +413,23 @@ impl Board {
                     coordinator_actor: s.get(4)?,
                     status: s.get(5)?,
                     worker_count: s.get(6)?,
+                    thread_id: s.get(7)?,
                 })
             })?,
         )?;
         tx.commit()?;
         Ok(result)
     }
-    pub fn swarm_list(
-        &self,
-        actor: &str,
-        before: Option<i64>,
-        limit: usize,
-    ) -> Result<Vec<SwarmRun>> {
-        ensure!(
-            (1..=500).contains(&limit),
-            Invalid.error("invalid_limit", "limit must be between 1 and 500")
-        );
-        let tx = self.conn.unchecked_transaction()?;
-        let a = self.access_on(&tx)?;
-        a.actor(actor)?;
-        let channels = a
-            .channels(&tx, Action::Read)?
-            .map(|c| serde_json::to_string(&c))
-            .transpose()?;
-        let ids=rows(tx.prepare("SELECT id FROM swarm_runs WHERE id<coalesce(?1,9223372036854775807) AND (?2 IS NULL OR channel IN (SELECT value FROM json_each(?2))) ORDER BY id DESC LIMIT ?3")?.query_map(params![before,channels,limit as i64],|r|r.get::<_,i64>(0))?)?;
-        let runs = ids
-            .iter()
-            .map(|id| self.swarm_overview(&tx, actor, &format!("#{id}")))
-            .collect::<Result<_>>()?;
-        tx.commit()?;
-        Ok(runs)
-    }
     pub fn swarm_active_count(&self, actor: &str) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
         let a = self.access_on(&tx)?;
         a.actor(actor)?;
-        let channels = a
-            .channels(&tx, Action::Read)?
-            .map(|c| serde_json::to_string(&c))
-            .transpose()?;
+        let channels = a.read_channels_json(&tx)?;
         let count=tx.query_row("SELECT count(*) FROM swarm_runs WHERE status='active' AND (?1 IS NULL OR channel IN (SELECT value FROM json_each(?1)))",[channels],|r|r.get(0))?;
         tx.commit()?;
         Ok(count)
     }
     pub fn swarm_start(&self, actor: &str, args: &SwarmStart) -> Result<SwarmRun> {
-        self.swarm_start_with_policy(actor, args, RunPolicy::default())
-    }
-    pub fn swarm_start_with_policy(
-        &self,
-        actor: &str,
-        args: &SwarmStart,
-        policy: RunPolicy,
-    ) -> Result<SwarmRun> {
-        policy.validate()?;
         let slug = args
             .slug
             .clone()
@@ -527,37 +439,71 @@ impl Board {
             Invalid.error("invalid_swarm_slug", "invalid run slug")
         );
         location(args.repo_root.as_deref())?;
-        let channel = format!("swarms/{slug}");
+        ensure!(
+            args.channel.is_some() != args.thread_id.is_some(),
+            Invalid.error("swarm_destination_required", "specify either channel (create a goal thread) or thread_id (use an existing thread)")
+        );
         let max = args.max_notifications.unwrap_or(200);
         notification_limit(max)?;
+        // Compare the caller's request, not today's resolved mentions, limit, or run status.
+        let fingerprint = crate::core::fingerprint((
+            &args.goal,
+            &args.channel,
+            args.thread_id,
+            &args.repo_root,
+            max,
+        ))?;
         self.write(|tx|{
-            let a=self.access_on(tx)?;a.actor(actor)?;a.require(Action::Read,&channel)?;a.require(Action::Post,&channel)?;
-            ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM channels WHERE name=?)",[&channel],|r|r.get::<_,bool>(0))?,Conflict.error("swarm_exists","run channel already exists"));
-            let (goal,_)=crate::actors::settle(tx,&a,actor,None,&args.goal)?;
-            let m=Self::post_tx(tx,&channel,actor,&goal,&PostOptions{no_sync:true,..Default::default()})?;
-            tx.execute("INSERT INTO swarm_runs(slug,goal,channel,root_id,repo_root,coordinator_actor,status,max_notifications,created_at) VALUES(?,?,?,?,?,?,'active',?,?)",
-                params![slug,m.text,channel,m.id,args.repo_root,actor,max,m.created_at])?;
-            tx.execute("INSERT INTO swarm_policy(run_id,max_active,retry_budget) SELECT id,?,? FROM swarm_runs WHERE slug=?",params![policy.max_active,policy.retry_budget,slug])?;
+            let a=self.access_on(tx)?;a.actor(actor)?;
+            let channel=match args.thread_id {
+                Some(id) => a.message(tx,id,Action::Post)?,
+                None => args.channel.clone().expect("validated destination"),
+            };
+            a.require(Action::Read,&channel)?;
+            a.require(Action::Post,&channel)?;
+            if let Some(same_start) = tx.query_row(
+                "SELECT coordinator_actor=?2 AND start_fingerprint=?3 FROM swarm_runs WHERE slug=?1",
+                params![slug, actor, fingerprint], |r| r.get::<_, bool>(0),
+            ).optional()? {
+                ensure!(args.slug.is_some() && same_start, Conflict.error("swarm_exists","that run slug is already in use"));
+                return self.swarm_overview(tx,actor,&slug);
+            }
+            if let Some(id) = args.thread_id {
+                Self::require_live_thread(tx,id)?;
+            }
+            let (goal,_)=crate::actors::settle(tx,&a,actor,args.thread_id,&args.goal)?;
+            let thread_id=if let Some(id)=args.thread_id {
+                crate::validate_post(&channel,actor,&goal,&PostOptions::default())?;
+                id
+            } else {
+                Self::post_tx(tx,&channel,actor,&goal,&PostOptions{no_sync:true,..Default::default()})?.id
+            };
+            tx.execute("INSERT INTO swarm_runs(slug,goal,channel,root_id,repo_root,coordinator_actor,status,max_notifications,created_at,start_fingerprint) VALUES(?,?,?,?,?,?,'active',?,?,?)",
+                params![slug,goal,channel,thread_id,args.repo_root,actor,max,crate::now(),fingerprint])?;
+            Board::event_tx(tx,"swarm.started",actor,Some(thread_id),serde_json::json!({"run":slug}))?;
             self.swarm_overview(tx,actor,&slug)
         })
     }
-    pub fn swarm_add_worker(
+    fn require_live_thread(c: &Connection, id: i64) -> Result<()> {
+        ensure!(
+            c.query_row(
+                "SELECT re IS NULL AND NOT deleted FROM messages WHERE id=?",
+                [id],
+                |r| r.get::<_, bool>(0)
+            )?,
+            Invalid.error("invalid_thread", "expected a live thread root")
+        );
+        Ok(())
+    }
+    pub(crate) fn swarm_for_plan(
         &self,
+        c: &Connection,
         actor: &str,
         run: &str,
-        args: &SwarmAddWorker,
-    ) -> Result<SpawnedWorker> {
-        let registered = self.swarm_register_worker(actor, run, args)?;
-        let tx = self.conn.unchecked_transaction()?;
-        let (access, r) = self.swarm_record(&tx, actor, &registered.run, Action::Post)?;
+    ) -> Result<SwarmRun> {
+        let (_, r) = self.swarm_record(c, actor, run, Action::Post)?;
         r.control()?;
-        r.active()?;
-        if registered.worker.role_slug.is_some() {
-            access.trusted()?;
-        }
-        let (prompt, skills) = Self::pinned_assignment(&tx, registered.worker.id)?;
-        tx.commit()?;
-        self.materialize_spawn(&r, registered.worker, &prompt, &skills)
+        Ok(r)
     }
     pub fn swarm_register_worker(
         &self,
@@ -577,6 +523,10 @@ impl Board {
         location(args.branch_name.as_deref())?;
         self.write(|tx|{
             let (access,r)=self.swarm_on(tx,actor,run,Action::Post)?;r.control()?;r.active()?;
+            if let Some(id)=args.thread_id {
+                access.message(tx,id,Action::Read)?;
+                Self::require_live_thread(tx,id)?;
+            }
             let person=r.coordinator_actor.split('/').next().unwrap_or(&r.coordinator_actor);
             let who=format!("{person}/{}",args.name);crate::validate_actor(&who)?;
             ensure!(who!=r.coordinator_actor,Conflict.error("worker_exists","the coordinator already uses this profile"));
@@ -584,9 +534,15 @@ impl Board {
                 // A scoped channel credential is not permission to export the private role library.
                 access.trusted()?;
             }
-            let registered = |worker| RegisteredWorker {run:r.slug.clone(),channel:r.channel.clone(),selector:format!("{}/{}",r.slug,args.name),worker};
+            let selector = format!("{}/{}",r.slug,args.name);
+            let cli_args = if access.is_trusted() {
+                self.database_file().and_then(|path| path.to_str()).map(|path|
+                    vec!["--db".into(),path.into(),"--worker".into(),selector.clone()])
+            } else {None};
+            let registered = |worker| RegisteredWorker {cli_args,run:r.slug.clone(),channel:r.channel.clone(),selector,worker};
             if let Some(w)=r.workers.iter().find(|w|w.name==args.name){
-                ensure!(w.role_slug==args.role_slug && w.brief==args.brief && w.workspace_path==args.workspace_path && w.branch_name==args.branch_name, Conflict.error("worker_exists","that worker name already has a different assignment"));
+                let same_link:bool=tx.query_row("SELECT thread_id IS ? FROM swarm_workers WHERE id=?",params![args.thread_id,w.id],|s|s.get(0))?;
+                ensure!(same_link && w.role_slug==args.role_slug && w.brief==args.brief && w.workspace_path==args.workspace_path && w.branch_name==args.branch_name, Conflict.error("worker_exists","that worker name already has a different assignment"));
                 return Ok(registered(w.clone()));
             }
             ensure!(r.workers.len()<128,Invalid.error("worker_limit","a run may have up to 128 workers"));
@@ -594,10 +550,10 @@ impl Board {
                 let (v,p,s)=crate::roles::pin_on(tx,slug)?;(Some(v),p,s)
             }else{(None,String::new(),vec![])};
             let time=crate::now();let body=format!("Brief for @[{who}]:\n{}",args.brief);
-            let m=Self::post_tx(tx,&r.channel,actor,&body,&PostOptions{no_sync:true,..Default::default()})?;
-            tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'registered',?,?,?)",
-                params![r.id,args.name,who,args.role_slug,version,prompt,serde_json::to_string(&skills)?,args.brief,args.workspace_path,args.branch_name,m.id,time,time])?;
-            let w=tx.query_row(&format!("{WORKER_SELECT} WHERE w.run_id=? AND w.name=?"),params![r.id,args.name],worker)?;
+            let (m,_)=Self::reply_tx_with_outcome(tx,r.thread_id,actor,&body,&PostOptions{no_sync:true,..Default::default()})?;
+            tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,thread_id,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,'registered',?,?,?)",
+                params![r.id,args.name,who,args.role_slug,version,prompt,serde_json::to_string(&skills)?,args.brief,args.workspace_path,args.branch_name,args.thread_id,m.id,time,time])?;
+            let w=tx.query_row(&format!("{WORKER_SELECT} WHERE w.run_id=? AND w.name=?"),params![r.id,args.name],|s|worker(s,&access))?;
             Board::event_tx(tx,"swarm.registered",actor,Some(m.id),serde_json::json!({"run":r.slug,"worker":w.name}))?;
             Ok(registered(w))
         })
@@ -605,10 +561,10 @@ impl Board {
     pub fn swarm_stop(&self, actor: &str, run: &str) -> Result<SwarmRun> {
         self.write(|tx|{let (_,r)=self.swarm_on(tx,actor,run,Action::Post)?;r.control()?;
             if r.status=="active" {
-                let stop=Board::event_tx(tx,"swarm.stopped",actor,Some(r.root_id),serde_json::json!({"run":r.slug}))?;
+                let stop=Board::event_tx(tx,"swarm.stopped",actor,Some(r.thread_id),serde_json::json!({"run":r.slug}))?;
                 let time=crate::now();
-                tx.execute("UPDATE swarm_runs SET status='stopped',ended_at=?,stop_cursor=?,coordinator_pid=NULL WHERE id=?",params![time,stop,r.id])?;
-                tx.execute("UPDATE swarm_workers SET status='stopped',waiter_pid=NULL,updated_at=? WHERE run_id=? AND status!='done'",params![time,r.id])?;
+                tx.execute("UPDATE swarm_runs SET status='stopped',ended_at=?,stop_cursor=? WHERE id=?",params![time,stop,r.id])?;
+                tx.execute("UPDATE swarm_workers SET status='stopped',updated_at=? WHERE run_id=? AND status!='done'",params![time,r.id])?;
             } self.swarm_overview(tx,actor,run)})
     }
     pub fn swarm_set_limit(&self, actor: &str, run: &str, max: i64) -> Result<SwarmRun> {
@@ -626,7 +582,7 @@ impl Board {
                     tx,
                     "swarm.limit",
                     actor,
-                    Some(r.root_id),
+                    Some(r.thread_id),
                     serde_json::json!({"run":r.slug,"limit":max}),
                 )?;
             }

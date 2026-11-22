@@ -13,18 +13,6 @@ use crate::{
 
 const MAX_FRAME: usize = 2 * 1024 * 1024;
 
-pub fn serve_stdio(board: &Board, actor: &str) -> Result<()> {
-    serve_stdio_bound(
-        board,
-        actor,
-        board_local::local::identity_env("BOARD_WORKER")?.as_deref(),
-    )
-}
-
-pub fn serve_stdio_bound(board: &Board, actor: &str, selector: Option<&str>) -> Result<()> {
-    serve_stdio_with_tools(board, actor, selector, Toolset::Board)
-}
-
 pub fn serve_stdio_with_tools(
     board: &Board,
     actor: &str,
@@ -53,9 +41,9 @@ pub fn serve_stdio_with_tools(
         }
     });
     let mut out = io::stdout().lock();
-    let mut pending: Vec<Parked<'_>> = vec![];
+    let mut pending: Option<Parked<'_>> = None;
     loop {
-        let next = pending.iter().map(|p| p.next_poll).min();
+        let next = pending.as_ref().map(|p| p.next_poll);
         let received = match next {
             Some(at) => match recv.recv_timeout(at.saturating_duration_since(Instant::now())) {
                 Ok(v) => Some(v),
@@ -74,22 +62,12 @@ pub fn serve_stdio_with_tools(
                 send_reply(&mut out, &reply)?;
             }
         }
-        let mut i = 0;
-        while i < pending.len() {
-            let wait = &mut pending[i];
-            if wait.next_poll <= Instant::now() {
-                if !wait.cancelled
-                    && let Some(reply) = router::poll(board, &mut session, wait)
-                {
-                    send_reply(&mut out, &reply)?;
-                    wait.cancelled = true;
-                }
-                if wait.cancelled && wait.retire() {
-                    pending.swap_remove(i);
-                    continue;
-                }
-            }
-            i += 1;
+        if let Some(wait) = &mut pending
+            && wait.next_poll <= Instant::now()
+            && let Some(reply) = router::poll(wait)
+        {
+            send_reply(&mut out, &reply)?;
+            pending = None;
         }
     }
     Ok(())

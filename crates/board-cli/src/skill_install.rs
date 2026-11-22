@@ -8,13 +8,7 @@ use std::{
 };
 
 const COORDINATOR: &str = include_str!("../assets/board-swarm-SKILL.md");
-const V15_COORDINATOR: &str = "126e1fc1455726325dfb5b7b3ad822fe5da73d0fb875e828594131181f3a7394";
-const V16_COORDINATOR: &str = "d5c9b58a6134fd9eaf47ff47709425345bf1989810ec2020035a9471312f65de";
-const V17_COORDINATOR: &str = "aeefde429f1a99e6215f088492e5cc82fde51abb27aada00192014a28e46bee7";
-const V18_COORDINATOR: &str = "1f8dc7910259ea679e342a625199892fa2b190c02b5623c251379cd4d6e95304";
-const V19_COORDINATOR: &str = "dacab208ee6cb4e680a95db03491735e1c2da60cea43cb55301af8ede5cab456";
-const V20_COORDINATOR: &str = "1fffe71de4ffcf6cb698a473f3a54f7fbf0dbab23a52f8d07bfbfa119bf49f87";
-const V21_COORDINATOR: &str = "17d52aa5e9426a1738e392b407627091ebbcf1e7ef12386264c4b74e20167396";
+const RECEIPT: &str = "\n<!-- board-installed-sha256: ";
 const FILE: &str = "board-swarm/SKILL.md";
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -64,87 +58,48 @@ enum Contents {
     Custom,
 }
 
-fn contents(file: &Path) -> Result<Contents> {
+// Keep the receipt in the instruction file so it is published together with the body.
+fn with_receipt(stock: &str) -> String {
+    let body = stock.replace("\r\n", "\n");
+    format!("{body}{RECEIPT}{:x} -->\n", Sha256::digest(body.as_bytes()))
+}
+
+fn contents(file: &Path, current: &str) -> Result<Contents> {
     let m = match fs::symlink_metadata(file) {
         Ok(m) => m,
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Contents::Missing),
         Err(e) => return Err(e.into()),
     };
-    ensure!(
-        m.is_file(),
-        "not a regular skill file: {}; inspect it before retrying",
-        file.display()
-    );
-    // The Windows and Unix builds can embed identical instructions with different line endings.
+    ensure!(m.is_file(), "not a regular skill file: {}", file.display());
     let mut bytes = Vec::new();
-    if m.len() <= 32 * 1024 {
-        fs::File::open(file)?
-            .take(32 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
+    if m.len() > 64 * 1024 {
+        return Ok(Contents::Custom);
     }
-    if let Ok(text) = std::str::from_utf8(&bytes) {
-        let text = text.replace("\r\n", "\n");
-        if text == COORDINATOR.replace("\r\n", "\n") {
-            return Ok(Contents::Current);
-        }
-        if matches!(
-            format!("{:x}", Sha256::digest(text.as_bytes())).as_str(),
-            V15_COORDINATOR
-                | V16_COORDINATOR
-                | V17_COORDINATOR
-                | V18_COORDINATOR
-                | V19_COORDINATOR
-                | V20_COORDINATOR
-                | V21_COORDINATOR
-        ) {
-            return Ok(Contents::Previous);
-        }
+    fs::File::open(file)?
+        .take(64 * 1024 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != m.len() {
+        return Ok(Contents::Custom);
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return Ok(Contents::Custom);
+    };
+    let text = text.replace("\r\n", "\n");
+    if text == current {
+        return Ok(Contents::Current);
+    }
+    if let Some((body, hash)) = text
+        .strip_suffix(" -->\n")
+        .and_then(|s| s.rsplit_once(RECEIPT))
+        && hash == format!("{:x}", Sha256::digest(body.as_bytes()))
+    {
+        return Ok(Contents::Previous);
     }
     Ok(Contents::Custom)
 }
 
-fn inspect(file: &Path) -> Result<Contents> {
-    let dir = file.parent().expect("skill directory");
-    match fs::symlink_metadata(dir) {
-        Ok(m) => ensure!(
-            m.is_dir(),
-            "not a regular skill directory: {}; inspect it before retrying",
-            dir.display()
-        ),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Contents::Missing),
-        Err(e) => return Err(e.into()),
-    }
-    let value = contents(file)?;
-    if value == Contents::Missing {
-        ensure!(
-            fs::read_dir(dir)?.next().transpose()?.is_none(),
-            "{} has files but no SKILL.md; move the bundle aside before retrying",
-            dir.display()
-        );
-    }
-    Ok(value)
-}
+pub struct Destination(PathBuf);
 
-fn only_instructions(file: &Path) -> Result<()> {
-    let dir = file.parent().expect("skill directory");
-    for entry in fs::read_dir(dir)? {
-        ensure!(
-            entry?.file_name() == "SKILL.md",
-            "{} has additional files; move the bundle aside and merge your changes after installation",
-            dir.display()
-        );
-    }
-    Ok(())
-}
-
-fn same_dir(a: &Path, b: &Path) -> bool {
-    a == b || matches!((a.canonicalize(), b.canonicalize()), (Ok(x), Ok(y)) if x == y)
-}
-
-pub struct Destination {
-    root: PathBuf,
-    legacy: Vec<PathBuf>,
-}
 impl Destination {
     pub fn harness(home: &Path, target: Target) -> Result<Self> {
         let root = match target {
@@ -152,187 +107,109 @@ impl Destination {
             Target::Codex => home.join(".agents/skills"),
             Target::Path => bail!("path requires --dest DIRECTORY"),
         };
-        let mut legacy: Vec<PathBuf> = Vec::new();
-        if target == Target::Codex {
-            // Older Board releases always used ~/.codex, even with a distinct CODEX_HOME.
-            for dir in [home.join(".codex/skills"), codex_dir(home).join("skills")] {
-                if !same_dir(&dir, &root) && !legacy.iter().any(|p| same_dir(p, &dir)) {
-                    legacy.push(dir);
-                }
-            }
-        }
         ensure!(
-            root.is_absolute() && legacy.iter().all(|p| p.is_absolute()),
-            "harness configuration directory must be absolute"
+            root.is_absolute() && root.to_str().is_some(),
+            "harness skill directory must be an absolute Unicode path"
         );
-        ensure!(
-            root.to_str().is_some(),
-            "harness configuration directory must be a Unicode path"
-        );
-        Ok(Self { root, legacy })
-    }
-    fn explicit(target: Target, root: PathBuf) -> Result<Self> {
-        if target == Target::Codex
-            && let Ok(home) = home()
-            && same_dir(&root, &home.join(".agents/skills"))
-        {
-            return Self::harness(&home, target);
-        }
-        Ok(Self {
-            root,
-            legacy: vec![],
-        })
+        Ok(Self(root))
     }
 
     pub fn install(&self, dry: bool) -> Result<(&'static str, PathBuf)> {
-        let file = self.root.join(FILE);
-        let installed = inspect(&file)?;
-        let mut source: Option<(PathBuf, Contents)> = None;
-        for old_root in &self.legacy {
-            let old = old_root.join(FILE);
-            let previous = inspect(&old)?;
-            if previous != Contents::Missing {
+        let file = self.0.join(FILE);
+        let dir = file.parent().expect("skill directory");
+        let current = with_receipt(COORDINATOR);
+        let installed = match fs::symlink_metadata(dir) {
+            Ok(m) => {
                 ensure!(
-                    installed == Contents::Missing,
-                    "both {} and {} exist; keep the intended bundle and move the other outside your skill directories before retrying",
-                    old.display(),
-                    file.display()
+                    m.is_dir(),
+                    "not a regular skill directory: {}",
+                    dir.display()
                 );
-                if let Some((earlier, _)) = &source {
-                    bail!(
-                        "both {} and {} contain a legacy Codex skill; move the intended bundle to {} and the other outside your skill directories before retrying",
-                        earlier.display(),
-                        old.display(),
-                        file.parent().unwrap().display()
-                    );
+                // A bundle with additional files is user-managed, even if its instructions look stock.
+                for entry in fs::read_dir(dir)? {
+                    if entry?.file_name() != "SKILL.md" {
+                        return Ok(("customized", file));
+                    }
                 }
-                ensure!(
-                    previous != Contents::Custom,
-                    "custom legacy Codex skill at {} was left untouched; move its folder to {} before retrying",
-                    old.display(),
-                    file.parent().unwrap().display()
-                );
-                source = Some((old, previous));
+                contents(&file, &current)?
             }
-        }
-        match installed {
-            Contents::Current => return Ok(("unchanged", file)),
-            Contents::Custom => return Ok(("customized", file)),
-            Contents::Previous => source = Some((file.clone(), installed)),
-            Contents::Missing => (),
-        }
-        if let Some((old, _)) = &source {
-            only_instructions(old)?;
-        }
-        if dry {
-            return Ok((
-                if source.is_some() {
-                    "would-upgrade"
-                } else {
-                    "would-install"
-                },
-                file,
-            ));
-        }
-        let dir = file.parent().unwrap();
-        fs::create_dir_all(dir)?;
-        ensure!(
-            fs::symlink_metadata(dir)?.is_dir(),
-            "skill directory changed"
-        );
-        let mut temp = tempfile::NamedTempFile::new_in(&self.root)?;
-        temp.write_all(COORDINATOR.as_bytes())?;
-        temp.as_file().sync_all()?;
-        let archived = source
-            .as_ref()
-            .map(|(old, expected)| archive_stock(old, *expected))
-            .transpose()?;
-        match temp.persist_noclobber(&file) {
-            Ok(_) => Ok((
-                if archived.is_some() {
-                    "upgraded"
-                } else {
+            Err(e) if e.kind() == ErrorKind::NotFound => Contents::Missing,
+            Err(e) => return Err(e.into()),
+        };
+        let status = match (installed, dry) {
+            (Contents::Current, _) => "unchanged",
+            (Contents::Custom, _) => "customized",
+            (Contents::Previous, true) => "would-upgrade",
+            (Contents::Missing, true) => "would-install",
+            (_, false) => {
+                fs::create_dir_all(dir)?;
+                ensure!(
+                    fs::symlink_metadata(dir)?.is_dir(),
+                    "skill directory changed"
+                );
+                publish(&self.0, &file, installed, &current)?;
+                if installed == Contents::Missing {
                     "installed"
-                },
-                file,
-            )),
-            Err(e) => {
-                if let (Some((old, _)), Some(backup)) = (&source, archived) {
-                    // A concurrent install can complete in the gap. Do not re-enable a second
-                    // legacy Codex slot or overwrite a user's new instructions.
-                    if e.error.kind() == ErrorKind::AlreadyExists
-                        && matches!(inspect(&file), Ok(Contents::Current))
-                    {
-                        return Ok(("upgraded", file));
-                    }
-                    if old == &file || matches!(contents(&file), Ok(Contents::Missing)) {
-                        let _ = fs::hard_link(&backup, old);
-                    }
-                    bail!(
-                        "could not publish {} without replacing another file: {}; original retained at {}. Inspect both before retrying",
-                        file.display(),
-                        e.error,
-                        backup.display()
-                    );
+                } else {
+                    "upgraded"
                 }
-                if e.error.kind() == ErrorKind::AlreadyExists {
-                    match inspect(&file)? {
-                        Contents::Current => return Ok(("unchanged", file)),
-                        Contents::Custom => return Ok(("customized", file)),
-                        _ => bail!(
-                            "{} changed during installation; rerun setup",
-                            file.display()
-                        ),
-                    }
-                }
-                Err(e.error.into())
             }
-        }
+        };
+        Ok((status, file))
     }
 }
 
-fn archive_stock(file: &Path, expected: Contents) -> Result<PathBuf> {
-    let root = file.parent().and_then(Path::parent).expect("skill root");
-    let archive = tempfile::Builder::new()
-        .prefix(".board-skill-backup-")
+fn publish(root: &Path, file: &Path, expected: Contents, current: &str) -> Result<()> {
+    let stage = tempfile::Builder::new()
+        .prefix(".board-skill-")
         .tempdir_in(root)?;
-    let backup = archive.path().join("coordinator.previous");
-    // Rename into a fresh private directory, not over an existing backup. Read the moved
-    // bytes again: a writer may have changed them since our initial inspection.
-    fs::rename(file, &backup).with_context(|| {
-        format!(
-            "cannot archive {}; leave the bundle in place and retry",
-            file.display()
-        )
-    })?;
-    let _ = archive.keep();
-    if !matches!(contents(&backup), Ok(value) if value == expected)
-        || !matches!(inspect(file), Ok(Contents::Missing))
-    {
-        let _ = fs::hard_link(&backup, file);
-        bail!(
-            "{} changed during upgrade; no replacement installed. Its contents are retained at {}; inspect both before retrying",
-            file.display(),
-            backup.display()
-        );
+    let mut tmp = tempfile::NamedTempFile::new_in(stage.path())?;
+    tmp.write_all(current.as_bytes())?;
+    tmp.as_file().sync_all()?;
+    if expected == Contents::Missing {
+        tmp.persist_noclobber(file)?;
+        return Ok(());
     }
-    Ok(backup)
+
+    // A user can edit the file between inspection and upgrade. Check the actual
+    // file moved aside, and never overwrite a competing writer at the destination.
+    let old = stage.path().join("previous");
+    fs::rename(file, &old)?;
+    let result = (|| {
+        ensure!(
+            contents(&old, current)? == Contents::Previous,
+            "skill changed during upgrade"
+        );
+        tmp.persist_noclobber(file)?;
+        Ok(())
+    })();
+    if let Err(error) = result {
+        if fs::hard_link(&old, file).is_err() {
+            let _ = stage.keep();
+            bail!(
+                "could not safely finish the upgrade: {error}; previous skill retained at {}",
+                old.display()
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 pub fn run(cmd: Skill, js: bool) -> Result<()> {
     let Skill::Install { target, dest } = cmd;
     let dest = match dest {
-        Some(p) => Destination::explicit(target, p)?,
+        Some(p) => Destination(p),
         None => Destination::harness(&home()?, target)?,
     };
     ensure!(
-        !js || dest.root.to_str().is_some(),
+        !js || dest.0.to_str().is_some(),
         "the skill path cannot be represented in JSON; choose a Unicode path or omit --json"
     );
     let (state, file) = dest.install(false)?;
     ensure!(
         state != "customized",
-        "{} already exists and differs; move it aside or merge the instructions manually",
+        "skill bundle at {} is user-managed; move it aside or merge the instructions manually",
         file.display()
     );
     crate::roles_cli::output(
@@ -347,41 +224,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stock_coordinators_upgrade_without_replacing_custom_workflows() {
+    fn concurrent_edits_are_never_overwritten() {
         let root = tempfile::tempdir().unwrap();
-        let dest = Destination::explicit(Target::Path, root.path().into()).unwrap();
         let file = root.path().join(FILE);
         fs::create_dir(file.parent().unwrap()).unwrap();
-        for previous in [
-            include_bytes!("../tests/fixtures/coordinator-v17.md").as_slice(),
-            include_bytes!("../tests/fixtures/coordinator-v18.md").as_slice(),
-            include_bytes!("../tests/fixtures/coordinator-v19.md").as_slice(),
-            include_bytes!("../tests/fixtures/coordinator-v20.md").as_slice(),
-            include_bytes!("../tests/fixtures/coordinator-v21.md").as_slice(),
-        ] {
-            fs::write(&file, previous).unwrap();
-            assert_eq!(dest.install(false).unwrap().0, "upgraded");
-            assert_eq!(fs::read_to_string(&file).unwrap(), COORDINATOR);
+        fs::write(&file, "user edit").unwrap();
+        for observed in [Contents::Missing, Contents::Previous] {
+            assert!(publish(root.path(), &file, observed, &with_receipt(COORDINATOR)).is_err());
+            assert_eq!(fs::read_to_string(&file).unwrap(), "user edit");
         }
-        fs::write(&file, b"local instructions").unwrap();
-        assert_eq!(dest.install(false).unwrap().0, "customized");
-    }
-
-    #[test]
-    fn archived_file_is_rechecked_before_replacing_it() {
-        let tmp = tempfile::tempdir().unwrap();
-        let slot = tmp.path().join(FILE);
-        fs::create_dir(slot.parent().unwrap()).unwrap();
-        fs::write(
-            &slot,
-            include_bytes!("../tests/fixtures/coordinator-v15.md"),
-        )
-        .unwrap();
-        let observed = inspect(&slot).unwrap();
-        assert!(observed == Contents::Previous);
-        fs::write(&slot, b"edited after inspection").unwrap();
-        let failure = archive_stock(&slot, observed).unwrap_err().to_string();
-        assert!(failure.contains("changed during upgrade"));
-        assert_eq!(fs::read(slot).unwrap(), b"edited after inspection");
     }
 }

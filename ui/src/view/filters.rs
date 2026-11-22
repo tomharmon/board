@@ -20,12 +20,6 @@ pub(super) fn summary(s: &State) -> El {
     if let Some(who) = &f.mentions {
         terms.push(format!("Mentions {who}"));
     }
-    for l in &f.label_terms {
-        terms.push(l.values.as_ref().map_or_else(
-            || format!("Has {}", l.key),
-            |v| format!("{}={}", l.key, v.join("|")),
-        ));
-    }
     if s.page == Page::Activity && !s.query.text.is_empty() {
         terms.push(format!("Text: {}", s.query.text));
     }
@@ -121,17 +115,7 @@ pub(super) fn view(s: &State, inset: f32) -> El {
             &b.words,
             |s| &mut s.browse.words,
             false,
-        ))
-        .child(field(
-            "filter-labels",
-            "Labels (one per line)",
-            &b.labels,
-            |s| &mut s.browse.labels,
-            true,
         ));
-    if let Some(choices) = suggestions::labels(s, suggestions::Field::Filter) {
-        content = content.child(choices);
-    }
     content = content.child(
         row()
             .w_full()

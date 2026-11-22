@@ -6,9 +6,7 @@ pub struct Delivery {
     pub(super) instance: std::sync::Arc<()>,
     pub open: bool,
     pub no_sync: bool,
-    pub review_before_send: bool,
     pub after: Option<i64>,
-    pub labels: TextEdit,
     pub stamp: Option<String>,
     files_dirty: bool,
 }
@@ -18,9 +16,7 @@ impl From<ComposerSettings> for Delivery {
             instance: std::sync::Arc::new(()),
             open: false,
             no_sync: d.no_sync,
-            review_before_send: d.review_before_send,
             after: d.after,
-            labels: TextEdit::new(d.labels),
             stamp: None,
             files_dirty: false,
         }
@@ -35,10 +31,8 @@ impl Delivery {
     fn settings(&self) -> ComposerSettings {
         ComposerSettings {
             no_sync: self.no_sync,
-            review_before_send: self.review_before_send,
             after: self.after,
-            labels: self.labels.text.clone(),
-            task: None,
+            ..Default::default()
         }
     }
 }
@@ -132,20 +126,6 @@ impl State {
     pub fn open_delivery(&mut self) {
         self.delivery.open = true;
     }
-    pub fn enable_manual_send(&mut self) {
-        if !self.delivery.review_before_send {
-            return;
-        }
-        self.delivery.review_before_send = false;
-        self.draft_changed();
-        match self.flush_draft() {
-            Ok(()) => self.error = None,
-            Err(e) => {
-                self.delivery.review_before_send = true;
-                self.error = Some(format!("Draft not saved: {e:#}"));
-            }
-        }
-    }
     pub fn guard_reply(&mut self, id: i64, tx: &mut Tx) {
         if !self.activate_draft(false) {
             return;
@@ -235,9 +215,6 @@ impl State {
         }
     }
     pub fn send(&mut self, tx: &mut Tx) {
-        if self.delivery.review_before_send {
-            return;
-        }
         let mut run = || -> Result<Message> {
             let scope = self.draft_scope().context("No active composer")?;
             self.flush_draft()?;
@@ -246,7 +223,6 @@ impl State {
                 files: self.files.clone(),
                 no_sync: self.delivery.no_sync,
                 after: self.delivery.after,
-                labels: self.delivery.settings().parsed_labels()?,
                 ..Default::default()
             };
             let db = self.db()?;

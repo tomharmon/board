@@ -15,11 +15,6 @@ pub(super) fn init(c: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS events_by_actor ON events(actor);
         CREATE INDEX IF NOT EXISTS thread_activity_channel ON thread_activity(channel,activity);
         CREATE INDEX IF NOT EXISTS live_replies_by_root ON messages(re,id) WHERE re IS NOT NULL AND deleted=0;
-        INSERT OR REPLACE INTO channel_activity
-          SELECT channel,count(*) FILTER (WHERE re IS NULL),count(*),max(id) FROM messages GROUP BY channel;
-        INSERT OR REPLACE INTO thread_activity
-          SELECT r.id,r.channel,count(m.id),coalesce(max(m.id),r.id) FROM messages r
-           LEFT JOIN messages m ON m.re=r.id AND m.deleted=0 WHERE r.re IS NULL GROUP BY r.id;
         CREATE TRIGGER IF NOT EXISTS activity_on_post AFTER INSERT ON messages BEGIN
             INSERT INTO channel_activity VALUES(new.channel,new.re IS NULL,1,new.id)
               ON CONFLICT(channel) DO UPDATE SET total=total+1,roots=roots+excluded.roots,latest=max(latest,excluded.latest);

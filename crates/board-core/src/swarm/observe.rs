@@ -1,17 +1,20 @@
 use super::*;
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RunAction {
     pub cursor: i64,
     pub kind: String,
     pub assigned_to: String,
     pub summary: String,
     pub message_id: i64,
+    pub thread_id: i64,
     pub task_id: Option<i64>,
     pub blocked_dependents: i64,
     pub worker: Option<String>,
 }
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RunChange {
     pub cursor: i64,
     pub kind: String,
@@ -20,23 +23,26 @@ pub struct RunChange {
     pub worker: Option<String>,
 }
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct RunThread {
     pub id: i64,
     pub title: String,
-    pub workstream: Option<String>,
     pub state: String,
     pub assignee: Option<String>,
+    pub briefed_workers: Vec<String>,
     pub claimant: Option<String>,
     pub latest_handoff: Option<i64>,
     pub latest_check: Option<i64>,
 }
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TaskExplanation {
     pub task_id: i64,
     pub steps: Vec<WaitStep>,
     pub truncated: bool,
 }
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct WaitStep {
     pub id: i64,
     pub title: String,
@@ -58,13 +64,13 @@ impl WaitStep {
     }
 }
 #[derive(Debug, Serialize)]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct SwarmObservation {
     pub run: String,
     pub goal: String,
     pub channel: String,
+    pub thread_id: i64,
     pub status: String,
-    pub policy: RunPolicy,
-    pub available_capacity: i64,
     pub workers: BTreeMap<String, i64>,
     pub tasks: BTreeMap<String, i64>,
     pub threads: Vec<RunThread>,
@@ -102,7 +108,19 @@ impl Board {
         );
         let tx = self.conn.unchecked_transaction()?;
         let (access, r) = self.swarm_record(&tx, actor, run, Action::Read)?;
-        let mut pending = vec![(task_id, r.channel.clone())];
+        let channels = access.read_channels_json(&tx)?;
+        let channel: String = tx
+            .query_row(
+                concat!(
+                    include_str!("readable_threads.sql"),
+                    "SELECT channel FROM run_threads WHERE id=?3"
+                ),
+                params![channels, r.id, task_id],
+                |s| s.get(0),
+            )
+            .optional()?
+            .context(Missing.error("not_found", "task not found in this run"))?;
+        let mut pending = vec![(task_id, channel)];
         let mut seen = BTreeSet::from([task_id]);
         let mut steps = Vec::new();
         let mut task = tx.prepare("SELECT substr(m.text,1,160),
@@ -165,7 +183,7 @@ impl Board {
                 state,
                 reason,
                 waits_on,
-                handoff: task_handoff_on(&tx, &access, id, Some(r.id))?,
+                handoff: task_handoff_on(&tx, channels.as_deref(), id, Some(r.id))?,
             });
         }
         drop((task, needs));
@@ -194,8 +212,9 @@ impl Board {
     pub fn swarm_mark_public_seen(&self, actor: &str, run: &str, through: i64) -> Result<()> {
         self.write(|tx| {
             let (a, r) = self.swarm_record(tx, actor, run, Action::Read)?;
-            ensure!(tx.query_row("SELECT EXISTS(SELECT 1 FROM messages WHERE channel=? AND id=? AND id>=?)",
-                params![r.channel, through, r.root_id], |s| s.get::<_,bool>(0))?,
+            ensure!(tx.query_row(concat!(include_str!("readable_threads.sql"),
+                "SELECT EXISTS(SELECT 1 FROM messages m JOIN run_threads s ON s.id=coalesce(m.re,m.id) WHERE m.id=?3)"),
+                params![a.read_channels_json(tx)?, r.id, through], |s| s.get::<_,bool>(0))?,
                 Invalid.error("invalid_cursor","expected a public message from this run"));
             tx.execute("INSERT INTO swarm_public_seen VALUES(?,?,?) ON CONFLICT(run_id,viewer) DO UPDATE SET through=max(through,excluded.through)",
                 params![r.id, a.private_key(actor)?, through])?;
@@ -234,8 +253,8 @@ impl Board {
             )
         );
         let tx = self.conn.unchecked_transaction()?;
-        let (_, r) = self.swarm_record(&tx, actor, run, Action::Read)?;
-        let policy = RunPolicy::read(&tx, r.id)?;
+        let (access, r) = self.swarm_record(&tx, actor, run, Action::Read)?;
+        let channels = access.read_channels_json(&tx)?;
         let workers = counts(
             &tx,
             "SELECT status,count(*) FROM swarm_workers WHERE run_id=? GROUP BY status",
@@ -243,49 +262,60 @@ impl Board {
         )?;
         let tasks = counts(
             &tx,
-            "SELECT CASE WHEN t.state='claimed' AND t.lease_until<=unixepoch() THEN 'expired' ELSE t.state END AS effective,count(*) FROM messages m JOIN tasks t USING(id) WHERE m.channel=? AND NOT m.deleted GROUP BY effective",
-            [&r.channel],
+            concat!(
+                include_str!("readable_threads.sql"),
+                "SELECT CASE WHEN t.state='claimed' AND t.lease_until<=unixepoch() THEN 'expired' ELSE t.state END AS effective,count(*) FROM run_threads JOIN tasks t USING(id) GROUP BY effective"
+            ),
+            params![channels, r.id],
         )?;
-        let occupied = workers.get("working").copied().unwrap_or(0)
-            + workers.get("waiting").copied().unwrap_or(0);
-        let capacity = if r.status == "active" {
-            (policy.max_active - occupied).max(0)
-        } else {
-            0
-        };
         let fetch = (limit + 1) as i64;
         let mut threads = rows(
-            tx.prepare(include_str!("observation_threads.sql"))?
-                .query_map(params![r.channel, r.id, task_after, fetch], |s| {
-                    Ok(RunThread {
-                        id: s.get(0)?,
-                        title: s
-                            .get::<_, String>(1)?
-                            .lines()
-                            .next()
-                            .unwrap_or("")
-                            .to_owned(),
-                        workstream: s.get(2)?,
-                        state: s.get(3)?,
-                        assignee: s.get(4)?,
-                        claimant: s.get(5)?,
-                        latest_handoff: s.get(6)?,
-                        latest_check: s.get(7)?,
-                    })
-                })?,
+            tx.prepare(concat!(
+                include_str!("readable_threads.sql"),
+                ", selected_runs AS (SELECT ?2 AS id)",
+                include_str!("readable_evidence.sql"),
+                include_str!("observation_threads.sql")
+            ))?
+            .query_map(params![channels, r.id, task_after, fetch], |s| {
+                Ok(RunThread {
+                    id: s.get(0)?,
+                    title: s
+                        .get::<_, String>(1)?
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned(),
+                    state: s.get(2)?,
+                    assignee: s.get(3)?,
+                    claimant: s.get(4)?,
+                    latest_handoff: s.get(5)?,
+                    latest_check: s.get(6)?,
+                    briefed_workers: serde_json::from_str(s.get_ref(7)?.as_str()?).map_err(
+                        |e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                7,
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        },
+                    )?,
+                })
+            })?,
         )?;
         let next_task_after = (threads.len() > limit).then(|| threads[limit - 1].id);
         threads.truncate(limit);
         let mut actions = rows(
             tx.prepare(concat!(
-                "WITH selected_runs AS (SELECT id,root_id,status,coordinator_actor FROM swarm_runs WHERE id=?1)",
+                include_str!("readable_threads.sql"),
+                ", selected_runs AS (SELECT id,slug,root_id,status,coordinator_actor FROM swarm_runs WHERE id=?2)",
+                include_str!("readable_evidence.sql"),
                 include_str!("current_run_actions.sql"),
                 include_str!("observation_actions.sql")
             ))?
                 .query_map(
                     params![
+                        channels,
                         r.id,
-                        r.channel,
                         action_after,
                         fetch
                     ],
@@ -299,6 +329,7 @@ impl Board {
                             task_id: s.get(5)?,
                             blocked_dependents: s.get(6)?,
                             worker: s.get(7)?,
+                            thread_id: s.get(8)?,
                         })
                     },
                 )?,
@@ -308,12 +339,16 @@ impl Board {
         // A first observation gives recent context; an explicit cursor delivers every
         // subsequent change oldest first. A newer unrelated event never advances it.
         let order = if after.is_some() { "ASC" } else { "DESC" };
-        let sql=format!("SELECT e.cursor,CASE WHEN e.kind='message.posted' THEN coalesce(v.kind,'swarm.started') ELSE e.kind END,e.message_id,e.actor,json_extract(e.payload,'$.worker')
-          FROM events e JOIN messages m ON m.id=e.message_id LEFT JOIN swarm_evidence v ON v.message_id=e.cursor AND v.run_id=?1
-          WHERE m.channel=?2 AND e.cursor>?3 AND (e.kind GLOB 'task.*' OR e.kind IN ('swarm.registered','swarm.checked_in','swarm.launch_failed','swarm.status','swarm.stopped','swarm.limit','swarm.budget_reached') OR (e.kind='message.posted' AND (v.message_id IS NOT NULL OR e.message_id=?4)))
-          ORDER BY e.cursor {order} LIMIT ?5");
+        let sql=format!(concat!(include_str!("readable_threads.sql"),
+          ", selected_runs AS (SELECT ?2 AS id)", include_str!("readable_evidence.sql"),
+          " SELECT e.cursor,coalesce(v.kind,e.kind),e.message_id,e.actor,json_extract(e.payload,'$.worker')
+          FROM events e LEFT JOIN readable_evidence v ON v.message_id=e.cursor AND e.kind='message.posted'
+          WHERE e.cursor>?3 AND ((e.kind GLOB 'task.*' AND e.message_id IN (SELECT id FROM run_threads))
+            OR (e.kind IN ('swarm.started','swarm.registered','swarm.checked_in','swarm.launch_failed','swarm.status','swarm.stopped','swarm.limit','swarm.budget_reached') AND json_extract(e.payload,'$.run')=?4)
+            OR v.message_id IS NOT NULL)
+          ORDER BY e.cursor {} LIMIT ?5"), order);
         let mut changes = rows(tx.prepare(&sql)?.query_map(
-            params![r.id, r.channel, after.unwrap_or(0), r.root_id, fetch],
+            params![channels, r.id, after.unwrap_or(0), r.slug, fetch],
             |s| {
                 Ok(RunChange {
                     cursor: s.get(0)?,
@@ -338,9 +373,8 @@ impl Board {
             run: r.slug,
             goal: r.goal,
             channel: r.channel,
+            thread_id: r.thread_id,
             status: r.status,
-            policy,
-            available_capacity: capacity,
             workers,
             tasks,
             threads,

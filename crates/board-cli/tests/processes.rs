@@ -45,6 +45,45 @@ fn err(db: &Path, args: &[&str], status: i32, code: &str) {
 }
 
 #[test]
+fn retired_flags_fail_before_opening_the_board() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("board.db");
+    for args in [
+        &["post", "work", "unwritten", "--label", "pool=old"][..],
+        &["label", "42", "state=completed"],
+        &["read", "work", "--label", "team=one"],
+        &["watchers", "add", "w", "work", "--label", "team=one"],
+        &["tasks", "list", "work", "--label", "team=one"],
+        &["tasks", "claim", "--ready", "work"],
+        &["tasks", "run", "--ready", "work", "--", "unused"],
+        &["tasks", "assign", "42", "--pool"],
+        &["mcp", "--queue"],
+        &[
+            "swarm",
+            "start",
+            "demo",
+            "--channel",
+            "work",
+            "--max-active",
+            "2",
+        ],
+        &[
+            "swarm",
+            "start",
+            "demo",
+            "--channel",
+            "work",
+            "--retry-budget",
+            "1",
+        ],
+    ] {
+        let out = invoke(&db, args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(!db.exists(), "{args:?} opened the database");
+    }
+}
+
+#[test]
 fn cli_retry_wait_resume_and_online_backup() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("board.db");
@@ -355,10 +394,6 @@ fn clock_sends_are_neither_advertised_nor_accepted() {
             .iter()
             .any(|f| f == "schedules")
     );
-    assert_eq!(
-        ok(&db, &["migrate", "export-schedules"])["schedules"],
-        serde_json::json!([])
-    );
 }
 
 #[test]
@@ -503,33 +538,15 @@ fn restarted_watcher_runs_an_event_driven_reply_without_a_worker() {
             "lab/",
             "--kind",
             "message.posted",
-            "--label",
-            "job=sample",
         ],
     );
     assert!(ok(&db, &["watchers", "next", "inbox"]).is_null());
-    let sent = ok(
-        &db,
-        &[
-            "post",
-            "lab/bench",
-            "Read the sample",
-            "--label",
-            "job=sample",
-        ],
-    );
+    let sent = ok(&db, &["post", "lab/bench", "Read the sample"]);
     let id = sent["message"]["id"].to_string();
     let event = ok(&db, &["watchers", "next", "inbox"]);
     assert_eq!(event["message"]["text"], "Read the sample");
     assert_eq!(ok(&db, &["watchers", "next", "inbox"]), event);
-    let handler = [
-        env!("CARGO_BIN_EXE_board"),
-        "reply",
-        &id,
-        "Sample reviewed",
-        "--label",
-        "job=sample",
-    ];
+    let handler = [env!("CARGO_BIN_EXE_board"), "reply", &id, "Sample reviewed"];
     let mut run = vec!["watchers", "run", "inbox", "--once", "--"];
     run.extend(handler);
     assert_eq!(ok(&db, &run)["cursor"], event["cursor"]);

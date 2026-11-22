@@ -188,23 +188,16 @@ fn channel_rules_intersect_caps_refresh_live_and_filter_before_paging() -> Resul
             .post("dev/open", "owner", "spoof", &Default::default())
             .is_err()
     );
+    use board_local::automation::{TaskTarget, create_task};
     assert!(
-        limited
-            .post(
-                "dev/open",
-                "ada/bot",
-                "with labels",
-                &PostOptions {
-                    labels: [("a".into(), "x".into())].into(),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-    );
-    assert!(
-        limited
-            .label(visible.id, "ada/bot", "state", Some("done"))
-            .is_err()
+        create_task(
+            &limited,
+            "ada/bot",
+            TaskTarget::Existing(visible.id),
+            &[],
+            None
+        )
+        .is_err()
     );
     assert!(limited.backup(&dir.path().join("no-copy")).is_err());
     assert!(limited.grants().is_err() && limited.credentials().is_err());
@@ -215,7 +208,13 @@ fn channel_rules_intersect_caps_refresh_live_and_filter_before_paging() -> Resul
     );
     assert_eq!(b.cursor()?, before);
     limited.react(exact.id, "ada/bot", "eyes", false)?;
-    limited.label(exception.id, "ada/bot", "state", Some("done"))?;
+    create_task(
+        &limited,
+        "ada/bot",
+        TaskTarget::Existing(exception.id),
+        &[],
+        None,
+    )?;
     limited.reply(visible.id, "ada/bot", "mine", &Default::default())?;
     b.set_grant(
         "owner",
@@ -263,7 +262,7 @@ fn blind_own_retries_return_only_the_original_post_not_thread_activity() -> Resu
     };
     let m = agent.post("in/log", "runner", "original", &key)?;
     b.react(m.id, "secret-person", "eyes", false)?;
-    b.label(m.id, "owner", "internal", Some("confidential"))?;
+    b.reply(m.id, "owner", "confidential", &Default::default())?;
     b.edit(m.id, "runner", "internal edit", None)?;
     assert_eq!(agent.posted("runner", "ping")?, m);
     assert_eq!(agent.post("in/log", "runner", "different", &key)?, m);
@@ -274,21 +273,8 @@ fn blind_own_retries_return_only_the_original_post_not_thread_activity() -> Resu
                 .is_err()
     );
     assert!(agent.channels()?.is_empty());
-    assert!(
-        agent
-            .post(
-                "in/log",
-                "runner",
-                "no labels",
-                &PostOptions {
-                    labels: [("tag".into(), "x".into())].into(),
-                    ..Default::default()
-                }
-            )
-            .is_err()
-    );
     let fixed = agent.edit(m.id, "runner", "fixed", None)?;
-    assert!(fixed.labels.is_empty() && fixed.reactions.is_empty());
+    assert!(fixed.reactions.is_empty());
     b.set_grant(
         "owner",
         Some(grant.id),
@@ -324,10 +310,8 @@ fn historical_tail_uses_current_content_but_live_resume_keeps_event_time_and_che
         .post("dev", "ann", "old words", &Default::default())
         .unwrap();
     b.react(m.id, "bob", "eyes", false).unwrap();
-    b.label(m.id, "ann", "one", Some("removed")).unwrap();
     b.edit(m.id, "ann", "new words", None).unwrap();
     b.react(m.id, "bob", "eyes", true).unwrap();
-    b.label(m.id, "ann", "one", None).unwrap();
     let words = Filter {
         text: Some("old words".into()),
         ..Default::default()

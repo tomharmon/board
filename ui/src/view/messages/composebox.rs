@@ -1,7 +1,7 @@
 use super::*;
 
 fn can_send(s: &State) -> bool {
-    !s.delivery.review_before_send && (!s.body.text.trim().is_empty() || !s.files.is_empty())
+    !s.body.text.trim().is_empty() || !s.files.is_empty()
 }
 fn body(s: &State, reply: bool) -> El {
     let placeholder = if reply {
@@ -192,64 +192,13 @@ pub(super) fn edit(s: &State, reply: bool, inset: f32) -> El {
     if let Some(id) = s.delivery.after {
         area = area.child(delivery::guard(id));
     }
-    if s.delivery.review_before_send {
+    if s.delivery.no_sync {
         area = area.child(
             row()
-                .w_full()
                 .px(8.)
                 .pt(6.)
-                .gap(6.)
-                .center_y()
-                .child(
-                    label(
-                        "Originally saved for later. This draft has not been sent.",
-                        12.,
-                        450.,
-                        INK,
-                    )
-                    .grow(1.)
-                    .min_w(0.)
-                    .wrap_anywhere(),
-                )
-                .child(
-                    action("enable-manual-send", "Enable manual send", false)
-                        .on_press(State::enable_manual_send),
-                ),
+                .child(chip("Local only").key("draft-local-only")),
         );
-    }
-    let mut labels = s
-        .delivery
-        .labels
-        .text
-        .lines()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .peekable();
-    if s.delivery.no_sync || labels.peek().is_some() {
-        let mut flags = row().w_full().flex_wrap().px(8.).pt(6.).gap(4.);
-        if s.delivery.no_sync {
-            flags = flags.child(chip("Local only").key("draft-local-only"));
-        }
-        for (i, v) in labels.by_ref().take(3).enumerate() {
-            let short = v.chars().take(60).collect::<String>();
-            flags = flags.child(
-                click(
-                    chip(short).key(format!("draft-label-{i}")),
-                    "Edit draft labels",
-                )
-                .on_press(State::open_delivery),
-            );
-        }
-        if labels.peek().is_some() {
-            flags = flags.child(
-                click(
-                    chip(format!("+{}", labels.count())).key("draft-more-labels"),
-                    "Edit draft labels",
-                )
-                .on_press(State::open_delivery),
-            );
-        }
-        area = area.child(flags);
     }
     area = area.child(body(s, reply));
     if s.inline_open() {
@@ -425,7 +374,7 @@ pub(super) fn activation(s: &State, inset: f32, root: bool) -> El {
         .child(
             tool(
                 &format!("{prefix}-options"),
-                "Labels and delivery options",
+                "Delivery options",
                 &icons::TAG,
             )
             .on_press_tx(move |s: &mut State, tx| {

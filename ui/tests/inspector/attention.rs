@@ -11,13 +11,14 @@ fn seed(f: &Fixture) -> (i64, i64) {
             "reader",
             &SwarmStart {
                 goal: "Verify Unicode handling".into(),
+                channel: Some("release".into()),
                 slug: Some("unicode".into()),
                 ..Default::default()
             },
         )
         .unwrap();
     for name in ["impl", "verify"] {
-        b.swarm_add_worker(
+        b.swarm_register_worker(
             "reader",
             "unicode",
             &SwarmAddWorker {
@@ -28,7 +29,8 @@ fn seed(f: &Fixture) -> (i64, i64) {
         )
         .unwrap();
     }
-    b.swarm_check_in("reader/impl", "unicode", "impl").unwrap();
+    b.swarm_check_in("reader/impl", "unicode", None, None, None)
+        .unwrap();
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
     let post = |who, name, data| {
         b.swarm_post(

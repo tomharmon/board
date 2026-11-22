@@ -353,7 +353,10 @@ fn strict_ack_over_loopback_and_cli_shares_the_proven_outcome_but_default_put_re
     let (s, api) = http(&addr, "GET", "openapi.json", master, None, Value::Null);
     assert_eq!(s, 200);
     let ack_schema = &api["paths"]["/watchers/{name}/acknowledgements/{cursor}"]["put"];
-    assert_eq!(ack_schema["requestBody"]["required"], false);
+    let body = &ack_schema["requestBody"];
+    assert!(body["content"]["application/json"]["schema"].is_object());
+    // OpenAPI defaults an omitted requestBody.required to false.
+    assert!(!body["required"].as_bool().unwrap_or(false));
     assert!(ack_schema["responses"]["412"].is_object());
     assert_eq!(
         api["components"]["schemas"]["WatcherAck"]["properties"]["if_pending"]["default"],
@@ -477,16 +480,6 @@ fn read_only_sync_lookups_observe_live_cli_and_rest_grants() {
     assert_eq!(get("links?url=https%3A%2F%2Ftest.invalid%2Fabsent"), hidden);
     assert_eq!(get(&format!("messages/{}/sync", examples[0])).0, 404);
     assert!(matches!(get("sources/open/inbox").0, 403 | 404));
-    let export = board(&db)
-        .env("BOARD_TOKEN", token)
-        .args(["migrate", "export-schedules"])
-        .output()
-        .unwrap();
-    assert!(!export.status.success());
-    assert!(
-        export.stdout.is_empty(),
-        "no archive bytes before authorization"
-    );
 }
 
 #[test]

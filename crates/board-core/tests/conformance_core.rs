@@ -155,40 +155,12 @@ fn profile_headers_edit_timestamps_limits_and_noop_events_hold_in_the_database()
     assert_eq!(b.react(root.id, "owner", "👀", false)?.version, head);
     assert!(b.react(root.id, "owner", "bad:name", false).is_err());
     assert!(b.react(root.id, "owner", "constructor", false).is_err());
-    assert!(
-        b.labels(
-            root.id,
-            "owner",
-            &Default::default(),
-            &[],
-            &(0..17).map(|i| (format!("k{i}"), None)).collect()
-        )
-        .is_err()
-    );
-    assert!(
-        b.labels(
-            root.id,
-            "owner",
-            &Default::default(),
-            &[],
-            &[("bad key".into(), None)].into()
-        )
-        .is_err()
-    );
-    b.labels(
-        root.id,
-        "owner",
-        &Default::default(),
-        &[],
-        &[("board.task".into(), None)].into(),
-    )?;
+    let mut retired = serde_json::to_value(PostOptions::default())?;
+    retired["labels"] = serde_json::json!({"priority":"high"});
+    assert!(serde_json::from_value::<PostOptions>(retired).is_err());
     assert_eq!(b.cursor()?, head);
     assert!(
         b.post("public", "owner", &"🌟".repeat(5001), &Default::default())
-            .is_err()
-    );
-    assert!(
-        b.label(root.id, "owner", "k", Some(&"🌟".repeat(129)))
             .is_err()
     );
     assert!(

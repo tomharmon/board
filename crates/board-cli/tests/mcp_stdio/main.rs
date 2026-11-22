@@ -1,3 +1,7 @@
+mod client;
+mod protocol;
+mod worker_identity;
+
 use std::{
     io::Write,
     process::{Command, Stdio},
@@ -38,7 +42,7 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         (
             3,
             "tools/call",
-            json!({"name":"swarm_start","arguments":{"goal":"Verify single database","slug":"sample"}}),
+            json!({"name":"swarm_start","arguments":{"channel":"project","goal":"Verify single database","slug":"sample"}}),
         ),
         (
             4,
@@ -53,7 +57,7 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         (
             6,
             "tools/call",
-            json!({"name":"tasks_plan","arguments":{"channel":"swarms/sample","key":"sample-plan","tasks":items}}),
+            json!({"name":"tasks_plan","arguments":{"channel":"project","key":"sample-plan","tasks":items}}),
         ),
     ] {
         writeln!(
@@ -115,14 +119,7 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         .env("BOARD_USER", "team")
         .arg("--db")
         .arg(&path)
-        .args([
-            "--json",
-            "--as",
-            "architect",
-            "tasks",
-            "create",
-            "swarms/sample",
-        ])
+        .args(["--json", "--as", "architect", "tasks", "create", "project"])
         .args(["--idempotency-key", "sample-plan", "--file"])
         .arg(file)
         .output()

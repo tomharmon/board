@@ -43,8 +43,6 @@ struct TaskList {
     /// List the tasks depending on this prerequisite
     #[arg(long)]
     needs: Option<i64>,
-    #[arg(long = "label", value_name = "KEY[=VALUE]")]
-    labels: Vec<String>,
     #[arg(long)]
     by: Option<String>,
     #[arg(long)]
@@ -75,18 +73,9 @@ struct Held {
 
 #[derive(Debug, Args)]
 struct ClaimArgs {
-    #[arg(required_unless_present = "ready", conflicts_with = "ready")]
-    id: Option<i64>,
-    #[arg(long)]
-    ready: Option<String>,
-    #[arg(long = "label", requires = "ready")]
-    labels: Vec<String>,
+    id: i64,
     #[arg(long, default_value = "15m")]
     lease: String,
-    #[arg(long, requires = "ready")]
-    wait: Option<String>,
-    #[arg(long = "from", requires = "ready")]
-    owners: Vec<String>,
     /// Caller-minted secret for retries after a lost response
     #[arg(
         long,
@@ -107,15 +96,16 @@ enum TaskCmd {
         needs: Vec<i64>,
         #[arg(long = "for")]
         assignee: Option<String>,
-        #[arg(long = "label")]
-        labels: Vec<String>,
         #[arg(long = "attach", value_name = "FILE", conflicts_with = "file")]
         attachments: Vec<PathBuf>,
         #[arg(long = "attachment-id", conflicts_with = "file")]
         attachment_ids: Vec<String>,
-        /// JSON plan; larger than 100 tasks uses resumable chunks. Use - for stdin.
-        #[arg(long, conflicts_with_all=["text","needs","assignee","labels"])]
+        /// Atomic JSON plan (1-100 tasks). Use - for stdin.
+        #[arg(long, conflicts_with_all=["text","needs","assignee"])]
         file: Option<String>,
+        /// Associate the plan's task threads with this swarm (does not change access or claim them).
+        #[arg(long, requires = "file")]
+        run: Option<String>,
         #[arg(long)]
         idempotency_key: Option<String>,
         #[arg(long, conflicts_with = "file")]
@@ -136,7 +126,7 @@ enum TaskCmd {
     },
     /// List open tasks; --state all includes terminal tasks.
     List(TaskList),
-    /// Claim by ID or atomically take the oldest matching ready task.
+    /// Lease the specified task.
     Claim(ClaimArgs),
     /// Run an explicitly supplied program under a renewable task lease
     Run {
@@ -203,10 +193,10 @@ enum TaskCmd {
     },
     Assign {
         id: i64,
-        #[arg(required_unless_present = "pool", conflicts_with = "pool")]
+        #[arg(required_unless_present = "none", conflicts_with = "none")]
         profile: Option<String>,
         #[arg(long)]
-        pool: bool,
+        none: bool,
     },
     Needs {
         id: i64,
@@ -258,8 +248,6 @@ pub enum WatchCmd {
         text: Option<String>,
         #[arg(long)]
         mentions: Option<String>,
-        #[arg(long = "label")]
-        labels: Vec<String>,
     },
     List,
     /// Deliver the next match. It remains pending until acknowledged.
@@ -359,8 +347,6 @@ fn list(board: &Board, actor: &str, q: &TaskList, json: bool) -> Result<()> {
         channel: q.channel.clone(),
         state: q.state.clone(),
         needs: q.needs,
-        labels: Default::default(),
-        label_terms: board_local::LabelTerm::parse(&q.labels)?,
         by: q.by.clone(),
         owner: q.owner.clone(),
         assignee: q.assignee.as_deref().map(|p| assignee(actor, p)),
@@ -404,43 +390,20 @@ fn take(
     cache: &Cache,
     binding: Option<&board_local::swarm::WorkerBinding>,
 ) -> Result<Task> {
-    let lease = secs(&args.lease)?;
-    let labels = crate::pairs(&args.labels, false)?;
-    let wait = args
-        .wait
-        .as_deref()
-        .map(humantime::parse_duration)
-        .transpose()?
-        .unwrap_or_default();
+    let lease_seconds = secs(&args.lease)?;
     let proof = cache.prepare(args.token.as_deref())?;
-    let start = Instant::now();
-    loop {
-        let target = args.id.map_or_else(
-            || ClaimTarget::Ready(args.ready.as_deref().unwrap_or("")),
-            ClaimTarget::Id,
-        );
-        match claim_in_assignment(
-            board,
-            actor,
-            target,
-            ClaimRequest {
-                lease_seconds: lease,
-                token: &proof,
-            },
-            &labels,
-            &args.owners,
-            binding,
-        ) {
-            Ok(t) => {
-                cache.remember(&t)?;
-                return Ok(t);
-            }
-            Err(e) if e.is::<NothingReady>() && start.elapsed() < wait => {
-                sleep(Duration::from_millis(200).min(wait.saturating_sub(start.elapsed())))
-            }
-            Err(e) => return Err(e),
-        }
-    }
+    let (t, _) = claim_in_assignment(
+        board,
+        actor,
+        args.id,
+        ClaimRequest {
+            lease_seconds,
+            token: &proof,
+        },
+        binding,
+    )?;
+    cache.remember(&t)?;
+    Ok(t)
 }
 fn task_command(
     cmd: TaskArgs,
@@ -485,10 +448,10 @@ fn task_command(
             text,
             needs,
             assignee: who,
-            labels: ls,
             attachments,
             attachment_ids,
             file,
+            run,
             idempotency_key: key,
             no_sync,
             claim,
@@ -502,13 +465,19 @@ fn task_command(
                     serde_json::from_reader(std::fs::File::open(file)?)?
                 };
                 let key = output_key(board, actor, key.as_deref())?;
-                let plan = create_plan(board, actor, target, &items, key.as_deref())?;
+                let (plan, _) = create_plan_for_run(
+                    board,
+                    actor,
+                    target,
+                    &items,
+                    key.as_deref(),
+                    run.as_deref(),
+                )?;
                 return print(&plan, json, || {
                     plan.iter().map(summary).collect::<Vec<_>>().join("\n")
                 });
             }
             let opts = PostOptions {
-                labels: crate::pairs(ls, false)?,
                 key: if text.is_some() || !attachments.is_empty() || !attachment_ids.is_empty() {
                     output_key(board, actor, key.as_deref())?
                 } else {
@@ -531,8 +500,8 @@ fn task_command(
                 }
                 _ => {
                     ensure!(
-                        ls.is_empty() && key.is_none() && !*no_sync,
-                        "labels and idempotency apply to new threads only"
+                        key.is_none() && !*no_sync,
+                        "idempotency and no-sync apply to new threads only"
                     );
                     TaskTarget::Existing(crate::parse_id(target).map_err(anyhow::Error::msg)?)
                 }
@@ -708,7 +677,6 @@ impl Commands {
                     re,
                     text,
                     mentions,
-                    labels: ls,
                 } => {
                     let w = add_watcher_spec(
                         board,
@@ -724,7 +692,6 @@ impl Commands {
                                 re,
                                 text,
                                 mentions,
-                                label_terms: board_local::LabelTerm::parse(&ls)?,
                                 ..Default::default()
                             },
                         },

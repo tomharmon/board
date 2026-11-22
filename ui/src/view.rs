@@ -9,7 +9,6 @@ mod properties;
 mod rich;
 mod roles;
 mod shell;
-mod suggestions;
 mod swarms;
 mod workspace;
 

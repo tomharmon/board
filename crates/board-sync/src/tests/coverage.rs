@@ -1,5 +1,24 @@
 use super::*;
 
+fn provider_fields(db: &Board, source: &str, thread: &str, fields: &[(&str, &str)]) {
+    let mut signal = upsert(
+        thread,
+        "metadata".into(),
+        "provider".into(),
+        None,
+        String::new(),
+    );
+    signal.change = Change::Signal {
+        conditions: BTreeMap::new(),
+        set: fields.iter().map(|&(k, v)| (k.into(), v.into())).collect(),
+        unset: vec![],
+        reply: None,
+    };
+    db.enqueue_imports("p", source, &[envelope(signal, Value::Null)], None)
+        .unwrap();
+    assert_eq!(db.drain_source("p", source, 5).unwrap(), (1, 0));
+}
+
 #[test]
 fn empty_as_tasks_pull_drains_an_interrupted_ordinary_checkpoint_as_claimable_work() {
     let mock = Mock::new(vec![
@@ -46,7 +65,7 @@ fn empty_as_tasks_pull_drains_an_interrupted_ordinary_checkpoint_as_claimable_wo
     let m = b.find_source("ada", "bugs", "17", None).unwrap().unwrap();
     let t = m.task.expect("a newly applied backlog root must be a task");
     assert_eq!((t.state.as_str(), t.by.as_str()), ("ready", "ada"));
-    assert_eq!(m.labels["tag.bug"], "bug");
+    assert_eq!(stored_fields(&b, m.id)["tag.bug"], "bug");
     assert!(
         b.find_source("ada", "bugs", "17", Some("comment:7"))
             .unwrap()
@@ -63,7 +82,7 @@ fn empty_as_tasks_pull_drains_an_interrupted_ordinary_checkpoint_as_claimable_wo
 
 #[test]
 fn github_pull_as_tasks_inherits_provider_labels_and_claim_survives_refetch() {
-    use board_local::automation::{ClaimTarget, claim, get_task};
+    use board_local::automation::{claim, get_task};
     let issue = json!({"number":1,"state":"open","title":"Lost receipt","body":"steps","user":{"id":1},
         "html_url":"https://github.com/org/proj/issues/1","labels":[{"name":"bug"}]});
     let comment = json!([{"id":7,"body":"confirmed","user":{"id":2},"html_url":"https://github.com/org/proj/issues/1#issuecomment-7"}]);
@@ -79,16 +98,10 @@ fn github_pull_as_tasks_inherits_provider_labels_and_claim_survives_refetch() {
     assert_eq!((r.records, r.applied, r.failed), (2, 2, 0));
     let root = b.find_source("ada", "test", "1", None).unwrap().unwrap();
     assert_eq!(root.task.as_ref().unwrap().state, "ready");
-    assert_eq!(root.labels["state"], "open");
-    assert!(root.labels.contains_key("tag.bug"));
-    let t = claim(
-        &b,
-        "ada/dev",
-        ClaimTarget::Id(root.id),
-        60,
-        &Default::default(),
-    )
-    .unwrap();
+    let fields = stored_fields(&b, root.id);
+    assert_eq!(fields["state"], "open");
+    assert!(fields.contains_key("tag.bug"));
+    let t = claim(&b, "ada/dev", root.id, 60).unwrap();
     assert_eq!(
         c.pull_with_tasks(&b, "ada", "test", Some("1"), true)
             .unwrap()
@@ -279,11 +292,16 @@ fn cross_provider_tag_filters_keep_display_values_and_sparse_updates_only_own_su
     ingest(&db, "p", "lin", "linear", "first", issue("create", opened)).unwrap();
     db.drain_source("p", "lin", 20).unwrap();
     let m = db.find_source("p", "lin", "a123", None).unwrap().unwrap();
-    assert_eq!(m.labels["tag.area-v2.1"], "._Àrea   V2.1");
-    assert_eq!(m.labels["assignee.ana"], "Ana");
-    assert_eq!(m.labels["project"], "release-plan");
-    db.label(m.id, "p", "tag.local", Some("here")).unwrap();
-    db.label(m.id, "p", "project.notes", Some("keep")).unwrap();
+    let fields = stored_fields(&db, m.id);
+    assert_eq!(fields["tag.area-v2.1"], "._Àrea   V2.1");
+    assert_eq!(fields["assignee.ana"], "Ana");
+    assert_eq!(fields["project"], "release-plan");
+    provider_fields(
+        &db,
+        "lin",
+        "a123",
+        &[("tag.extra", "extra"), ("project.notes", "keep")],
+    );
     base["assigneeId"] = json!("id-only");
     base["projectId"] = json!("id-only");
     base["priority"] = json!(0);
@@ -297,25 +315,25 @@ fn cross_provider_tag_filters_keep_display_values_and_sparse_updates_only_own_su
     )
     .unwrap();
     db.drain_source("p", "lin", 20).unwrap();
-    let m = db.get(m.id).unwrap();
+    let fields = stored_fields(&db, m.id);
     assert!(
-        m.labels.contains_key("tag.local")
-            && m.labels.contains_key("assignee.ana")
-            && !m.labels.contains_key("priority")
+        fields.contains_key("tag.extra")
+            && fields.contains_key("assignee.ana")
+            && !fields.contains_key("priority")
     );
-    assert_eq!(m.labels["project"], "release-plan");
+    assert_eq!(fields["project"], "release-plan");
     base["assigneeId"] = Value::Null;
     base["projectId"] = Value::Null;
     base["labels"] = json!([]);
     ingest(&db, "p", "lin", "linear", "remove", issue("update", base)).unwrap();
     db.drain_source("p", "lin", 20).unwrap();
-    let m = db.get(m.id).unwrap();
+    let fields = stored_fields(&db, m.id);
     assert!(
-        !m.labels
+        !fields
             .keys()
             .any(|k| k.starts_with("assignee.") || k.starts_with("tag.") || k == "project")
     );
-    assert_eq!(m.labels["project.notes"], "keep");
+    assert_eq!(fields["project.notes"], "keep");
 }
 
 #[test]
@@ -535,17 +553,12 @@ fn native_pr_lifecycle_preserves_unsupplied_tags_and_clears_only_the_old_heads_c
     ingest(&db, "p", "gh", "pull_request", "open", opened).unwrap();
     db.drain_source("p", "gh", 5).unwrap();
     let m = db.find_source("p", "gh", "4", None).unwrap().unwrap();
-    db.labels(
-        m.id,
-        "p",
-        &BTreeMap::from([
-            ("ci.3-4.build".into(), "failure".into()),
-            ("ci.other".into(), "keep".into()),
-        ]),
-        &[],
-        &BTreeMap::new(),
-    )
-    .unwrap();
+    provider_fields(
+        &db,
+        "gh",
+        "4",
+        &[("ci.3-4.build", "failure"), ("ci.other", "keep")],
+    );
     ingest(
         &db,
         "p",
@@ -561,12 +574,10 @@ fn native_pr_lifecycle_preserves_unsupplied_tags_and_clears_only_the_old_heads_c
         db.drain_source("p", "gh", 5).unwrap();
     }
     let t = db.conversation(m.id, &Default::default()).unwrap();
-    assert_eq!(t.message.labels["head"], "new");
-    assert!(
-        t.message.labels.contains_key("tag.needs-test")
-            && !t.message.labels.contains_key("ci.3-4.build")
-    );
-    assert_eq!(t.message.labels["ci.other"], "keep");
+    let fields = stored_fields(&db, m.id);
+    assert_eq!(fields["head"], "new");
+    assert!(fields.contains_key("tag.needs-test") && !fields.contains_key("ci.3-4.build"));
+    assert_eq!(fields["ci.other"], "keep");
     assert_eq!(t.replies.len(), 1);
     assert_eq!(t.replies[0].text, "closed by ada");
 }

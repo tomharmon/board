@@ -33,44 +33,6 @@ fn registering_a_mapping_takes_destinations_not_provider_urls_or_bearers() -> an
 }
 
 #[test]
-fn v12_join_upgrade_retires_unsent_roots_and_preserves_the_actual_join_boundary()
--> anyhow::Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("early.db");
-    let b = Board::open(&path)?;
-    b.create_source("p", "desk", Provider::Local, "external", "work")?;
-    b.set_outbound("p", "desk", true)?;
-    let root = b.post("work", "p", "private history", &Default::default())?;
-    b.reply(root.id, "p", "older reply", &Default::default())?;
-    b.join_source_thread("p", "desk", "T", root.id)?;
-    let next = b.reply(root.id, "p", "later reply", &Default::default())?;
-    let head = b.cursor()?;
-    drop(b);
-    let c = rusqlite::Connection::open(&path)?;
-    c.execute_batch(
-        "DROP TRIGGER sync_outgoing; DROP TRIGGER sync_outgoing_reactions;
-        ALTER TABLE sync_explicit_joins DROP COLUMN joined_at; PRAGMA user_version=12;",
-    )?;
-    c.execute("INSERT INTO sync_queue(source,direction,thread,event_key,payload,raw,state,receipt)
-        VALUES('desk','out','T',?1,json_object('event','message.posted','message',?1,'cursor',?1,'text','private history','parent',null),'null','leased','old')",[root.id])?;
-    drop(c);
-    let b = Board::open(&path)?;
-    assert_eq!(b.cursor()?, head);
-    assert_eq!(b.backfill_source("p", "desk", "T")?, 0);
-    let jobs = b.inbox("p", "desk", Direction::Out, 0, 10)?;
-    assert_eq!(jobs.len(), 2);
-    let old = jobs
-        .iter()
-        .find(|j| j.payload["message"] == root.id)
-        .unwrap();
-    assert_eq!(old.state, "skipped");
-    assert!(b.start_sending("p", "desk", old.id, "old").is_err());
-    let eligible = b.lease_source("p", "desk", Direction::Out, 30)?.unwrap();
-    assert_eq!(eligible.job.payload["message"], next.id);
-    Ok(())
-}
-
-#[test]
 fn disabling_publishing_and_files_fences_leases_but_permits_an_explicit_unsent_backfill() {
     let b = Board::memory().unwrap();
     b.create_source("p", "s", Provider::Slack, "C1", "work")
@@ -262,7 +224,7 @@ fn queued_platform_status_notes_keep_fenced_examples_as_prose() -> anyhow::Resul
     assert_eq!(b.drain_source_report("p", "desk", 10)?.applied, 2);
     let root = b.find_source("p", "desk", "T", None)?.unwrap();
     let reply = b.find_source("p", "desk", "T", Some("closed"))?.unwrap();
-    assert_eq!(root.labels["status"], "closed");
+    assert!(serde_json::to_value(&root)?.get("labels").is_none());
     assert_eq!(reply.re, Some(root.id));
     assert_eq!(reply.text, external);
     assert!(reply.blocks.is_empty());
@@ -456,12 +418,20 @@ fn private_lifecycle_reply_is_never_mirrored_or_backfilled_and_sparse_profiles_k
         Some("https://profile.invalid/dana.png")
     );
     let jobs = b.inbox("owner", "mirror", Direction::Out, 0, 50).unwrap();
-    assert_eq!(b.get(id).unwrap().labels["state"], "closed");
+    let state: String = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM labels WHERE message_id=? AND key='state'",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "closed");
     assert!(
         !jobs
             .iter()
             .any(|j| j.payload["message"] == id && j.payload["event"] == "message.edited"),
-        "a label-only change did not change the outbound text"
+        "a source metadata change did not change the outbound text"
     );
     assert!(!jobs.iter().any(|j| j.payload["message"] == note.id));
     drop(b);

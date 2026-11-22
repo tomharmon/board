@@ -7,7 +7,7 @@ arch=('x86_64')
 url='https://github.com/tomharmon/board'
 license=('MIT OR Apache-2.0')
 depends=("glibc>=${BOARD_MIN_GLIBC:?}" 'gcc-libs' 'vulkan-icd-loader' 'vulkan-driver' 'wayland' 'libxkbcommon' 'libxkbcommon-x11' 'libx11' 'libxcursor' 'libxi' 'libxrandr')
-optdepends=('xdg-desktop-portal: desktop file picker' 'ffmpeg: attachment video and audio playback')
+optdepends=('xdg-desktop-portal: desktop file picker' 'ffmpeg: AVIF image previews')
 options=('!strip' '!debug')
 
 package() {

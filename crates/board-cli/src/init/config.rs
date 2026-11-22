@@ -25,11 +25,7 @@ fn command_matches(cmd: Option<&str>, exe: &Path) -> bool {
 fn mcp_args<'a>(mut args: impl Iterator<Item = Option<&'a str>>) -> bool {
     matches!(
         (args.next(), args.next(), args.next()),
-        (
-            Some(Some("mcp")),
-            None | Some(Some("--queue" | "--full")),
-            None
-        )
+        (Some(Some("mcp")), None | Some(Some("--full")), None)
     )
 }
 fn codex(path: &Path, exe: &Path) -> Result<Saved> {

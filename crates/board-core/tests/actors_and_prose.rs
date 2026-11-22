@@ -17,7 +17,7 @@ fn mentioned(board: &Board, term: &str) -> Result<Vec<i64>> {
 }
 
 #[test]
-fn lexical_mentions_mask_mid_paragraph_fences_and_migrate_prior_indexes() -> Result<()> {
+fn lexical_mentions_mask_mid_paragraph_fences() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("v6.sqlite");
     let b = Board::open(&path)?;
@@ -30,11 +30,6 @@ fn lexical_mentions_mask_mid_paragraph_fences_and_migrate_prior_indexes() -> Res
     }
     let cursor = b.cursor()?;
     drop(b);
-    let c = rusqlite::Connection::open(&path)?;
-    c.execute("INSERT INTO mentions VALUES(?,'hidden')", [m.id])?;
-    c.execute("INSERT INTO exact_mentions VALUES(?,'hidden')", [m.id])?;
-    c.pragma_update(None, "user_version", 6)?;
-    drop(c);
     let b = Board::open(&path)?;
     assert_eq!(b.cursor()?, cursor);
     assert_eq!(b.get(m.id)?.text, text);

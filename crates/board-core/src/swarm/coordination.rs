@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct Revision {
     pub kind: String,
     pub value: String,
@@ -35,6 +37,8 @@ pub struct Verification {
 
 /// Source posts for the latest visible handoff of a task and its exact revision.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TaskHandoff {
     pub id: i64,
     pub revision: Revision,
@@ -43,6 +47,8 @@ pub struct TaskHandoff {
     pub verification: Option<TaskVerification>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
+#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 pub struct TaskVerification {
     pub id: i64,
     pub status: String,
@@ -50,52 +56,51 @@ pub struct TaskVerification {
 
 pub(crate) fn task_handoff_on(
     c: &Connection,
-    access: &Access,
+    channels: Option<&str>,
     task: i64,
     run: Option<i64>,
 ) -> Result<Option<TaskHandoff>> {
     // A run can hand off a task from another channel. A grant on the task
     // alone must never disclose that run's evidence or even its post IDs.
-    let mut stmt = c.prepare_cached(
-        "SELECT r.channel,h.message_id,json_extract(h.payload,'$.revision.kind'),
+    let mut stmt = c.prepare_cached(concat!(
+        "WITH selected_runs AS (SELECT id FROM swarm_runs WHERE (?2 IS NULL OR id=?2)
+            AND (?1 IS NULL OR channel IN (SELECT value FROM json_each(?1))))",
+        include_str!("readable_evidence.sql"),
+        ", candidates(id) AS (
+             SELECT h.message_id FROM selected_runs r CROSS JOIN swarm_evidence h
+               WHERE h.run_id=r.id AND h.kind='handoff' AND json_extract(h.payload,'$.task')=?3
+             UNION ALL SELECT id FROM messages WHERE re=?3 UNION ALL SELECT ?3
+         ), latest AS (SELECT * FROM readable_posts WHERE message_id IN (SELECT id FROM candidates)
+             AND kind='handoff' AND thread_id=?3 ORDER BY message_id DESC LIMIT 1)
+         SELECT h.message_id,json_extract(h.payload,'$.revision.kind'),
             json_extract(h.payload,'$.revision.value'),json_extract(h.payload,'$.to'),
-            v.message_id,v.payload,hm.deleted,coalesce(vm.deleted,0)
-         FROM (SELECT id,channel FROM swarm_runs WHERE id=?2
-               UNION ALL SELECT id,channel FROM swarm_runs WHERE ?2 IS NULL) r
-         JOIN swarm_evidence h ON h.message_id=(
-             SELECT max(message_id) FROM swarm_evidence WHERE run_id=r.id AND kind='handoff'
-             AND json_extract(payload,'$.task')=?1)
-         JOIN messages hm ON hm.id=h.message_id
-         LEFT JOIN swarm_evidence v ON v.message_id=(
-             SELECT max(message_id) FROM swarm_evidence WHERE run_id=r.id AND kind='verification'
+            v.message_id,v.payload,h.deleted,coalesce(v.deleted,0)
+         FROM latest h LEFT JOIN readable_posts v ON v.message_id=(
+             SELECT max(message_id) FROM readable_posts WHERE run_id=h.run_id AND kind='verification'
              AND json_extract(payload,'$.handoff')=h.message_id)
-         LEFT JOIN messages vm ON vm.id=v.message_id
-         ORDER BY h.message_id DESC",
-    )?;
-    let mut rows = stmt.query(params![task, run])?;
-    while let Some(row) = rows.next()? {
-        if !access.allows(Action::Read, row.get_ref(0)?.as_str()?) {
-            continue;
-        }
-        if row.get::<_, bool>(7)? {
+        "
+    ))?;
+    let mut rows = stmt.query(params![channels, run, task])?;
+    if let Some(row) = rows.next()? {
+        if row.get::<_, bool>(6)? {
             return Ok(None);
         }
-        let verification = match (row.get::<_, Option<i64>>(5)?, row.get::<_, bool>(8)?) {
+        let verification = match (row.get::<_, Option<i64>>(4)?, row.get::<_, bool>(7)?) {
             (Some(id), false) => Some(TaskVerification {
                 id,
-                status: serde_json::from_str::<Verification>(row.get_ref(6)?.as_str()?)?
+                status: serde_json::from_str::<Verification>(row.get_ref(5)?.as_str()?)?
                     .status()
                     .into(),
             }),
             _ => None,
         };
         return Ok(Some(TaskHandoff {
-            id: row.get(1)?,
+            id: row.get(0)?,
             revision: Revision {
-                kind: row.get(2)?,
-                value: row.get(3)?,
+                kind: row.get(1)?,
+                value: row.get(2)?,
             },
-            to: row.get(4)?,
+            to: row.get(3)?,
             verification,
         }));
     }
@@ -129,6 +134,7 @@ pub struct DecisionResolution {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HandoffReceipt {
     pub id: i64,
+    pub thread_id: i64,
     pub actor: String,
     pub handoff: Handoff,
     pub superseded: bool,
@@ -199,10 +205,12 @@ pub(crate) fn coordination_schemas() -> Vec<(&'static str, &'static str, Value)>
 
 fn record<T: for<'de> Deserialize<'de>>(
     c: &Connection,
+    access: &Access,
     run: i64,
     id: i64,
     kind: &str,
 ) -> Result<(String, T)> {
+    access.message(c, id, Action::Read)?;
     let (actor, data): (String, String) = c
         .query_row(
             "SELECT actor,payload FROM swarm_evidence WHERE run_id=? AND message_id=? AND kind=?",
@@ -217,37 +225,32 @@ fn record<T: for<'de> Deserialize<'de>>(
     Ok((actor, serde_json::from_str(&data)?))
 }
 
-fn coordination_blocks<'a>(c: &Connection, m: &'a Message) -> Result<Vec<&'a crate::Block>> {
-    let mut blocks = Vec::new();
-    for block in &m.blocks {
-        if block.version == 1 && matches!(block.schema.as_str(), "handoff"|"verification"|"decision-request"|"decision-resolution")
-            && c.query_row("SELECT coalesce((SELECT builtin FROM schema_origins WHERE name=? AND version=1),0)", [&block.schema], |r| r.get::<_,bool>(0))? {
-            blocks.push(block);
-        }
-    }
-    Ok(blocks)
-}
-
 pub(super) fn record_on(
     tx: &Transaction,
     a: &Access,
     run: Option<&SwarmRun>,
     m: &Message,
 ) -> Result<Option<String>> {
-    let blocks = coordination_blocks(tx, m)?;
+    let mut blocks = m.blocks.iter().filter(|b| {
+        b.version == 1
+            && matches!(
+                b.schema.as_str(),
+                "handoff" | "verification" | "decision-request" | "decision-resolution"
+            )
+    });
+    let Some(block) = blocks.next() else {
+        return Ok(None);
+    };
     ensure!(
-        blocks.len() <= 1,
+        blocks.next().is_none(),
         Invalid.error(
             "ambiguous_evidence",
             "post one coordination record at a time"
         )
     );
-    let Some(block) = blocks.first() else {
-        return Ok(None);
-    };
     let run = run.context(Invalid.error(
         "swarm_required",
-        "coordination records require a readable swarm channel",
+        "coordination records require a readable swarm",
     ))?;
     if block.schema != "decision-resolution" {
         run.active()?;
@@ -280,7 +283,7 @@ pub(super) fn record_on(
         }
         "verification" => {
             let v: Verification = serde_json::from_value(block.data.clone())?;
-            let (author, h): (_, Handoff) = record(tx, run.id, v.handoff, "handoff")?;
+            let (author, h): (_, Handoff) = record(tx, a, run.id, v.handoff, "handoff")?;
             let verifier = run
                 .workers
                 .iter()
@@ -314,7 +317,7 @@ pub(super) fn record_on(
                 )
             );
             if let Some(id) = d.handoff {
-                let _: (String, Handoff) = record(tx, run.id, id, "handoff")?;
+                let _: (String, Handoff) = record(tx, a, run.id, id, "handoff")?;
             }
             run.name_for(&d.to)
                 .or_else(|| run.operator(&d.to).then_some("coordinator"))
@@ -323,7 +326,7 @@ pub(super) fn record_on(
         "decision-resolution" => {
             let d: DecisionResolution = serde_json::from_value(block.data.clone())?;
             let (author, request): (_, DecisionRequest) =
-                record(tx, run.id, d.request, "decision-request")?;
+                record(tx, a, run.id, d.request, "decision-request")?;
             ensure!(
                 crate::core::owned_by(&request.to, &m.actor),
                 Forbidden.error(
@@ -372,21 +375,24 @@ fn validate_revision(r: &Revision) -> Result<()> {
     Ok(())
 }
 
-fn receipt_on(c: &Connection, run: &SwarmRun) -> Result<SwarmReceipt> {
-    let records = rows(c.prepare("SELECT message_id,kind,actor,payload FROM swarm_evidence WHERE run_id=? ORDER BY message_id")?.query_map([run.id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?)))?)?;
+fn receipt_on(c: &Connection, access: &Access, run: &SwarmRun) -> Result<SwarmReceipt> {
+    let channels = access.read_channels_json(c)?;
+    let records = rows(c.prepare(concat!("WITH selected_runs AS (SELECT ?2 AS id)",include_str!("readable_evidence.sql"),
+        "SELECT message_id,kind,actor,payload,thread_id FROM readable_evidence ORDER BY message_id"))?
+        .query_map(params![channels,run.id],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,i64>(4)?)))?)?;
     let mut handoffs: Vec<HandoffReceipt> = vec![];
+    let mut latest = BTreeMap::<(String, i64), usize>::new();
     let mut decisions: Vec<PendingDecision> = vec![];
-    for (id, kind, actor, data) in records {
+    for (id, kind, actor, data, thread_id) in records {
         match kind.as_str() {
             "handoff" => {
                 let h: Handoff = serde_json::from_str(&data)?;
-                for old in &mut handoffs {
-                    if old.actor == actor && old.handoff.task == h.task {
-                        old.superseded = true;
-                    }
+                if let Some(old) = latest.insert((actor.clone(), thread_id), handoffs.len()) {
+                    handoffs[old].superseded = true;
                 }
                 handoffs.push(HandoffReceipt {
                     id,
+                    thread_id,
                     actor,
                     handoff: h,
                     superseded: false,
@@ -417,7 +423,9 @@ fn receipt_on(c: &Connection, run: &SwarmRun) -> Result<SwarmReceipt> {
             _ => (),
         }
     }
-    let mut open_tasks: BTreeSet<i64> = rows(c.prepare("SELECT t.id FROM tasks t JOIN messages m USING(id) WHERE m.channel=? AND m.deleted=0 AND t.state NOT IN ('completed','canceled')")?.query_map([&run.channel],|r|r.get(0))?)?.into_iter().collect();
+    let mut open_tasks: BTreeSet<i64> = rows(c.prepare(concat!(include_str!("readable_threads.sql"),
+        "SELECT t.id FROM tasks t JOIN run_threads USING(id) WHERE t.state NOT IN ('completed','canceled')"))?
+        .query_map(params![channels,run.id],|r|r.get(0))?)?.into_iter().collect();
     for h in &handoffs {
         if let Some(id) = h.handoff.task {
             let state: String =
@@ -435,19 +443,76 @@ fn receipt_on(c: &Connection, run: &SwarmRun) -> Result<SwarmReceipt> {
     })
 }
 
+#[derive(Debug, Serialize)]
+pub struct WorkerCheckIn {
+    pub run: String,
+    pub worker: String,
+    pub actor: String,
+    pub status: &'static str,
+}
+
+fn record_check_in(
+    tx: &Transaction,
+    run: &SwarmRun,
+    w: &SwarmWorker,
+    model: Option<&str>,
+    workspace_mode: Option<&str>,
+    session_ref: Option<&str>,
+) -> Result<WorkerCheckIn> {
+    let replace = model.is_some() || workspace_mode.is_some() || session_ref.is_some();
+    tx.execute(
+        "UPDATE swarm_workers SET status='working',checked_in_at=coalesce(checked_in_at,?1),
+        last_activity_at=?1,updated_at=?1,launch_error=NULL,
+        model=CASE WHEN ?2 THEN ?3 ELSE model END,
+        workspace_mode=CASE WHEN ?2 THEN ?4 ELSE workspace_mode END,
+        session_ref=CASE WHEN ?2 THEN ?5 ELSE session_ref END WHERE id=?6",
+        params![
+            crate::now(),
+            replace,
+            model,
+            workspace_mode,
+            session_ref,
+            w.id
+        ],
+    )?;
+    Board::event_tx(
+        tx,
+        "swarm.checked_in",
+        &w.actor,
+        Some(run.thread_id),
+        json!({"worker":w.name,"run":run.slug}),
+    )?;
+    Ok(WorkerCheckIn {
+        run: run.slug.clone(),
+        worker: w.name.clone(),
+        actor: w.actor.clone(),
+        status: "working",
+    })
+}
+
 impl Board {
-    pub fn swarm_check_in(&self, actor: &str, run: &str, target: &str) -> Result<()> {
-        self.swarm_check_in_with_runtime(actor, run, target, None, None, None)
+    pub(super) fn swarm_first_contact(&self, actor: &str, run: &str) -> Result<()> {
+        self.write(|tx| {
+            let (_, r) = self.swarm_waiting_on(tx, actor, run, Action::Post)?;
+            if r.status == "active"
+                && let Some(w) = r.workers.iter().find(|w| {
+                    w.actor == actor && matches!(w.status.as_str(), "registered" | "launch_failed")
+                })
+            {
+                record_check_in(tx, &r, w, None, None, None)?;
+            }
+            Ok(())
+        })
     }
-    pub fn swarm_check_in_with_runtime(
+
+    pub fn swarm_check_in(
         &self,
         actor: &str,
         run: &str,
-        target: &str,
         model: Option<&str>,
         workspace_mode: Option<&str>,
         session_ref: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<WorkerCheckIn> {
         for (v, max) in [(model, 128), (workspace_mode, 64), (session_ref, 1024)] {
             ensure!(
                 v.is_none_or(|s| !s.trim().is_empty()
@@ -460,17 +525,17 @@ impl Board {
             );
         }
         self.write(|tx| {
-            let (_,r)=self.swarm_waiting_on(tx,actor,run,Action::Post)?; r.active()?;
-            let w=r.workers.iter().find(|w|w.name==target && w.actor==actor).context(Forbidden.error("wrong_swarm_actor","a worker must check itself in"))?;
-            ensure!(!matches!(w.status.as_str(),"done"|"stopped"), Conflict.error("worker_stopped","worker has finished"));
-            let time=crate::now();
-            tx.execute("UPDATE swarm_workers SET status='working',checked_in_at=coalesce(checked_in_at,?1),last_activity_at=?1,updated_at=?1,waiter_pid=NULL,launch_error=NULL WHERE id=?2",params![time,w.id])?;
-            if model.is_some() || workspace_mode.is_some() || session_ref.is_some() {
-                tx.execute("INSERT INTO swarm_worker_runtime(worker_id,model,workspace_mode,session_ref) VALUES(?,?,?,?) ON CONFLICT(worker_id) DO UPDATE SET model=excluded.model,workspace_mode=excluded.workspace_mode,session_ref=excluded.session_ref",
-                    params![w.id,model,workspace_mode,session_ref])?;
-            }
-            Board::event_tx(tx,"swarm.checked_in",actor,Some(r.root_id),json!({"worker":target,"run":r.slug}))?;
-            Ok(())
+            let (_, r) = self.swarm_waiting_on(tx, actor, run, Action::Post)?;
+            r.active()?;
+            let w =
+                r.workers.iter().find(|w| w.actor == actor).context(
+                    Forbidden.error("wrong_swarm_actor", "a worker must check itself in"),
+                )?;
+            ensure!(
+                !matches!(w.status.as_str(), "done" | "stopped"),
+                Conflict.error("worker_stopped", "worker has finished")
+            );
+            record_check_in(tx, &r, w, model, workspace_mode, session_ref)
         })
     }
     pub fn swarm_launch_failed(
@@ -489,17 +554,14 @@ impl Board {
             let w=r.workers.iter().find(|w|w.name==target).context(Missing.error("worker_not_found","unknown worker"))?;
             ensure!(matches!(w.status.as_str(),"registered"|"launch_failed"),Conflict.error("worker_started","cannot report launch failure after a worker checks in"));
             tx.execute("UPDATE swarm_workers SET status='launch_failed',launch_error=?,updated_at=? WHERE id=?",params![reason,crate::now(),w.id])?;
-            Board::event_tx(tx,"swarm.launch_failed",actor,Some(r.root_id),json!({"worker":target,"reason":reason,"run":r.slug}))?;
+            Board::event_tx(tx,"swarm.launch_failed",actor,Some(r.thread_id),json!({"worker":target,"reason":reason,"run":r.slug}))?;
             Ok(())
         })
     }
     pub fn swarm_receipt(&self, actor: &str, run: &str) -> Result<SwarmReceipt> {
         let tx = self.conn.unchecked_transaction()?;
         let (access, r) = self.swarm_on(&tx, actor, run, Action::Read)?;
-        let mut receipt = receipt_on(&tx, &r)?;
-        receipt
-            .open_tasks
-            .retain(|id| access.message(&tx, *id, Action::Read).is_ok());
+        let receipt = receipt_on(&tx, &access, &r)?;
         tx.commit()?;
         Ok(receipt)
     }
@@ -512,15 +574,24 @@ impl Board {
     ) -> Result<SwarmPostResult> {
         self.write(|tx| {
             let (a, r) = self.swarm_on(tx, actor, run, Action::Post)?;
-            let builtin:bool=tx.query_row("SELECT coalesce((SELECT builtin FROM schema_origins WHERE name='decision-resolution' AND version=1),0)",[],|r|r.get(0))?;
-            ensure!(builtin, Invalid.error("custom_decision_schema", "the existing custom decision-resolution schema is preserved; it cannot resolve built-in decisions"));
             let body = crate::append_block(
                 "",
                 "decision-resolution",
                 1,
                 &json!({"request":id,"summary":summary}),
             )?;
-            self.swarm_post_on(tx, &a, &r, actor, &body, &Default::default())
+            // An operator answering a linked thread must not publish its answer
+            // into the anchor's (potentially wider) audience.
+            Ok(self
+                .publish_public_on(
+                    tx,
+                    &a,
+                    actor,
+                    crate::core::PublicDestination::Run(&r, id),
+                    &body,
+                    &Default::default(),
+                )?
+                .0)
         })
     }
     pub fn attention(&self, actor: &str) -> Result<Vec<AttentionItem>> {
@@ -528,13 +599,11 @@ impl Board {
         let tx = self.conn.unchecked_transaction()?;
         let access = self.access_on(&tx)?;
         access.actor(actor)?;
-        let channels = access
-            .channels(&tx, Action::Read)?
-            .map(|c| serde_json::to_string(&c))
-            .transpose()?;
+        let channels = access.read_channels_json(&tx)?;
         let mut items = rows(tx.prepare(concat!(
             "WITH selected_runs AS (SELECT id,slug,channel,root_id,status,coordinator_actor FROM swarm_runs
              WHERE ?1 IS NULL OR channel IN (SELECT value FROM json_each(?1)))",
+            include_str!("readable_evidence.sql"),
             include_str!("current_run_actions.sql"),
             "SELECT a.kind,a.assigned_to,a.summary,a.waiting,a.source,r.slug,r.id,r.channel
              FROM current_run_actions a JOIN selected_runs r ON r.id=a.run_id

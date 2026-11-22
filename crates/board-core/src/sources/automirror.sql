@@ -1,9 +1,5 @@
 -- Start each enabled channel mirror at most once, in the same commit as the post.
 -- No network is involved. A pending lane is renamed only after a confirmed receipt.
-DROP TRIGGER IF EXISTS sync_mirror_root;
-DROP TRIGGER IF EXISTS sync_render_labels;
-DROP TRIGGER IF EXISTS sync_mirror_asset;
-DROP TRIGGER IF EXISTS sync_remove_asset;
 UPDATE sync_settings SET value=json_set(value,'$.mirror_roots',json('false'))
  WHERE json_extract(value,'$.mirror_roots')=1 AND source IN (SELECT name FROM sync_sources WHERE provider='github');
 CREATE TRIGGER IF NOT EXISTS sync_mirror_root AFTER UPDATE OF message ON events

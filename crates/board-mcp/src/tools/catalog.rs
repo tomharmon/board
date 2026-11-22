@@ -1,108 +1,74 @@
 use crate::Toolset;
-use anyhow::{Result, ensure};
-use serde_json::{Map, Value, json};
+use anyhow::Result;
+use rmcp::{
+    handler::server::tool::{schema_for_input, schema_for_output},
+    model::{JsonObject, Tool as McpTool},
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::sync::{Arc, OnceLock};
 
-#[derive(Clone, Copy)]
-enum Kind {
-    Text,
-    Run,
-    Target,
-    Id,
-    Cursor,
-    Limit,
-    Count,
-    Seconds,
-    WaitSeconds,
-    Lease,
-    Bool,
-    Labels,
-    Ids,
-    Data,
-    PlanItems,
-    Slots,
-    Retries,
-    Page,
+use super::read::{Feed, Read, Run};
+type Text = String;
+type Bool = bool;
+type Data = Value;
+type Ids = Vec<Id>;
+
+macro_rules! bounded {
+    ($name:ident, $ty:ty, $constraint:meta) => {
+        #[derive(Deserialize, Serialize, JsonSchema)]
+        #[schemars(inline)]
+        pub(crate) struct $name(#[schemars($constraint)] pub(crate) $ty);
+    };
+}
+bounded!(Id, i64, range(min = 1));
+bounded!(Cursor, i64, range(min = 0));
+bounded!(Count, i64, range(min = 0, max = 100000));
+bounded!(Limit, usize, range(min = 1, max = 500));
+bounded!(Page, usize, range(min = 1, max = 100));
+bounded!(Seconds, u64, range(max = 300));
+bounded!(Lease, i64, range(min = 30, max = 3600));
+bounded!(
     FileChunk,
-    Base64Chunk,
-}
-
-impl Kind {
-    fn schema(self) -> Value {
-        use Kind::*;
-        match self {
-            Text => json!({"type":"string"}),
-            Target | Run => json!({"oneOf":[{"type":"string"},{"type":"integer","minimum":1}]}),
-            Id => json!({"type":"integer","minimum":1}),
-            Count => json!({"type":"integer","minimum":0,"maximum":100000}),
-            Cursor => json!({"type":"integer","minimum":0}),
-            Limit => json!({"type":"integer","minimum":1,"maximum":500}),
-            Seconds | WaitSeconds => {
-                json!({"type":"integer","minimum":0,"maximum":300,"default":if matches!(self, Seconds) {90} else {0}})
-            }
-            Lease => json!({"type":"integer","minimum":30,"maximum":3600,"default":300}),
-            Bool => json!({"type":"boolean"}),
-            Labels => json!({"type":"object","additionalProperties":{"type":"string"}}),
-            Ids => json!({"type":"array","items":{"type":"integer","minimum":1}}),
-            Data => json!({}),
-            Slots => json!({"type":"integer","minimum":1,"maximum":128,"default":8}),
-            Retries => json!({"type":"integer","minimum":0,"maximum":1000,"default":0}),
-            Page => json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
-            FileChunk => {
-                json!({"type":"integer","minimum":1,"maximum":board_local::FILE_CHUNK_BYTES,"default":board_local::FILE_CHUNK_BYTES})
-            }
-            Base64Chunk => {
-                json!({"type":"string","contentEncoding":"base64","maxLength":board_local::FILE_CHUNK_BYTES.div_ceil(3)*4})
-            }
-            PlanItems => json!({"type":"array","minItems":1,"items":{
-                "type":"object","additionalProperties":false,"required":["text"],"properties":{
-                    "text":Text.schema(),"key":{"type":["string","null"]},
-                    "for":{"type":["string","null"]},"labels":Labels.schema(),
-                    "attachment_ids":Ids.schema(),"no_sync":Bool.schema(),"noSync":Bool.schema(),
-                    "needs":{"type":"array","items":{"oneOf":[Text.schema(),Id.schema(),
-                        {"type":"object","additionalProperties":false,"required":["key"],"properties":{"key":Text.schema()}},
-                        {"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":{"oneOf":[Id.schema(),Text.schema()]}}}
-                    ]}}
-                }
-            }}),
-        }
-    }
-    fn accepts(self, v: &Value) -> bool {
-        use Kind::*;
-        match self {
-            Text => v.is_string(),
-            Target | Run => v.is_string() || v.as_i64().is_some_and(|n| n > 0),
-            Id => v.as_i64().is_some_and(|n| n > 0),
-            Count => v.as_i64().is_some_and(|n| (0..=100000).contains(&n)),
-            Cursor => v.as_i64().is_some_and(|n| n >= 0),
-            Limit => v.as_i64().is_some_and(|n| (1..=500).contains(&n)),
-            Seconds | WaitSeconds => v.as_i64().is_some_and(|n| (0..=300).contains(&n)),
-            Lease => v.as_i64().is_some_and(|n| (30..=3600).contains(&n)),
-            Bool => v.is_boolean(),
-            Labels => v
-                .as_object()
-                .is_some_and(|v| v.values().all(Value::is_string)),
-            Ids => v
-                .as_array()
-                .is_some_and(|v| v.iter().all(|n| n.as_i64().is_some_and(|i| i > 0))),
-            Data => true,
-            Slots => v.as_i64().is_some_and(|n| (1..=128).contains(&n)),
-            Retries => v.as_i64().is_some_and(|n| (0..=1000).contains(&n)),
-            Page => v.as_i64().is_some_and(|n| (1..=100).contains(&n)),
-            FileChunk => v
-                .as_u64()
-                .is_some_and(|n| (1..=board_local::FILE_CHUNK_BYTES as u64).contains(&n)),
-            Base64Chunk => v
-                .as_str()
-                .is_some_and(|s| s.len() <= board_local::FILE_CHUNK_BYTES.div_ceil(3) * 4),
-            PlanItems => v.as_array().is_some_and(|a| !a.is_empty()),
-        }
-    }
-}
+    usize,
+    range(min = 1, max = board_local::FILE_CHUNK_BYTES)
+);
+const BASE64_MAX: usize = board_local::FILE_CHUNK_BYTES.div_ceil(3) * 4;
+bounded!(Base64Chunk, String, length(max = BASE64_MAX));
+bounded!(
+    PlanItems,
+    Vec<board_local::automation::PlanItem>,
+    length(min = 1, max = board_local::automation::MAX_PLAN_ITEMS)
+);
 
 pub(crate) struct Tool {
     pub name: &'static str,
     description: &'static str,
-    fields: &'static [(&'static str, Kind, bool)],
+    schema: fn() -> Arc<JsonObject>,
+    decode: fn(&Value) -> Result<Call>,
+}
+
+pub(crate) struct Published {
+    pub tool: &'static Tool,
+    pub definition: McpTool,
+    validator: OnceLock<jsonschema::Validator>,
+}
+impl Published {
+    pub fn parse(&self, args: &Value) -> Result<Call> {
+        let validator = self.validator.get_or_init(|| {
+            jsonschema::validator_for(&json!(&*self.definition.input_schema))
+                .expect("generated tool schema")
+        });
+        validator.validate(args).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid tool arguments at {} (schema {})",
+                e.instance_path,
+                e.schema_path
+            )
+        })?;
+        (self.tool.decode)(args)
+    }
 }
 impl Tool {
     pub(crate) fn offered(&self, set: Toolset, worker: bool) -> bool {
@@ -117,100 +83,76 @@ impl Tool {
             "board_post" | "board_read" | "swarm_wait" | "swarm_observe" => true,
             "worker_assignment" => worker,
             "swarm_start" | "swarm_add" | "swarm_stop" | "tasks_plan" => !worker,
-            "tasks_claim" | "tasks_renew" | "tasks_release" | "tasks_complete" | "tasks_fail"
-            | "tasks_block" => set == Toolset::Queue,
             _ => false,
         }
     }
-
-    fn definition(&self) -> Value {
-        let properties: Map<_, _> = self
-            .fields
-            .iter()
-            .map(|(k, t, _)| ((*k).into(), t.schema()))
-            .collect();
-        let required: Vec<_> = self
-            .fields
-            .iter()
-            .filter_map(|(k, _, r)| r.then_some(k))
-            .collect();
-        json!({"name":self.name,"description":self.description,"inputSchema":{
-            "type":"object","additionalProperties":false,"properties":properties,"required":required
-        }})
-    }
-    pub fn validate(&self, v: &Value) -> Result<()> {
-        let object = v
-            .as_object()
-            .ok_or_else(|| anyhow::anyhow!("arguments must be an object"))?;
-        for key in object.keys() {
-            ensure!(
-                self.fields.iter().any(|(k, _, _)| *k == key),
-                "unknown argument: {key}"
-            );
-        }
-        for &(key, kind, required) in self.fields {
-            if let Some(value) = object.get(key) {
-                ensure!(
-                    kind.accepts(value),
-                    "invalid value for {key}: expected {}",
-                    kind.schema()
-                );
-            } else {
-                ensure!(!required, "missing required argument: {key}");
-            }
-        }
-        Ok(())
-    }
+}
+fn schema<T: JsonSchema + 'static>() -> Arc<JsonObject> {
+    schema_for_input::<T>().expect("tool parameters are objects")
 }
 macro_rules! tools {
-    ($($name:literal, $doc:literal, [$($rk:ident:$rt:ident),*], [$($ok:ident:$ot:ident),*];)+) => {
-        const TOOLS: &[Tool] = &[$(Tool {name:$name,description:$doc,fields:&[
-            $((stringify!($rk),Kind::$rt,true),)* $((stringify!($ok),Kind::$ot,false),)*
-        ]}),+];
+    (@input $ty:ident, [$($rk:ident:$rt:ident),*], [$($ok:ident:$ot:ident),*]) => {
+        #[derive(Deserialize, Serialize, JsonSchema)]
+        #[serde(deny_unknown_fields)]
+        pub(crate) struct $ty {
+            $(pub $rk: $rt,)*
+            $(#[serde(skip_serializing_if="Option::is_none")]
+              #[schemars(extend("not" = {"type":"null"}))]
+              pub $ok: Option<$ot>,)*
+        }
+    };
+    (@input $ty:ident, $args:ident) => { pub(crate) type $ty = $args; };
+    ($($ty:ident, $name:literal, $doc:literal, $args:tt $(, $opts:tt)?;)+) => {
+        $(tools!(@input $ty, $args $(, $opts)?);)+
+        pub(crate) enum Call { $($ty($ty)),+ }
+        const TOOLS: &[Tool] = &[$(Tool {
+            name:$name, description:$doc, schema:schema::<$ty>,
+            decode:|v| Ok(Call::$ty($ty::deserialize(v)?)),
+        }),+];
     };
 }
 tools! {
-    "swarm_start","Record a goal, worker capacity and retry budget; no workers are launched.",[goal:Text],[slug:Text,repo_root:Text,max_notifications:Count,max_active:Slots,retry_budget:Retries];
-    "swarm_observe","Read the run overview, paging threads with next_task_after, exceptions with next_action_after, and changes with cursor. Or pass explain_task instead of cursors for that task's unfinished prerequisite chain and linked review evidence. limit bounds the returned steps.",[],[run:Run,after:Cursor,action_after:Cursor,task_after:Cursor,explain_task:Id,limit:Page];
-    "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
-    "swarm_add","Register an assignment without starting a process. Returns its worker selector; only export_local:true writes skills and returns a local CLI launch package.",[name:Text,brief:Text],[run:Run,role:Text,workspace_path:Text,branch_name:Text,export_local:Bool];
-    "swarm_status","Inspect a run and its roster. Omit run to use BOARD_SWARM_RUN.",[],[run:Run];
-    "swarm_check_in","Report that this worker has started. Supplying runtime metadata replaces its previous report. session_ref is a public roster label, never a secret. Set compact:true for a short acknowledgment.",[],[run:Run,compact:Bool,model:Text,workspace_mode:Text,session_ref:Text];
-    "worker_assignment","Read the goal, own brief, pinned instructions and available skill files. Supply both skill and path to read one pinned text file, not a local path.",[],[skill:Text,path:Text];
-    "swarm_launch_failed","Report a launch failure actually observed by the harness. Coordinator only.",[name:Text,reason:Text],[run:Run];
-    "swarm_receipt","Read immutable handoffs, checks for their exact revisions, and outstanding decisions.",[],[run:Run];
-    "board_attention","List explicit decisions and blocked work; action_required distinguishes this actor's actions from agent follow-up.",[],[];
-    "swarm_decide","Answer an explicit decision request addressed to this actor, even after stop.",[id:Id,summary:Text],[run:Run];
-    "swarm_set_limit","Adjust a run's peer notification budget. Requires coordinator or owning person.",[max_notifications:Count],[run:Run];
-    "swarm_post","Post publicly; @name addresses a teammate. Returns notified and budget-suppressed recipients, not read receipts. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,labels:Labels,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "swarm_dm","Send a side message to a worker name or coordinator.",[to:Text,text:Text],[run:Run];
-    "swarm_read","Read visible conversation in cursor order without acknowledging it. Filter kind by public, dm, or addressed (to you); optionally filter by worker name.",[],[run:Run,after:Cursor,limit:Limit,kind:Text,worker:Text];
-    "swarm_wait","Wait for your addressed notifications. Pass the last processed message batch's cursor as ack on your next call; unacknowledged batches can replay. Use after instead to read from a position without acknowledging.",[],[run:Run,after:Cursor,ack:Id,timeout_seconds:Seconds];
-    "swarm_done","Mark this worker finished with an optional public summary.",[],[run:Run,summary:Text];
-    "swarm_stop","Stop a run and wake its waiters. Requires coordinator or owning person.",[],[run:Run];
-    "roles_list","List built-in and custom agent roles.",[],[];
-    "roles_show","Inspect a role, its instructions and attached skills.",[slug:Text],[];
-    "board_channels","List readable channels with an optional name prefix.",[],[prefix:Text,limit:Limit];
-    "board_file_upload","Stage up to 64 KiB of evidence as standard padded base64. Returns attachment metadata; publish its id in a post or reply's attachment_ids.",[channel:Text,name:Text,content_type:Text,data_base64:Base64Chunk],[];
-    "board_file_read","Read a bounded slice of an authorized attachment by ID. Append decoded data_base64 bytes and continue with next_offset until null.",[id:Id],[offset:Cursor,length:FileChunk];
-    "board_whoami","Report the identity bound to this connection and its worker assignment, if any. Never changes identity.",[],[];
-    "board_post","Start a thread with channel or reply to a message with reply_to. In swarm channels, notified and suppressed report signals, not reads. Use idempotency_key for retries.",[text:Text],[channel:Text,reply_to:Id,labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "board_reply","Reply by message ID. In swarm channels, notified lists signaled teammates; suppressed lists those not signaled due to the run limit. Empty lists are omitted. Use idempotency_key for retries.",[id:Id,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "board_read","Open a thread by message ID (target), search ordinary messages, or read a run feed (run, optional kind and worker). The run feed defaults to public; kind can select dm or addressed instead. Reading never acknowledges the inbox. An opened task includes readable prerequisite results in message.task.inputs.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,run:Run,kind:Text,worker:Text,after:Cursor,limit:Limit];
-    "tasks_list","List visible tasks oldest first. Pass next_after as after for the next page; cursor is the snapshot event head.",[],[channel:Text,state:Text,assignee:Text,labels:Labels,after:Cursor,limit:Limit];
-    "tasks_create","Create a task with optional prerequisites, assignment and atomic initial claim.",[channel:Text,text:Text],[assignee:Text,needs:Ids,labels:Labels,claim:Bool];
-    "tasks_plan","Create a batch of ordinary tasks and return them in input order. Use a stable key to retry; large batches checkpoint.",[channel:Text,tasks:PlanItems],[key:Text];
-    "tasks_claim","Exclusively lease by id or ready_channel. inputs summarizes readable prerequisite results and their revision evidence. Only a ready queue can wait; nothing_ready means no eligible task was found.",[],[id:Id,ready_channel:Text,labels:Labels,lease_seconds:Lease,wait_seconds:WaitSeconds];
-    "tasks_renew","Extend this session's live claim without changing its epoch.",[id:Id],[lease_seconds:Lease];
-    "tasks_release","Return this session's claimed task to the eligible pool.",[id:Id],[];
-    "tasks_complete","Complete a task using the fenced lease held by this MCP session.",[id:Id],[result:Text];
-    "tasks_fail","Fail a task with a reason using this session's live lease.",[id:Id,reason:Text],[];
-    "tasks_block","Put a task on hold; a claimed task requires this session's lease.",[id:Id,reason:Text],[];
+    SwarmStart, "swarm_start","Start a named run on an existing thread_id or create a goal thread in channel. Choose a stable slug before calling; retry the same arguments after a disconnect. Does not launch workers.",[goal:Text,slug:Text],[thread_id:Id,channel:Text,repo_root:Text,max_notifications:Count];
+    SwarmObserve, "swarm_observe","Read the run overview, paging threads with next_task_after, exceptions with next_action_after, and changes with cursor. Or pass explain_task instead of cursors for that task's unfinished prerequisite chain and linked review evidence. limit bounds the returned steps.",[],[run:Run,after:Cursor,action_after:Cursor,task_after:Cursor,explain_task:Id,limit:Page];
+    SwarmList, "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
+    SwarmAdd, "swarm_add","Register a worker and brief. Optional thread_id links existing work without granting access, creating a task or claiming it. Returns the worker selector and, for a local owner, literal CLI arguments.",[name:Text,brief:Text],[run:Run,thread_id:Id,role:Text,workspace_path:Text,branch_name:Text];
+    SwarmStatus, "swarm_status","Inspect a run and its roster. Omit run to use BOARD_SWARM_RUN.",[],[run:Run];
+    SwarmCheckIn, "swarm_check_in","Report that this worker has started. Supplying runtime metadata replaces its previous report. session_ref is a public roster label, never a secret. Returns a short acknowledgment.",[],[run:Run,model:Text,workspace_mode:Text,session_ref:Text];
+    WorkerAssignment, "worker_assignment","Read the goal, own brief, pinned instructions and available skill files. Supply both skill and path to read one pinned text file, not a local path.",[],[skill:Text,path:Text];
+    SwarmLaunchFailed, "swarm_launch_failed","Report a launch failure actually observed by the harness. Coordinator only.",[name:Text,reason:Text],[run:Run];
+    SwarmReceipt, "swarm_receipt","Read immutable handoffs, checks for their exact revisions, and outstanding decisions.",[],[run:Run];
+    BoardAttention, "board_attention","List explicit decisions and blocked work; action_required distinguishes this actor's actions from agent follow-up.",[],[];
+    SwarmDecide, "swarm_decide","Answer an explicit decision request addressed to this actor, even after stop.",[id:Id,summary:Text],[run:Run];
+    SwarmSetLimit, "swarm_set_limit","Adjust a run's peer notification budget. Requires coordinator or owning person.",[max_notifications:Count],[run:Run];
+    SwarmPost, "swarm_post","Post publicly; @name addresses a teammate. Returns notified and budget-suppressed recipients, not read receipts. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,reply_to:Id,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    SwarmDm, "swarm_dm","Send a side message to a worker name or coordinator.",[to:Text,text:Text],[run:Run];
+    SwarmRead, "swarm_read","Read visible conversation in cursor order without acknowledging it. Filter kind by public, dm, or addressed (to you); optionally filter by worker name.",[],[run:Run,after:Cursor,limit:Limit,kind:Feed,worker:Text];
+    SwarmWait, "swarm_wait","Wait for your addressed notifications. Pass the last processed message batch's cursor as ack on your next call; unacknowledged batches can replay. Use after instead to read from a position without acknowledging.",[],[run:Run,after:Cursor,ack:Id,timeout_seconds:Seconds];
+    SwarmDone, "swarm_done","Mark this worker finished with an optional public summary.",[],[run:Run,summary:Text];
+    SwarmStop, "swarm_stop","Stop a run and wake its waiters. Requires coordinator or owning person.",[],[run:Run];
+    RolesList, "roles_list","List built-in and custom agent roles.",[],[];
+    RolesShow, "roles_show","Inspect a role, its instructions and attached skills.",[slug:Text],[];
+    BoardChannels, "board_channels","List readable channels with an optional name prefix.",[],[prefix:Text,limit:Limit];
+    BoardFileUpload, "board_file_upload","Stage up to 64 KiB of evidence as standard padded base64. Returns attachment metadata; publish its id in a post or reply's attachment_ids.",[channel:Text,name:Text,content_type:Text,data_base64:Base64Chunk],[];
+    BoardFileRead, "board_file_read","Read a bounded slice of an authorized attachment by ID. Append decoded data_base64 bytes and continue with next_offset until null.",[id:Id],[offset:Cursor,length:FileChunk];
+    BoardWhoami, "board_whoami","Report the identity bound to this connection and its worker assignment, if any. Never changes identity.",[],[];
+    BoardPost, "board_post","Start a thread with channel or reply to a message with reply_to. For a reply on a thread linked by multiple swarms, specify run. In linked threads, notified and suppressed report signals, not reads. Use idempotency_key for retries.",[text:Text],[channel:Text,reply_to:Id,run:Run,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    BoardRead, "board_read","Open a thread by message ID (target), search ordinary messages, or read a run feed (run, optional kind and worker). The run feed defaults to public; kind can select dm or addressed instead. Reading never acknowledges the inbox. An opened task includes readable prerequisite results in message.task.inputs.",Read;
+    TasksList, "tasks_list","List visible tasks oldest first. Pass next_after as after for the next page; cursor is the snapshot event head.",[],[channel:Text,state:Text,assignee:Text,after:Cursor,limit:Limit];
+    TasksCreate, "tasks_create","Create a task with optional prerequisites, assignment and atomic initial claim.",[channel:Text,text:Text],[assignee:Text,needs:Ids,claim:Bool];
+    TasksPlan, "tasks_plan","Create ordinary tasks in input order. Each item supplies text for a new thread in channel, or thread_id to track an existing conversation in place. Set run to include these threads in swarm_observe. Retry with the same key.",[channel:Text,tasks:PlanItems],[key:Text,run:Run];
+    TasksClaim, "tasks_claim","Exclusively lease a specific task. The response includes readable prerequisite results and their revision evidence.",[id:Id],[lease_seconds:Lease];
+    TasksRenew, "tasks_renew","Extend this session's live claim without changing its epoch.",[id:Id],[lease_seconds:Lease];
+    TasksRelease, "tasks_release","Release this session's lease on the specified task.",[id:Id],[];
+    TasksComplete, "tasks_complete","Complete a task using the fenced lease held by this MCP session.",[id:Id],[result:Text];
+    TasksFail, "tasks_fail","Fail a task with a reason using this session's live lease.",[id:Id,reason:Text],[];
+    TasksBlock, "tasks_block","Put a task on hold; a claimed task requires this session's lease.",[id:Id,reason:Text],[];
 }
-pub(crate) fn coordinator_tool(name: &str) -> bool {
+fn coordinator_tool(name: &str) -> bool {
     matches!(
         name,
         "swarm_start"
+            | "tasks_plan"
             | "swarm_list"
             | "swarm_add"
             | "swarm_launch_failed"
@@ -220,78 +162,66 @@ pub(crate) fn coordinator_tool(name: &str) -> bool {
             | "roles_show"
     )
 }
-pub(crate) fn catalog(
-    board: &board_local::Board,
-    set: Toolset,
-    worker: bool,
-    structured: bool,
-) -> Vec<Value> {
+pub(crate) fn catalog(board: &board_local::Board, set: Toolset, worker: bool) -> Vec<Published> {
     TOOLS
         .iter()
         .filter(|t| t.offered(set, worker))
-        .map(|tool| {
-            let mut d = tool.definition();
-            if matches!(tool.name, "swarm_post" | "board_post" | "board_reply") {
-                let input = &mut d["inputSchema"];
-                if tool.name == "board_post" {
-                    input["oneOf"] = json!([{"required":["channel"]},{"required":["reply_to"]}]);
-                }
-                input["dependentRequired"] = json!({"schema":["schema_data"],"schema_data":["schema"]});
-                let variants: Vec<_> = ["handoff","verification","decision-request","decision-resolution"]
-                    .into_iter()
-                    .filter_map(|name| board.schema(name, 1).ok().filter(|s| s.built_in))
-                    .map(|s| json!({
-                        "if":{"required":["schema"],"properties":{"schema":{"const":s.id}}},
-                        "then":{"properties":{"schema_data":s.schema}}
-                    })).collect();
-                if !variants.is_empty() {
-                    input["allOf"] = json!(variants);
-                }
-            } else if tool.name == "board_read" {
-                let input = &mut d["inputSchema"];
-                input["properties"]["kind"]["enum"] = json!(["public","dm","addressed"]);
-                input["dependentRequired"] = json!({"kind":["run"],"worker":["run"]});
-                input["not"] = json!({"required":["run"],"anyOf":[{"required":["target"]},
-                    {"required":["channel"]},{"required":["text"]},{"required":["by"]},{"required":["mentions"]}]});
-            } else if tool.name == "worker_assignment" {
-                d["inputSchema"]["dependentRequired"] = json!({"skill":["path"],"path":["skill"]});
-            } else if tool.name == "swarm_wait" {
-                d["inputSchema"]["not"] = json!({"required":["ack","after"]});
-            } else if tool.name == "swarm_observe" {
-                d["inputSchema"]["not"] = json!({"required":["explain_task"],
-                    "anyOf":[{"required":["after"]},{"required":["action_after"]},{"required":["task_after"]}]});
-            } else if tool.name == "tasks_claim" {
-                d["inputSchema"]["oneOf"] = json!([{"required":["id"]},{"required":["ready_channel"]}]);
-                d["inputSchema"]["dependentRequired"] = json!({"wait_seconds":["ready_channel"]});
-            }
-            if structured && let Some(success) = output_schema(tool.name) {
-                d["outputSchema"] = json!({"type":"object","oneOf":[success,{
-                    "required":["code","message"],"properties":{"code":Kind::Text.schema(),"message":Kind::Text.schema()}
-                }]});
-            }
-            d
-        })
+        .map(|tool| publish(tool, board))
         .collect()
 }
-fn output_schema(name: &str) -> Option<Value> {
-    Some(match name {
-        "tasks_plan" => json!({"required":["key","tasks"],"properties":{
-            "key":Kind::Text.schema(),"tasks":{"type":"array","items":{"type":"object","required":["id"],"properties":{"id":Kind::Id.schema()}}}
-        }}),
-        "swarm_observe" => {
-            json!({"oneOf":[{"required":["task_id","steps","truncated"],"properties":{"task_id":Kind::Id.schema(),
-                "steps":{"type":"array","items":{"type":"object","required":["id","title","state","reason","waits_on","handoff"]}},
-                "truncated":Kind::Bool.schema()}},{"required":["run","goal","channel","status","policy","workers","tasks","threads","next_task_after","available_capacity","actions","changes","cursor","next_action_after","has_more"],
-                "properties":{"run":Kind::Text.schema(),"status":Kind::Text.schema(),"policy":{"type":"object"},
-                "goal":Kind::Text.schema(),"channel":Kind::Text.schema(),"workers":{"type":"object"},"tasks":{"type":"object"},"available_capacity":Kind::Cursor.schema(),
-                "threads":{"type":"array","items":{"type":"object","required":["id","title","state"]}},"next_task_after":{"type":["integer","null"]},
-                "actions":{"type":"array"},"changes":{"type":"array"},"cursor":Kind::Cursor.schema(),
-                "next_action_after":{"type":["integer","null"]},"has_more":Kind::Bool.schema()}
-            }]})
+
+fn publish(tool: &'static Tool, board: &board_local::Board) -> Published {
+    let mut input = json!(&*(tool.schema)());
+    if matches!(tool.name, "swarm_post" | "board_post") {
+        if tool.name == "board_post" {
+            input["oneOf"] = json!([{"required":["channel"]},{"required":["reply_to"]}]);
         }
-        _ => return None,
-    })
-}
-pub(crate) fn find(name: &str) -> Option<&'static Tool> {
-    TOOLS.iter().find(|t| t.name == name)
+        input["dependentRequired"] = json!({"schema":["schema_data"],"schema_data":["schema"]});
+        if tool.name == "board_post" {
+            input["dependentRequired"]["run"] = json!(["reply_to"]);
+        }
+        let variants: Vec<_> = [
+            "handoff",
+            "verification",
+            "decision-request",
+            "decision-resolution",
+        ]
+        .into_iter()
+        .filter_map(|name| board.schema(name, 1).ok().filter(|s| s.built_in))
+        .map(|s| {
+            json!({
+                "if":{"required":["schema"],"properties":{"schema":{"const":s.id}}},
+                "then":{"properties":{"schema_data":s.schema}}
+            })
+        })
+        .collect();
+        if !variants.is_empty() {
+            input["allOf"] = json!(variants);
+        }
+    } else if tool.name == "swarm_start" {
+        input["oneOf"] = json!([{"required":["channel"]},{"required":["thread_id"]}]);
+    } else if tool.name == "worker_assignment" {
+        input["dependentRequired"] = json!({"skill":["path"],"path":["skill"]});
+    } else if tool.name == "swarm_wait" {
+        input["not"] = json!({"required":["ack","after"]});
+    } else if tool.name == "swarm_observe" {
+        input["not"] = json!({"required":["explain_task"],
+                    "anyOf":[{"required":["after"]},{"required":["action_after"]},{"required":["task_after"]}]});
+    }
+
+    let mut definition = McpTool::new(
+        tool.name,
+        tool.description,
+        input.as_object().unwrap().clone(),
+    );
+    definition.output_schema = match tool.name {
+        "tasks_plan" => Some(schema_for_output::<super::ToolOutput<super::PlanReply>>()),
+        "swarm_observe" => Some(schema_for_output::<super::ToolOutput<super::Observation>>()),
+        _ => None,
+    };
+    Published {
+        tool,
+        definition,
+        validator: OnceLock::new(),
+    }
 }

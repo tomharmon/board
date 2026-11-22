@@ -5,14 +5,13 @@ mod router;
 mod stdio;
 mod tools;
 
-pub use router::{ActorContext, handle_request};
-pub use stdio::{serve_stdio, serve_stdio_bound, serve_stdio_with_tools};
+use router::ActorContext;
+pub use stdio::serve_stdio_with_tools;
 
 /// What this connection advertises and accepts, not an authorization grant.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Toolset {
     #[default]
     Board,
-    Queue,
     Full,
 }

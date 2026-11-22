@@ -1,20 +1,8 @@
+use super::client::Client;
 use board_local::{Board, access::Rules};
 use serde_json::{Value, json};
-use std::{
-    io::{BufRead, BufReader, Write},
-    path::Path,
-    process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+use std::{path::Path, process::Command};
 
-struct Client {
-    child: Child,
-    input: ChildStdin,
-    lines: mpsc::Receiver<String>,
-    id: u64,
-}
 impl Client {
     fn full(path: &Path, profile: Option<&str>, token: Option<&str>) -> Self {
         Self::full_session(path, profile, token, None)
@@ -34,9 +22,8 @@ impl Client {
         worker: Option<&str>,
         flag: Option<&str>,
     ) -> Self {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_board-mcp-stdio"));
-        cmd.args(flag)
-            .env_clear()
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_board"));
+        cmd.env_clear()
             .env("BOARD_DB", path)
             .env("BOARD_USER", "ada")
             .env("BOARD_SWARM_RUN", "release");
@@ -49,84 +36,12 @@ impl Client {
         if let Some(worker) = worker {
             cmd.env("BOARD_WORKER", worker);
         }
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take().unwrap();
-        let out = child.stdout.take().unwrap();
-        let (tx, lines) = mpsc::channel();
-        thread::spawn(move || {
-            for line in BufReader::new(out).lines().map_while(Result::ok) {
-                if tx.send(line).is_err() {
-                    break;
-                }
-            }
-        });
-        Self {
-            child,
-            input,
-            lines,
-            id: 0,
-        }
-    }
-    fn write(&mut self, s: &str) {
-        writeln!(self.input, "{s}").unwrap();
-        self.input.flush().unwrap();
-    }
-    fn read(&self) -> Value {
-        let line = self.lines.recv_timeout(Duration::from_secs(10)).expect(
-            "expected one complete protocol frame; no diagnostic output is permitted on stdout",
-        );
-        serde_json::from_str(&line).unwrap()
-    }
-    fn send(&mut self, method: &str, params: Value) -> u64 {
-        self.id += 1;
-        self.write(
-            &json!({"jsonrpc":"2.0","method":method,"id":self.id,"params":params}).to_string(),
-        );
-        self.id
-    }
-    fn request(&mut self, method: &str, params: Value) -> Value {
-        let id = self.send(method, params);
-        let msg = self.read();
-        assert_eq!(msg["id"], id, "{msg}");
-        msg
-    }
-    fn initialize(&mut self) {
-        let r=self.request("initialize",json!({"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"pipe-test","version":"1"}}));
-        assert_eq!(r["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(r["result"]["serverInfo"]["name"], "board-mcp");
-        assert_eq!(r["result"]["capabilities"], json!({"tools":{}}));
-        self.write(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
-        assert_eq!(self.request("ping", json!({}))["result"], json!({}));
-    }
-    fn tool(&mut self, name: &str, args: Value, success: bool) -> Value {
-        let reply = self.request("tools/call", json!({"name":name,"arguments":args}));
-        Self::content(reply, success)
-    }
-    fn content(reply: Value, success: bool) -> Value {
-        assert_eq!(reply["result"]["isError"], !success, "{reply}");
-        assert_eq!(reply["result"]["content"][0]["type"], "text");
-        serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
-    }
-    fn call(&mut self, name: &str, args: Value) -> Value {
-        self.tool(name, args, true)
-    }
-    fn denied(&mut self, name: &str, args: Value) -> Value {
-        self.tool(name, args, false)
-    }
-}
-impl Drop for Client {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        Self::spawn(cmd, flag)
     }
 }
 
 #[test]
-fn board_and_queue_catalogs_match_what_each_connection_can_actually_call() {
+fn board_catalog_matches_what_each_connection_can_actually_call() {
     use std::collections::BTreeSet;
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("board");
@@ -134,7 +49,7 @@ fn board_and_queue_catalogs_match_what_each_connection_can_actually_call() {
     boss.initialize();
     boss.call(
         "swarm_start",
-        json!({"slug":"release","goal":"Check the published catalogs"}),
+        json!({"channel":"release","slug":"release","goal":"Check the published catalogs"}),
     );
     boss.call(
         "swarm_add",
@@ -142,65 +57,52 @@ fn board_and_queue_catalogs_match_what_each_connection_can_actually_call() {
     );
     let plan = boss.call(
         "tasks_plan",
-        json!({"channel":"swarms/release","tasks":[{"key":"review","text":"Review catalogs"}]}),
+        json!({"channel":"release","run":"release","tasks":[{"key":"review","text":"Review catalogs"}]}),
     );
     let id = &plan["tasks"][0]["id"];
     for bound in [None, Some("release/review")] {
-        for flag in [None, Some("--queue")] {
-            let mut c = Client::start_mode(&path, None, None, bound, flag);
-            c.initialize();
-            let list = c.request("tools/list", json!({}));
-            let names: BTreeSet<_> = list["result"]["tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|t| t["name"].as_str().unwrap())
-                .collect();
-            let mut expected =
-                BTreeSet::from(["board_post", "board_read", "swarm_observe", "swarm_wait"]);
-            if bound.is_some() {
-                expected.insert("worker_assignment");
-            } else {
-                expected.extend(["swarm_start", "swarm_add", "swarm_stop", "tasks_plan"]);
-            }
-            if flag.is_some() {
-                expected.extend([
-                    "tasks_claim",
-                    "tasks_renew",
-                    "tasks_release",
-                    "tasks_complete",
-                    "tasks_fail",
-                    "tasks_block",
-                ]);
-            }
-            assert_eq!(names, expected, "{bound:?} {flag:?}");
-            let before = Board::open(&path).unwrap().cursor().unwrap();
-            for (hidden, args) in [
-                ("swarm_post", json!({"text":"No hidden shortcut"})),
-                (
-                    "tasks_create",
-                    json!({"channel":"swarms/release","text":"Blind lease","claim":true}),
-                ),
-                ("board_reply", json!({"id":id,"text":"Wrong tool"})),
-            ] {
-                assert_eq!(
-                    c.request("tools/call", json!({"name":hidden,"arguments":args}))["error"]["code"],
-                    -32602
-                );
-            }
-            if flag.is_none() {
-                assert_eq!(c.request("tools/call", json!({"name":"tasks_claim","arguments":{"ready_channel":"swarms/release","wait_seconds":300}}))["error"]["code"], -32602);
-                assert_eq!(c.request("ping", json!({}))["result"], json!({}));
-            }
-            assert_eq!(Board::open(&path).unwrap().cursor().unwrap(), before);
+        let mut c = Client::start_mode(&path, None, None, bound, None);
+        c.initialize();
+        let list = c.request("tools/list", json!({}));
+        let names: BTreeSet<_> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        let mut expected =
+            BTreeSet::from(["board_post", "board_read", "swarm_observe", "swarm_wait"]);
+        if bound.is_some() {
+            expected.insert("worker_assignment");
+        } else {
+            expected.extend(["swarm_start", "swarm_add", "swarm_stop", "tasks_plan"]);
         }
+        assert_eq!(names, expected, "{bound:?}");
+        let before = Board::open(&path).unwrap().cursor().unwrap();
+        for (hidden, args) in [
+            ("swarm_post", json!({"text":"No hidden shortcut"})),
+            (
+                "tasks_create",
+                json!({"channel":"release","text":"Blind lease","claim":true}),
+            ),
+            ("board_reply", json!({"id":id,"text":"Wrong tool"})),
+        ] {
+            assert_eq!(
+                c.request("tools/call", json!({"name":hidden,"arguments":args}))["error"]["code"],
+                -32602
+            );
+        }
+        assert_eq!(c.request("tools/call", json!({"name":"tasks_claim","arguments":{"ready_channel":"release","wait_seconds":300}}))["error"]["code"], -32602);
+        assert_eq!(c.request("ping", json!({}))["result"], json!({}));
+        assert_eq!(Board::open(&path).unwrap().cursor().unwrap(), before);
     }
-    let mut worker = Client::start_mode(&path, None, None, Some("release/review"), Some("--queue"));
+    let mut worker = Client::start_mode(&path, None, None, Some("release/review"), Some("--full"));
     worker.initialize();
-    assert_eq!(
-        worker.call("tasks_claim", json!({"ready_channel":"swarms/release"}))["id"],
-        *id
+    worker.denied(
+        "tasks_claim",
+        json!({"ready_channel":"release","wait_seconds":1}),
     );
+    assert_eq!(worker.call("tasks_claim", json!({"id":id}))["id"], *id);
     assert_eq!(
         worker.call("tasks_complete", json!({"id":id,"result":"Reviewed"}))["state"],
         "completed"
@@ -209,6 +111,49 @@ fn board_and_queue_catalogs_match_what_each_connection_can_actually_call() {
         boss.call("swarm_observe", json!({}))["tasks"]["completed"],
         1
     );
+}
+
+#[test]
+fn board_read_advertises_only_the_forms_it_executes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut c = Client::start_mode(&tmp.path().join("board"), None, None, None, None);
+    c.initialize();
+    let root = c.call("board_post", json!({"channel":"work","text":"first"}))["id"].clone();
+    c.call(
+        "swarm_start",
+        json!({"thread_id":root,"slug":"review","goal":"Read this thread"}),
+    );
+    let listed = c.request("tools/list", json!({}));
+    let schema = &listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "board_read")
+        .unwrap()["inputSchema"];
+    let validator = jsonschema::validator_for(schema).unwrap();
+    for (valid, args) in [
+        (false, json!({"target":root,"channel":"work"})),
+        (false, json!({"run":"review","text":"first"})),
+        (false, json!({"worker":"review"})),
+        (false, json!({"run":"review","kind":"unknown"})),
+        (false, json!({"target":0})),
+        (false, json!({"target":root,"after":0})),
+        (true, json!({"target":root,"after":root})),
+        (false, json!({"after":-1})),
+        (false, json!({"limit":501})),
+        (false, json!({"typo":"work"})),
+        (true, json!({"target":root})),
+        (true, json!({"run":"review","kind":"public","after":0})),
+        (true, json!({"channel":"work","text":"first","limit":1})),
+        (true, json!({})),
+    ] {
+        assert_eq!(validator.is_valid(&args), valid, "catalog: {args}");
+        let reply = c.request("tools/call", json!({"name":"board_read","arguments":args}));
+        assert_eq!(
+            reply["result"]["isError"], !valid,
+            "dispatch: {args}: {reply}"
+        );
+    }
 }
 
 #[test]
@@ -238,7 +183,10 @@ fn protocol_framing_inventory_and_schema_validation() {
     let mut names: Vec<_> = tools
         .iter()
         .map(|t| {
-            assert_eq!(t["inputSchema"]["additionalProperties"], false);
+            // A union closes each argument form rather than the outer object.
+            if t["name"] != "board_read" {
+                assert_eq!(t["inputSchema"]["additionalProperties"], false);
+            }
             assert_eq!(t["inputSchema"]["type"], "object");
             t["name"].as_str().unwrap()
         })
@@ -253,7 +201,6 @@ fn protocol_framing_inventory_and_schema_validation() {
             "board_file_upload",
             "board_post",
             "board_read",
-            "board_reply",
             "board_whoami",
             "roles_list",
             "roles_show",
@@ -388,78 +335,6 @@ fn mcp_file_chunks_require_a_live_readable_placement_on_every_read() {
 }
 
 #[test]
-fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = dir.path().join("pool");
-    let mut boss = Client::full(&db, None, None);
-    let mut worker = Client::full(&db, Some("pool"), None);
-    boss.initialize();
-    worker.initialize();
-    let first = boss.call(
-        "tasks_create",
-        json!({"channel":"pool","text":"first","claim":true}),
-    );
-    let next = boss.call(
-        "tasks_create",
-        json!({"channel":"pool","text":"second","needs":[first["id"]]}),
-    );
-    let mine = worker.call(
-        "tasks_create",
-        json!({"channel":"other","text":"mine","claim":true}),
-    );
-    let req = json!({"name":"tasks_claim","arguments":{"ready_channel":"pool","wait_seconds":5}});
-    let parked = worker.send("tools/call", req.clone());
-    let renewed = worker.call("tasks_renew", json!({"id":mine["id"],"lease_seconds":3600}));
-    assert_eq!(renewed["epoch"], mine["epoch"]);
-    assert!(renewed["lease_until"].as_i64() > mine["lease_until"].as_i64());
-    assert!(renewed.get("claim_token").is_none());
-    worker.write(
-        &json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":parked}})
-            .to_string(),
-    );
-    assert_eq!(
-        worker.call("tasks_release", json!({"id":mine["id"]}))["state"],
-        "ready"
-    );
-    let parked = worker.send("tools/call", req);
-    assert_eq!(worker.request("ping", json!({}))["result"], json!({}));
-    boss.call("tasks_complete", json!({"id":first["id"]}));
-    let response = worker.read();
-    assert_eq!(response["id"], parked);
-    assert_eq!(response["result"]["structuredContent"]["id"], next["id"]);
-    let task = Client::content(response, true);
-    assert!(task.get("claim_token").is_none());
-    assert_eq!(
-        worker.call("tasks_complete", json!({"id":task["id"]}))["state"],
-        "completed"
-    );
-}
-
-#[test]
-fn contended_queue_wait_yields_to_ping_and_never_leases_after_its_deadline() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("contention");
-    let mut c = Client::full(&path, None, None);
-    c.initialize();
-    let task = c.call("tasks_create", json!({"channel":"pool","text":"ready"}));
-    let writer = rusqlite::Connection::open(&path).unwrap();
-    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-    let id = c.send(
-        "tools/call",
-        json!({"name":"tasks_claim","arguments":{"ready_channel":"pool","wait_seconds":1}}),
-    );
-    assert_eq!(c.request("ping", json!({}))["result"], json!({}));
-    let reply = c.read();
-    assert_eq!(reply["id"], id);
-    assert_eq!(Client::content(reply, false)["code"], "nothing_ready");
-    writer.execute_batch("ROLLBACK").unwrap();
-    assert_eq!(
-        c.call("tasks_claim", json!({"ready_channel":"pool"}))["id"],
-        task["id"]
-    );
-}
-
-#[test]
 fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("inbox");
@@ -467,7 +342,7 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     boss.initialize();
     boss.call(
         "swarm_start",
-        json!({"slug":"release","goal":"Interrupt an inbox"}),
+        json!({"channel":"release","slug":"release","goal":"Interrupt an inbox"}),
     );
     boss.call(
         "swarm_add",
@@ -482,7 +357,7 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     worker.request("ping", json!({}));
     assert_eq!(
         boss.call("swarm_status", json!({}))["workers"][0]["status"],
-        "waiting"
+        "working"
     );
     let writer = rusqlite::Connection::open(&path).unwrap();
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -493,11 +368,6 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     worker.request("ping", json!({}));
     writer.execute_batch("ROLLBACK").unwrap();
     let msg = boss.call("swarm_dm", json!({"to":"review","text":"Still unread"}));
-    let until = Instant::now() + Duration::from_secs(4);
-    while boss.call("swarm_status", json!({}))["workers"][0]["status"] == "waiting" {
-        assert!(Instant::now() < until);
-        thread::sleep(Duration::from_millis(15));
-    }
     let delivery = worker.call("swarm_wait", json!({"timeout_seconds":0}));
     assert_eq!(delivery["dms"][0]["id"], msg["id"]);
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
@@ -520,7 +390,7 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     worker.request("ping", json!({}));
     assert_eq!(
         boss.call("swarm_status", json!({}))["workers"][0]["status"],
-        "waiting"
+        "working"
     );
     writer.execute_batch("BEGIN IMMEDIATE").unwrap();
     let reply = worker.read();
@@ -541,7 +411,7 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     boss.initialize();
     boss.call(
         "swarm_start",
-        json!({"slug":"release","goal":"two leaves and a join","max_active":2,"retry_budget":1}),
+        json!({"channel":"release","slug":"release","goal":"two leaves and a join"}),
     );
     boss.call(
         "swarm_add",
@@ -549,33 +419,54 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     );
     let mut worker = Client::full_session(&db, None, None, Some("release/tester"));
     worker.initialize();
-    let compact = worker.call("swarm_check_in", json!({"compact":true}));
-    assert_eq!(compact["actor"], "ada/tester");
-    assert!(compact.get("workers").is_none());
-    let mut plan = json!({"channel":"swarms/release","key":"release-v1","tasks":[
+    let ack = worker.call("swarm_check_in", json!({}));
+    assert_eq!(
+        ack,
+        json!({"run":"release","worker":"tester","actor":"ada/tester","status":"working"})
+    );
+    worker.denied("swarm_check_in", json!({"compact":true}));
+    let mut plan = json!({"run":"release","channel":"release","key":"release-v1","tasks":[
         {"key":"join","text":"Synthesize both leaves","needs":["a","b"],"no_sync":true},
         {"key":"a","text":"Analyze A","no_sync":true},
         {"key":"b","text":"Analyze B","no_sync":true}]});
     let made = boss.call("tasks_plan", plan.clone());
+    let listed = boss.request("tools/list", json!({}));
+    let contract = |name: &str| {
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap();
+        jsonschema::validator_for(&tool["outputSchema"]).unwrap()
+    };
+    let plan_output = contract("tasks_plan");
+    plan_output.validate(&made).unwrap();
+    assert!(!plan_output.is_valid(&json!({"key":"broken","tasks":[{"id":1}]})));
     let original_plan = plan.clone();
     assert_eq!(boss.call("tasks_plan", plan.clone()), made);
     plan["tasks"][1]["text"] = json!("changed");
-    assert_eq!(boss.denied("tasks_plan", plan)["code"], "duplicate_id");
+    let conflict = boss.denied("tasks_plan", plan);
+    assert_eq!(conflict["code"], "duplicate_id");
+    plan_output.validate(&conflict).unwrap();
     let a = made["tasks"][1]["id"].clone();
     boss.call("tasks_block", json!({"id":a,"reason":"awaiting fixture"}));
     let b = made["tasks"][2]["id"].clone();
     boss.call("tasks_block", json!({"id":b,"reason":"awaiting input"}));
     assert_eq!(made["tasks"][0]["needs"], json!([a, b]));
     let obs = boss.call("swarm_observe", json!({"limit":1}));
+    let observation_output = contract("swarm_observe");
+    observation_output.validate(&obs).unwrap();
     assert_eq!(obs["tasks"], json!({"waiting":1,"blocked":2}));
-    assert_eq!(obs["available_capacity"], 1);
-    assert_eq!(obs["policy"]["retry_budget"], 1);
+    assert_eq!(obs["workers"]["working"], 1);
+    assert!(obs.get("available_capacity").is_none() && obs.get("policy").is_none());
     assert_eq!(obs["actions"][0]["blocked_dependents"], 1);
     let focused = boss.call(
         "swarm_observe",
         json!({"explain_task":made["tasks"][0]["id"],"limit":2}),
     );
     assert_eq!(focused["task_id"], made["tasks"][0]["id"]);
+    observation_output.validate(&focused).unwrap();
     assert_eq!(focused["steps"][0]["waits_on"], json!([a, b]));
     assert_eq!(focused["steps"][1]["reason"], "awaiting fixture");
     assert_eq!(focused["truncated"], true);
@@ -587,10 +478,10 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     assert_ne!(page["actions"][0]["task_id"], obs["actions"][0]["task_id"]);
     assert!(page["changes"].as_array().unwrap().is_empty());
     assert_eq!(page["cursor"], obs["cursor"]);
-    let first = worker.call("tasks_list", json!({"channel":"swarms/release","limit":2}));
+    let first = worker.call("tasks_list", json!({"channel":"release","limit":2}));
     let last = worker.call(
         "tasks_list",
-        json!({"channel":"swarms/release","limit":2,"after":first["next_after"]}),
+        json!({"channel":"release","limit":2,"after":first["next_after"]}),
     );
     assert_eq!(last["tasks"].as_array().unwrap().len(), 1);
     assert!(last["next_after"].is_null());
@@ -620,10 +511,9 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
         worker.call("swarm_status", json!({}))["workers"][0]["status"],
         "working"
     );
-    worker.send("tools/call",json!({"name":"tasks_claim","arguments":{"ready_channel":"swarms/release","wait_seconds":5}}));
     boss.call("swarm_stop", json!({}));
     assert_eq!(
-        Client::content(worker.read(), false)["code"],
+        worker.denied("tasks_claim", json!({"id":a}))["code"],
         "swarm_stopped"
     );
     let replay = boss.call("tasks_plan", original_plan);
@@ -645,14 +535,14 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
 }
 
 #[test]
-fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
+fn tool_results_include_structured_data_and_evidence_inputs() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("board");
     let mut modern = Client::full(&db, None, None);
     modern.initialize();
     let response = modern.request("tools/list", json!({}));
     let defs = response["result"]["tools"].as_array().unwrap();
-    for tool in ["swarm_post", "board_post", "board_reply"] {
+    for tool in ["swarm_post", "board_post"] {
         let post = defs.iter().find(|t| t["name"] == tool).unwrap();
         let cases = post["inputSchema"]["allOf"].as_array().unwrap();
         for name in ["handoff@1", "verification@1"] {
@@ -666,10 +556,13 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
         }
     }
     let mut old = Client::full(&db, None, None);
-    old.request("initialize", json!({"protocolVersion":"2025-03-26"}));
-    let reply = old.request("tools/call", json!({"name":"roles_list","arguments":{}}));
-    assert!(reply["result"].get("structuredContent").is_none());
-    assert!(Client::content(reply, true).is_array());
+    let offered = old.request("initialize", json!({"protocolVersion":"2025-03-26"}));
+    assert_eq!(offered["result"]["protocolVersion"], "2025-11-25");
+    let reply = modern.request("tools/call", json!({"name":"roles_list","arguments":{}}));
+    assert_eq!(
+        reply["result"]["structuredContent"]["items"],
+        Client::content(reply.clone(), true)
+    );
 }
 
 #[test]
@@ -678,18 +571,25 @@ fn unified_posts_and_run_reads_keep_routing_and_private_history_separate() {
     let path = dir.path().join("board");
     let mut boss = Client::start_mode(&path, None, None, None, None);
     boss.initialize();
-    let run = boss.call("swarm_start", json!({"slug":"release","goal":"Review"}));
+    let run = boss.call(
+        "swarm_start",
+        json!({"channel":"release","slug":"release","goal":"Review"}),
+    );
+    let root = boss.call(
+        "board_post",
+        json!({"channel":"code","text":"Release candidate"}),
+    );
     for name in ["verify", "peer"] {
-        boss.call("swarm_add", json!({"name":name,"brief":"Check a revision"}));
+        boss.call(
+            "swarm_add",
+            json!({"name":name,"brief":"Check a revision","thread_id":root["id"]}),
+        );
     }
     let mut verifier = Client::start_mode(&path, None, None, Some("release/verify"), None);
     let mut peer = Client::start_mode(&path, None, None, Some("release/peer"), None);
     verifier.initialize();
     peer.initialize();
-    let root = boss.call(
-        "board_post",
-        json!({"channel":run["channel"],"text":"Release candidate"}),
-    );
+    let before_reply = boss.call("board_read", json!({"run":run["id"]}))["cursor"].clone();
     let reply = json!({"reply_to":root["id"],"text":"@verify Check the candidate","idempotency_key":"review"});
     let sent = boss.call("board_post", reply.clone());
     assert_eq!(sent["re"], root["id"]);
@@ -709,7 +609,7 @@ fn unified_posts_and_run_reads_keep_routing_and_private_history_separate() {
         .swarm_dm("ada", "release", "verify", "Private follow-up")
         .unwrap();
     let before = (db.cursor().unwrap(), db.data_version().unwrap());
-    let public = verifier.call("board_read", json!({"run":run["id"],"after":root["id"]}));
+    let public = verifier.call("board_read", json!({"run":run["id"],"after":before_reply}));
     assert_eq!(public["entries"].as_array().unwrap().len(), 1);
     assert_eq!(public["entries"][0]["message"]["id"], sent["id"]);
     assert!(public["entries"][0]["dm"].is_null());
@@ -741,6 +641,55 @@ fn unified_posts_and_run_reads_keep_routing_and_private_history_separate() {
 }
 
 #[test]
+fn a_shared_goal_thread_can_address_one_run_without_claiming_the_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("board");
+    let mut boss = Client::start_mode(&db, None, None, None, None);
+    boss.initialize();
+    let root = boss.call(
+        "board_post",
+        json!({"channel":"project","text":"Release review"}),
+    )["id"]
+        .clone();
+    for wrong in [
+        json!({"goal":"Missing slug","thread_id":root}),
+        json!({"goal":"Missing destination","slug":"bad"}),
+        json!({"goal":"Ambiguous destination","slug":"bad","thread_id":root,"channel":"elsewhere"}),
+        json!({"goal":"Retired launch limit","slug":"bad","thread_id":root,"max_active":1}),
+        json!({"goal":"Retired retry budget","slug":"bad","thread_id":root,"retry_budget":1}),
+    ] {
+        boss.denied("swarm_start", wrong);
+    }
+    for (slug, name) in [("packaging", "packager"), ("docs", "editor")] {
+        let run = boss.call(
+            "swarm_start",
+            json!({"thread_id":root,"slug":slug,"goal":"Review the release"}),
+        );
+        assert_eq!(run["thread_id"], root);
+        assert_eq!(run["channel"], "project");
+        boss.call(
+            "swarm_add",
+            json!({"run":slug,"name":name,"thread_id":root,"brief":"Check your part"}),
+        );
+    }
+    let post = boss.call(
+        "board_post",
+        json!({"run":"packaging","reply_to":root,"text":"@packager please review"}),
+    );
+    assert_eq!(post["notified"], json!(["packager"]));
+    let mut editor = Client::start_mode(&db, None, None, Some("docs/editor"), None);
+    editor.initialize();
+    assert_eq!(
+        editor.call("swarm_wait", json!({"timeout_seconds":0}))["status"],
+        "still_waiting"
+    );
+    let overview = editor.call("swarm_observe", json!({}));
+    assert_eq!(overview["threads"][0]["briefed_workers"], json!(["editor"]));
+    assert_eq!(overview["tasks"], json!({}));
+    assert_eq!(overview["threads"][0]["state"], "thread");
+}
+
+#[test]
 fn ordinary_public_replies_record_evidence_once_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("board");
@@ -748,23 +697,24 @@ fn ordinary_public_replies_record_evidence_once_on_retry() {
     boss.initialize();
     let run = boss.call(
         "swarm_start",
-        json!({"slug":"release","goal":"verify one change"}),
+        json!({"channel":"release","slug":"release","goal":"verify one change"}),
     );
     boss.call("swarm_add", json!({"name":"check","brief":"verify"}));
     boss.call("swarm_add", json!({"name":"build","brief":"build"}));
     boss.call("swarm_set_limit", json!({"max_notifications":0}));
     let mut verifier = Client::full_session(&path, None, None, Some("release/check"));
     verifier.initialize();
-    let args = json!({"channel":run["channel"],"text":"Review @check","idempotency_key":"mcp-public-root"});
+    let args = json!({"reply_to":run["thread_id"],"text":"Review @check","idempotency_key":"mcp-public-root"});
     let root = boss.call("board_post", args.clone());
     assert_eq!(root["notified"], json!(["check"]));
     assert_eq!(boss.call("board_post", args)["id"], root["id"]);
-    let args = json!({"id":root["id"],"text":"@build Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
-    let reply = verifier.call("board_reply", args.clone());
-    assert_eq!(reply["re"], root["id"]);
+    let args = json!({"reply_to":root["id"],"text":"@build Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
+    let reply = verifier.call("board_post", args.clone());
+    assert_eq!(reply["re"], run["thread_id"]);
+    assert_eq!(reply["reply_to"], root["id"]);
     assert_eq!(reply["notified"], json!(["coordinator"]));
     assert_eq!(reply["suppressed"], json!(["build"]));
-    let replay = verifier.call("board_reply", args);
+    let replay = verifier.call("board_post", args);
     assert_eq!(replay["id"], reply["id"]);
     assert_eq!(replay["suppressed"], reply["suppressed"]);
     let receipt = boss.call("swarm_receipt", json!({}));
@@ -773,7 +723,51 @@ fn ordinary_public_replies_record_evidence_once_on_retry() {
 }
 
 #[test]
-fn ordinary_mcp_plan_can_repair_an_uncommitted_suffix() {
+fn plan_adopts_a_conversation_and_only_explicitly_links_the_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut boss = Client::full(&dir.path().join("board"), None, None);
+    boss.initialize();
+    boss.call(
+        "swarm_start",
+        json!({"slug":"release","channel":"ops","goal":"Ship"}),
+    );
+    let root = boss.call("board_post", json!({"channel":"bugs","text":"Slow builds"}));
+    let id = &root["id"];
+    let body = json!({"channel":"queue","run":"release","key":"fix","tasks":[
+        {"text":"Verify","needs":["fix"]},{"key":"fix","thread_id":id}
+    ]});
+    boss.denied(
+        "tasks_plan",
+        json!({"channel":"bugs","tasks":[{"thread_id":id,"labels":{"severity":"urgent"}}]}),
+    );
+    let out = boss.call("tasks_plan", body.clone());
+    assert_eq!(out["tasks"][0]["needs"], json!([id]));
+    assert_eq!(&out["tasks"][1]["id"], id);
+    assert_eq!(out["tasks"][1]["channel"], "bugs");
+    assert_eq!(out["tasks"][1]["state"], "ready");
+    let unrelated = boss.call(
+        "tasks_plan",
+        json!({"channel":"queue","tasks":[{"text":"Other work"}]}),
+    );
+    let overview = boss.call("swarm_observe", json!({"run":"release"}));
+    let threads = overview["threads"].as_array().unwrap();
+    assert!(threads.iter().any(|t| &t["id"] == id));
+    assert!(threads.iter().any(|t| t["id"] == out["tasks"][0]["id"]));
+    assert!(
+        !threads
+            .iter()
+            .any(|t| t["id"] == unrelated["tasks"][0]["id"])
+    );
+    boss.call("swarm_stop", json!({"run":"release"}));
+    assert_eq!(boss.call("tasks_plan", body), out);
+    boss.denied(
+        "tasks_plan",
+        json!({"channel":"queue","run":"release","tasks":[{"text":"Too late"}]}),
+    );
+}
+
+#[test]
+fn ordinary_mcp_plan_rejects_oversized_batches_before_creating_tasks() {
     let dir = tempfile::tempdir().unwrap();
     let mut boss = Client::full(&dir.path().join("board"), None, None);
     boss.initialize();
@@ -785,25 +779,44 @@ fn ordinary_mcp_plan_can_repair_an_uncommitted_suffix() {
         "tasks_plan",
         json!({"channel":"work","key":"plan","tasks":tasks}),
     );
-    let committed = boss.call("tasks_list", json!({"channel":"work","limit":110}));
-    assert_eq!(committed["tasks"].as_array().unwrap().len(), 100);
-    tasks[100]["needs"] = json!(["i0"]);
+    let listed = boss.call("tasks_list", json!({"channel":"work","limit":110}));
+    assert!(listed["tasks"].as_array().unwrap().is_empty());
+    tasks.pop();
+    tasks[99]["needs"] = json!(["i0"]);
     let retried = boss.call(
         "tasks_plan",
         json!({"channel":"work","key":"plan","tasks":tasks}),
     );
-    let retried_tasks = retried["tasks"].as_array().unwrap();
-    assert_eq!(retried_tasks.len(), 101);
-    for (task, original) in retried_tasks
-        .iter()
-        .zip(committed["tasks"].as_array().unwrap())
-    {
-        assert_eq!(task["id"], original["id"]);
-    }
+    assert_eq!(retried["tasks"].as_array().unwrap().len(), 100);
     assert_eq!(
-        retried["tasks"][100]["needs"],
+        retried["tasks"][99]["needs"],
         json!([retried["tasks"][0]["id"]])
     );
+}
+
+#[test]
+fn a_new_coordinator_connection_recovers_a_committed_start_by_slug() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board");
+    let args = json!({"slug":"audit","goal":"Check the release","channel":"reviews"});
+    {
+        let mut first = Client::start_mode(&path, None, None, None, None);
+        first.initialize();
+        first.send("tools/call", json!({"name":"swarm_start","arguments":args}));
+        // Wait for the write to finish, but retain no result or identifiers.
+        first.read();
+    }
+    let board = Board::open(&path).unwrap();
+    let head = board.cursor().unwrap();
+    let mut retry = Client::start_mode(&path, None, None, None, None);
+    retry.initialize();
+    let run = retry.call("swarm_start", args.clone());
+    assert_eq!(run["status"], "active");
+    assert_eq!(board.cursor().unwrap(), head, "retry wrote to the board");
+    retry.call("swarm_stop", json!({"run":"audit"}));
+    let stopped = retry.call("swarm_start", args);
+    assert_eq!(stopped["status"], "stopped");
+    assert_eq!(stopped["thread_id"], run["thread_id"]);
 }
 
 #[test]
@@ -811,9 +824,15 @@ fn integer_run_reference_cannot_stop_a_different_numeric_slug() {
     let tmp = tempfile::tempdir().unwrap();
     let mut c = Client::full(&tmp.path().join("board"), None, None);
     c.initialize();
-    let first = c.call("swarm_start", json!({"goal":"first", "slug":"audit"}));
+    let first = c.call(
+        "swarm_start",
+        json!({"channel":"release","goal":"first", "slug":"audit"}),
+    );
     let slug = first["id"].to_string();
-    c.call("swarm_start", json!({"goal":"second", "slug":slug}));
+    c.call(
+        "swarm_start",
+        json!({"channel":"release","goal":"second", "slug":slug}),
+    );
     assert_eq!(
         c.call("swarm_stop", json!({"run":first["id"]}))["slug"],
         "audit"
@@ -828,7 +847,10 @@ fn an_open_markdown_example_cannot_swallow_a_requested_schema() {
     let tmp = tempfile::tempdir().unwrap();
     let mut c = Client::full(&tmp.path().join("board"), None, None);
     c.initialize();
-    c.call("swarm_start", json!({"goal":"test", "slug":"markdown"}));
+    c.call(
+        "swarm_start",
+        json!({"channel":"work","goal":"test", "slug":"markdown"}),
+    );
     let input = |data: Value| json!({"run":"markdown","text":"My example:\n```rust\nlet x = 1;", "schema":"verdict@1", "schema_data":data});
     c.denied("swarm_post", input(json!({"status":"no-such-verdict"})));
     let post = c.call(
@@ -858,25 +880,22 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
     );
     let run = coordinator.call(
         "swarm_start",
-        json!({"goal":"Check receipt recovery","slug":"release"}),
+        json!({"channel":"release","goal":"Check receipt recovery","slug":"release"}),
     );
     let listed = coordinator.call("swarm_list", json!({"limit":10}));
     assert_eq!(listed[0]["slug"], "release");
+    assert!(listed[0]["worker_count"].is_number());
+    assert!(listed[0].get("workers").is_none() && listed[0].get("activity_count").is_none());
+    assert!(coordinator.call("swarm_status", json!({}))["workers"].is_array());
     let updated = coordinator.call("swarm_set_limit", json!({"max_notifications":25}));
     assert_eq!(updated["max_notifications"], 25);
     let id = run["id"].as_i64().unwrap();
     let spawn = coordinator.call(
         "swarm_add",
-        json!({"run":id,"name":"checker","role":"verifier","brief":"Verify the receipt","export_local":true}),
+        json!({"run":id,"name":"checker","role":"verifier","brief":"Verify the receipt"}),
     );
     assert_eq!(spawn["worker"]["actor"], "ada/checker");
-    assert!(Path::new(spawn["skills_dir"].as_str().unwrap()).is_dir());
-    assert!(
-        spawn["assembled_prompt"]
-            .as_str()
-            .unwrap()
-            .contains("Verify the receipt")
-    );
+    assert_eq!(spawn["worker"]["brief"], "Verify the receipt");
     let mut checker = Client::full(&path, Some("checker"), None);
     checker.initialize();
     let observer = board_local::Board::open(&path).unwrap();
@@ -892,14 +911,7 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
         "tools/call",
         json!({"name":"swarm_wait","arguments":{"timeout_seconds":5}}),
     );
-    let until = Instant::now() + Duration::from_secs(4);
-    while coordinator.call("swarm_status", json!({}))["workers"][0]["status"] != "waiting" {
-        assert!(
-            Instant::now() < until,
-            "worker failed to register its deadline"
-        );
-        thread::sleep(Duration::from_millis(15));
-    }
+    checker.request("ping", json!({}));
     let posted=coordinator.call("swarm_post",json!({"text":"Please check, @checker","schema":"verdict@1","schema_data":{"status":"not-run","summary":"Awaiting checker"}}));
     assert_eq!(posted["notified"], json!(["checker"]));
     assert_eq!(posted["message"]["blocks"].as_array().unwrap().len(), 1);
@@ -952,7 +964,7 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
     boss.initialize();
     boss.call(
         "swarm_start",
-        json!({"slug":"release","goal":"Park and recover"}),
+        json!({"channel":"release","slug":"release","goal":"Park and recover"}),
     );
     boss.call(
         "swarm_add",
@@ -964,25 +976,18 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
         "tools/call",
         json!({"name":"swarm_wait","arguments":{"timeout_seconds":30}}),
     );
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while boss.call("swarm_status", json!({}))["workers"][0]["waiter_pid"] != first.child.id() {
-        assert!(Instant::now() < deadline, "waiter did not enter");
-        thread::sleep(Duration::from_millis(15));
-    }
+    first.request("ping", json!({}));
     let message = boss.call(
         "swarm_post",
         json!({"text":"@checker verify this revision"}),
     )["message"]["id"]
         .clone();
-    // The server has finished the wait; deliberately kill the connection without reading its reply.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while boss.call("swarm_status", json!({}))["workers"][0]["status"] == "waiting" {
-        assert!(
-            Instant::now() < deadline,
-            "server did not finish the delivery"
-        );
-        thread::sleep(Duration::from_millis(15));
-    }
+    // Drop the delivered response without acknowledging the batch.
+    let delivered = first.read();
+    assert_eq!(
+        delivered["result"]["structuredContent"]["messages"][0]["id"],
+        message
+    );
     first.child.kill().unwrap();
     first.child.wait().unwrap();
     let mut replacement = Client::full(&path, Some("checker"), None);
@@ -1000,7 +1005,7 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
     );
     let worker = boss.call("swarm_status", json!({}))["workers"][0].clone();
     assert_eq!(worker["status"], "working");
-    assert!(worker["waiter_pid"].is_null());
+    assert!(worker.get("waiter_pid").is_none());
 }
 
 #[test]
@@ -1009,11 +1014,18 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
     let path = tmp.path().join("board");
     let mut owner = Client::full(&path, None, None);
     owner.initialize();
+    owner.denied(
+        "board_post",
+        json!({"channel":"bugs","text":"obsolete","labels":{"kind":"issue"}}),
+    );
     let root = owner.call(
         "board_post",
-        json!({"channel":"bugs","text":"reproduction","labels":{"kind":"issue"},"no_sync":true}),
+        json!({"channel":"bugs","text":"reproduction","no_sync":true}),
     );
-    let reply = owner.call("board_reply", json!({"id":root["id"],"text":"second step"}));
+    let reply = owner.call(
+        "board_post",
+        json!({"reply_to":root["id"],"text":"second step"}),
+    );
     assert_eq!(
         owner.call("board_read", json!({"target":reply["id"]}))["replies"][0]["id"],
         reply["id"]
@@ -1031,23 +1043,21 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
     );
     let created = owner.call(
         "tasks_create",
-        json!({"channel":"bugs","text":"fix receipt","labels":{"priority":"next"}}),
+        json!({"channel":"bugs","text":"fix receipt"}),
     );
     let id = &created["id"];
+    owner.denied(
+        "tasks_list",
+        json!({"channel":"bugs","state":"ready","labels":{"priority":"next"}}),
+    );
     assert_eq!(
-        owner.call(
-            "tasks_list",
-            json!({"channel":"bugs","state":"ready","labels":{"priority":"next"}})
-        )["tasks"][0]["id"],
+        owner.call("tasks_list", json!({"channel":"bugs","state":"ready"}))["tasks"][0]["id"],
         *id
     );
     let mut worker = Client::full(&path, Some("dev"), None);
     worker.initialize();
     assert_eq!(
-        worker.call(
-            "tasks_claim",
-            json!({"ready_channel":"bugs","labels":{"priority":"next"},"lease_seconds":30})
-        )["id"],
+        worker.call("tasks_claim", json!({"id":id,"lease_seconds":30}))["id"],
         *id
     );
     let mut other = Client::full(&path, Some("dev"), None);
@@ -1109,12 +1119,15 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
 fn invalid_worker_setting_does_not_open_a_coordinator_connection() {
     use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
     let dir = tempfile::tempdir().unwrap();
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_board-mcp-stdio"))
+    let db = dir.path().join("board.sqlite3");
+    let out = Command::new(env!("CARGO_BIN_EXE_board"))
+        .arg("mcp")
         .env_clear()
-        .env("BOARD_DB", dir.path().join("board.sqlite3"))
+        .env("BOARD_DB", &db)
         .env("BOARD_WORKER", OsStr::from_bytes(&[0xff]))
         .output()
         .unwrap();
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("BOARD_WORKER"));
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("invalid UTF-8"));
+    assert!(out.stdout.is_empty() && !db.exists());
 }

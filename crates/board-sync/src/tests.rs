@@ -104,6 +104,20 @@ fn setup(kind: Provider, remote: &str, m: &Mock) -> (Board, Connector) {
         Connector::new(kind, m.base.clone(), Some("test".into())).unwrap(),
     )
 }
+
+// Provider reconciliation state is not part of the public message model.
+fn stored_fields(db: &Board, id: i64) -> BTreeMap<String, String> {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("snapshot.db");
+    db.backup(&path).unwrap();
+    let conn = rusqlite::Connection::open(path).unwrap();
+    conn.prepare("SELECT key,value FROM labels WHERE message_id=?")
+        .unwrap()
+        .query_map([id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
 #[test]
 fn github_ci_updates_only_the_matching_head_and_redelivery_is_harmless() {
     let db = Board::memory().unwrap();
@@ -123,7 +137,10 @@ fn github_ci_updates_only_the_matching_head_and_redelivery_is_harmless() {
         ingest(&db, "p", "repo", "workflow_run", key, workflow(head, state)).unwrap();
         db.drain_source("p", "repo", 9).unwrap();
         let root = db.find_source("p", "repo", "7", None).unwrap().unwrap();
-        assert_eq!(root.labels.contains_key("ci.5-7.build"), key == "3");
+        assert_eq!(
+            stored_fields(&db, root.id).contains_key("ci.5-7.build"),
+            key == "3"
+        );
         assert_eq!(
             db.conversation(root.id, &Default::default())
                 .unwrap()
@@ -405,7 +422,7 @@ fn github_pr_reviews_inline_parents_and_opt_in_reply_use_real_http_protocol() {
     let r = api.pull(&db, "ada", "test", Some("7")).unwrap();
     assert_eq!((r.records, r.failed), (4, 0));
     let root = db.find_source("ada", "test", "7", None).unwrap().unwrap();
-    assert_eq!(root.labels["review"], "approved");
+    assert_eq!(stored_fields(&db, root.id)["review"], "approved");
     let first = db
         .find_source("ada", "test", "7", Some("inline:91"))
         .unwrap()

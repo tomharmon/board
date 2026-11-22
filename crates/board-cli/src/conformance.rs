@@ -2,7 +2,6 @@
 use anyhow::{Context, Result, ensure};
 use board_local::{Board, Filter, PostOptions, automation::*};
 use serde_json::json;
-use std::collections::BTreeMap;
 
 pub fn run(js: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -63,24 +62,9 @@ pub fn run(js: bool) -> Result<()> {
         &[],
         None,
     )?;
-    let c = claim(
-        &b,
-        "probe/a",
-        ClaimTarget::Id(claimable.id),
-        60,
-        &BTreeMap::new(),
-    )?;
+    let c = claim(&b, "probe/a", claimable.id, 60)?;
     let peer = Board::open(&path)?;
-    ensure!(
-        claim(
-            &peer,
-            "probe/b",
-            ClaimTarget::Id(c.id),
-            60,
-            &BTreeMap::new()
-        )
-        .is_err()
-    );
+    ensure!(claim(&peer, "probe/b", c.id, 60).is_err());
     checks.push("exclusive claim");
     let f = next_event(&b, "posted")?
         .context("expected watcher match")?

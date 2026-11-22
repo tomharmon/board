@@ -6,7 +6,7 @@ Board lets **events**, not a wall clock, trigger messages. Tasks are claimable t
 
 A task is a Board thread with lifecycle state (`waiting`, `ready`, `claimed`, `blocked`, `completed`, `failed`, `canceled`), an optional assignee, optional prerequisites, and a fenced claim lease.
 
-The desktop lists those states in that order and defaults to **All tasks**, including failures. There is no Open tab. The CLI/API's existing `open` selector remains a backward-compatible aggregate of waiting, ready, claimed and blocked; it is not a stored task state and excludes failed tasks.
+The desktop lists those states in that order and defaults to **All tasks**, including failures. There is no Open tab. The CLI/API's existing `open` selector is an aggregate of waiting, ready, claimed and blocked; it is not a stored task state and excludes failed tasks.
 
 | State | Meaning |
 | --- | --- |
@@ -31,10 +31,9 @@ board --as verifier tasks complete "$check" "All tests pass"
 # "$publish" automatically moves from waiting -> ready
 ```
 
-- **Exclusive fenced claims:** Claiming a task acquires an expiring lease (epoch + private claim token). If a worker crashes or its lease expires, another worker can safely take over and the stale worker is fenced out.
-- **Queue claiming:** Workers can pull the next available job from a channel or backlog with `board tasks claim --ready work/ --label area=auth`. Queue claims prioritize tasks assigned to the caller, then unassigned tasks, oldest first.
-- **Dependency plans:** Submit a JSON DAG of tasks (`board tasks create work --file plan.json`) with forward references between items. Cycles are rejected, and completing a prerequisite automatically readies any unblocked dependents.
-- **Supervised execution (`tasks run`):** `board tasks run --ready work --lease 1m -- cargo test` claims a task, renews the lease while the command runs, completes on exit `0`, fails on non-zero exit, and releases the claim if interrupted. Only the explicitly supplied command is run—Board never executes text from a message.
+- **Exclusive attempts:** `board tasks claim ID` acquires an expiring lease on that specific ready task. After expiry another worker can take over, and the old claim token cannot settle the new attempt. Listing ready tasks or naming a thread in a brief does not acquire a lease.
+- **Dependency plans:** Submit 1–100 tasks in one transaction (`board tasks create work --file plan.json`) with forward references between items. Supply `thread_id` instead of `text` on an item to adopt an existing root in place. Add `--run RUN` when the run should follow the plan items; omitting it leaves the plan independent. Cycles are rejected, and completing a prerequisite automatically readies any unblocked dependents.
+- **Supervised execution (`tasks run`):** `board tasks run 42 --lease 1m -- cargo test` claims a task, renews the lease while the command runs, completes on exit `0`, fails on non-zero exit, and releases the claim if interrupted. Only the explicitly supplied command is run—Board never executes text from a message.
 
 ### Claim recovery
 
@@ -47,7 +46,7 @@ The CLI stores active claim proofs in a private local cache (`.board-claims/` be
 Watchers are durable, named event subscriptions stored in SQLite for consumers that want reliable at-least-once event processing across restarts:
 
 ```sh
-board watchers add triage work/ --kind message.posted --label phase=review
+board watchers add triage work/ --kind message.posted
 delivery=$(board --json watchers next triage --lease 30s)
 board watchers ack triage "$CURSOR" --receipt "$RECEIPT"
 ```
@@ -58,13 +57,3 @@ board watchers ack triage "$CURSOR" --receipt "$RECEIPT"
 - **Ordinary `board wait` vs. watchers:** For interactive waiting in scripts or agent swarms, use `board wait` or `board swarm wait` (no subscription setup needed). Use watchers when you want persistent cursors, retries, and leased delivery across restarts.
 
 No handler runs just because an event arrived. Start a consumer explicitly, for example `board watchers run triage -- /absolute/path/to/handler`. The handler may reply, post, or notify a peer using its Board identity. While it is stopped, matching events stay available in SQLite; unacknowledged deliveries become eligible for redelivery. An expired task or delivery lease prevents an old holder from settling new work. Those timeouts protect ownership; they do not post messages or launch agents.
-
-## Upgrading an older board
-
-Stop all old Board processes (including any timer you configured yourself) and take a backup **with your old binary** before upgrading. Schema v16 retires both scheduled posts and scheduled replies, one-shot and recurring. Even overdue items are archived, not delivered on open. Previously sent messages and historical event cursors remain intact.
-
-```sh
-(umask 077; board --db /path/to/board.sqlite3 migrate export-schedules > retired-sends.json)
-```
-
-This owner-only, read-only export contains potentially private bodies, labels, destinations, timing metadata and attachment references or hex-encoded inline bytes. Protect the output like a backup. It does not requeue anything. Use `board download ID PATH` to retrieve an existing uploaded attachment before manually reposting. A previously delayed Rune composer draft opens for review; enable manual sending first, then send only when ready.

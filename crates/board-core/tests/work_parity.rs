@@ -21,13 +21,11 @@ fn saved_task_submission_fences_private_routing_files_and_double_submits_after_r
             needs: format!("#{}", prep.id),
             assignee: "ana/build".into(),
         }),
-        labels: "phase=review".into(),
         no_sync: true,
         ..Default::default()
     };
     let opts = PostOptions {
         no_sync: true,
-        labels: settings.parsed_labels()?,
         files: vec![("check.txt".into(), b"proof".to_vec())],
         ..Default::default()
     };
@@ -113,7 +111,7 @@ fn new<'a>(channel: &'a str, text: &'a str, options: &'a PostOptions) -> TaskTar
     }
 }
 fn lease(b: &Board, id: i64) -> Result<Task> {
-    claim(b, "worker", ClaimTarget::Id(id), 30, &Default::default())
+    claim(b, "worker", id, 30)
 }
 fn grant(b: &Board, actor: &str, rules: &str) -> Result<String> {
     b.set_grant("root", None, actor, &Rules::parse(rules)?)?;
@@ -157,7 +155,7 @@ fn blind_task_and_plan_retries_return_creation_receipts_not_ongoing_work() -> Re
         t
     );
     let items = serde_json::from_value::<Vec<PlanItem>>(
-        json!([{"key":"a","text":"intake","noSync":true},{"text":"second","needs":[{"key":"a"}]}]),
+        json!([{"key":"a","text":"intake","noSync":true},{"text":"second","needs":["a"]}]),
     )?;
     let batch = create_plan(&limited, "ada/intake", "intake", &items, Some("plan"))?;
     assert_eq!(batch[1].needs, [batch[0].id]);
@@ -216,16 +214,7 @@ fn principal_profile_and_post_only_owner_rights_are_distinct_from_claim_permissi
         change_task(&build, t.id, "ada/build", None, None, TaskAction::Unblock)?.state,
         "ready"
     );
-    assert!(
-        claim(
-            &build,
-            "ada/build",
-            ClaimTarget::Id(t.id),
-            30,
-            &Default::default()
-        )
-        .is_err()
-    );
+    assert!(claim(&build, "ada/build", t.id, 30).is_err());
     assert!(
         change_task(
             &b,
@@ -552,8 +541,7 @@ fn local_only_posts_keep_their_settled_mentions_and_cannot_start_a_mirror() -> R
 }
 
 #[test]
-fn change_feed_and_watchers_include_both_sides_of_readiness_and_only_verbose_watches_see_renewal()
--> Result<()> {
+fn task_state_is_recorded_at_event_time_and_only_verbose_watches_see_renewal() -> Result<()> {
     let b = Board::memory()?;
     let opts = Default::default();
     let dep = create_task(&b, "ada", new("ops", "dep", &opts), &[], None)?;
@@ -596,19 +584,22 @@ fn change_feed_and_watchers_include_both_sides_of_readiness_and_only_verbose_wat
         TaskAction::Renew(60),
     )?;
     let f = Filter {
-        labels: std::collections::BTreeMap::from([("board.task".into(), "ready".into())]),
+        tasks_only: true,
         ..Default::default()
     };
     let events = b.events(0, 200)?;
     let selected: Vec<_> = events
         .iter()
-        .filter(|e| e.message.as_ref().map(|m| m.id) == Some(t.id) && e.matches(&f))
+        .filter(|e| {
+            e.kind == "task.ready"
+                && e.message.as_ref().is_some_and(|m| {
+                    m.id == t.id && m.task.as_ref().is_some_and(|t| t.state == "ready")
+                })
+                && e.matches(&f)
+        })
         .map(|e| e.kind.as_str())
         .collect();
-    assert_eq!(
-        selected,
-        ["task.ready", "task.blocked", "task.ready", "task.claimed"]
-    );
+    assert_eq!(selected, ["task.ready", "task.ready"]);
     for (name, expect) in [("normal", false), ("verbose", true)] {
         let mut renew = false;
         while let Some(e) = next_event(&b, name)? {
@@ -698,43 +689,9 @@ fn imported_edits_hold_adopted_task_and_cancelled_prerequisites_are_rechecked_on
 }
 
 #[test]
-fn canceled_wait_before_commit_rolls_back_queue_claim_and_proof() -> Result<()> {
-    let b = Board::memory()?;
-    let t = create_task(
-        &b,
-        "ada",
-        new("work", "next", &Default::default()),
-        &[],
-        None,
-    )?;
-    let head = b.cursor()?;
-    let checked = std::cell::Cell::new(false);
-    let proof = "private-before-abort";
-    assert!(
-        claim_while(
-            &b,
-            "ada",
-            ClaimTarget::Ready("work"),
-            ClaimRequest {
-                lease_seconds: 30,
-                token: proof
-            },
-            &Default::default(),
-            &[],
-            || !checked.replace(true)
-        )
-        .is_err()
-    );
-    assert_eq!(b.cursor()?, head);
-    assert_eq!(get_task(&b, t.id)?.epoch, 0);
-    assert!(recover_claim(&b, "ada", proof).is_err());
-    Ok(())
-}
-
-#[test]
-fn queue_poll_only_expires_the_overdue_lease_it_can_actually_take() -> Result<()> {
+fn claim_expires_only_the_selected_overdue_lease() -> Result<()> {
     let d = tempfile::tempdir()?;
-    let path = d.path().join("queue.db");
+    let path = d.path().join("claims.db");
     let b = Board::open(&path)?;
     let opts = Default::default();
     let foreign = create_task(&b, "bob", new("ops", "unrelated", &opts), &[], None)?;
@@ -744,13 +701,7 @@ fn queue_poll_only_expires_the_overdue_lease_it_can_actually_take() -> Result<()
     }
     let raw = rusqlite::Connection::open(&path)?;
     raw.execute("UPDATE tasks SET lease_until=0", [])?;
-    let root = claim(
-        &b,
-        "ada",
-        ClaimTarget::Ready("ops"),
-        30,
-        &std::collections::BTreeMap::from([("board.task".into(), "ready".into())]),
-    )?;
+    let root = claim(&b, "ada", own.id, 30)?;
     assert_eq!(root.id, own.id);
     assert_eq!(root.epoch, 2);
     assert_eq!(
@@ -759,56 +710,12 @@ fn queue_poll_only_expires_the_overdue_lease_it_can_actually_take() -> Result<()
         })?,
         "claimed"
     );
-    assert!(
-        claim(
-            &b,
-            "ada",
-            ClaimTarget::Ready("ops"),
-            30,
-            &Default::default()
-        )
-        .is_err()
-    );
+    assert!(claim(&b, "ada", own.id, 30).is_err());
     assert_eq!(
         raw.query_row("SELECT state FROM tasks WHERE id=?", [foreign.id], |r| {
             r.get::<_, String>(0)
         })?,
         "claimed"
     );
-    Ok(())
-}
-
-#[test]
-fn legacy_profile_task_snapshots_retain_the_original_creator_without_new_events() -> Result<()> {
-    let d = tempfile::tempdir()?;
-    let path = d.path().join("legacy.db");
-    let b = Board::open(&path)?;
-    let id = create_task(
-        &b,
-        "ada/triage",
-        new("intake", "review", &Default::default()),
-        &[],
-        None,
-    )?
-    .id;
-    let head = b.cursor()?;
-    drop(b);
-    let raw = rusqlite::Connection::open(&path)?;
-    raw.execute("UPDATE events SET message=json_remove(json_set(message,'$.task.owner','ada/triage'),'$.task.by'),payload=json_remove(json_set(payload,'$.task.owner','ada/triage'),'$.task.by') WHERE kind='task.created'",[])?;
-    raw.pragma_update(None, "user_version", 7)?;
-    drop(raw);
-    let b = Board::open(path)?;
-    assert_eq!(b.cursor()?, head);
-    let ev = b
-        .events(0, 30)?
-        .into_iter()
-        .find(|e| e.kind == "task.created")
-        .unwrap();
-    let t = ev.message.unwrap().task.unwrap();
-    assert_eq!(
-        (t.id, t.owner.as_str(), t.by.as_str()),
-        (id, "ada", "ada/triage")
-    );
-    assert_eq!(ev.payload["task"]["by"], "ada/triage");
     Ok(())
 }

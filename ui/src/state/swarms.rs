@@ -3,7 +3,7 @@ use anyhow::Result;
 use board_local::{
     Board,
     access::Action,
-    swarm::{SwarmEntry, SwarmFilter, SwarmObservation, SwarmRun, SwarmSummary, SwarmWorker},
+    swarm::{SwarmEntry, SwarmFilter, SwarmObservation, SwarmRun, SwarmSummary},
 };
 use rune::{TextEdit, Tx};
 use std::collections::HashSet;
@@ -51,7 +51,6 @@ pub struct Observer {
     pub kind: FeedKind,
     pub worker: Option<String>,
     pub briefs: HashSet<String>,
-    pub offline: HashSet<i64>,
     pub roster_open: bool,
     pub choose_target: bool,
     pub choose_run: bool,
@@ -59,35 +58,6 @@ pub struct Observer {
     pub body: TextEdit,
     pub can_send: bool,
     pub confirm_stop: bool,
-}
-#[cfg(unix)]
-fn stale_waiter(worker: &SwarmWorker) -> bool {
-    use rustix::{
-        io::Errno,
-        process::{Pid, test_kill_process},
-    };
-    if worker.status != "waiting" {
-        return false;
-    }
-    let Some(pid) = worker
-        .waiter_pid
-        .and_then(|n| i32::try_from(n).ok())
-        .and_then(Pid::from_raw)
-    else {
-        return false;
-    };
-    let Ok(updated) = chrono::DateTime::parse_from_rfc3339(&worker.updated_at) else {
-        return false;
-    };
-    chrono::Utc::now()
-        .signed_duration_since(updated)
-        .num_seconds()
-        >= 5
-        && test_kill_process(pid) == Err(Errno::SRCH)
-}
-#[cfg(not(unix))]
-fn stale_waiter(_: &SwarmWorker) -> bool {
-    false
 }
 impl Observer {
     pub fn load(&mut self, db: &Board, actor: &str, page: Page) -> Result<()> {
@@ -163,25 +133,8 @@ impl Observer {
                 self.confirm_stop = false;
             }
             self.run = Some(run);
-            self.refresh_waiters();
         }
         Ok(())
-    }
-    pub fn refresh_waiters(&mut self) -> bool {
-        let Some(run) = self.run.as_ref() else {
-            return false;
-        };
-        let offline = run
-            .workers
-            .iter()
-            .filter(|w| stale_waiter(w))
-            .map(|w| w.id)
-            .collect();
-        if self.offline == offline {
-            return false;
-        }
-        self.offline = offline;
-        true
     }
 }
 impl State {

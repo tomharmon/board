@@ -131,24 +131,32 @@ async fn future_inbox_and_outbox_cursors_resume_at_their_own_queues() {
 }
 
 #[tokio::test]
-async fn thread_reads_by_reply_accept_repeated_labels_and_inherit_each_root_label() {
+async fn retired_label_inputs_cannot_modify_a_post_or_broaden_a_thread_read() {
     let app = api();
     let post = |data| send(&app, Method::POST, "/v1/messages", data, None);
-    let root = parse(
-        &post(json!({"channel":"triage","text":"Root","labels":{"team":"oncall"}}))
+    assert!(
+        post(json!({"channel":"triage","text":"Invalid","labels":{"team":"oncall"}}))
             .await
-            .2,
-    )["id"]
-        .clone();
-    let reply = parse(
-        &post(json!({"reply_to":root,"text":"Ready","labels":{"state":"ready"}}))
-            .await
-            .2,
-    )["id"]
-        .clone();
-    post(json!({"reply_to":root,"text":"Later","labels":{"state":"later"}})).await;
+            .0
+            .is_client_error()
+    );
+    let root = parse(&post(json!({"channel":"triage","text":"Root"})).await.2)["id"].clone();
+    let reply = parse(&post(json!({"reply_to":root,"text":"Ready"})).await.2)["id"].clone();
     let path = format!("/v1/threads/{reply}?label=team%3Doncall&label=state%3Dready%7Cactive");
-    let (status, _, body) = send(&app, Method::GET, &path, Value::Null, None).await;
+    assert!(
+        send(&app, Method::GET, &path, Value::Null, None)
+            .await
+            .0
+            .is_client_error()
+    );
+    let (status, _, body) = send(
+        &app,
+        Method::GET,
+        &format!("/v1/threads/{reply}"),
+        Value::Null,
+        None,
+    )
+    .await;
     assert_eq!(status, 200);
     let body = parse(&body);
     assert_eq!(body["message"]["id"], root);
@@ -411,6 +419,78 @@ async fn sse_reconnect_resumes_both_seeded_and_cursor_urls_without_replays() {
 }
 
 #[tokio::test]
+async fn generated_openapi_matches_the_request_shapes() {
+    use Method as M;
+    let app = api();
+    let (_, _, spec) = send(&app, M::GET, "/v1/openapi.json", Value::Null, None).await;
+    let published = parse(&spec);
+    for path in ["/threads", "/threads/{id}", "/messages"] {
+        let params = published["paths"][path]["get"]["parameters"]
+            .as_array()
+            .unwrap();
+        assert!(
+            params
+                .iter()
+                .any(|p| p["name"] == "limit" && p["in"] == "query")
+        );
+    }
+    assert!(published["paths"]["/messages"]["post"].is_object());
+    fn check_refs(doc: &Value, node: &Value) {
+        if let Some(reference) = node.get("$ref").and_then(Value::as_str) {
+            assert!(
+                doc.pointer(reference.strip_prefix('#').unwrap()).is_some(),
+                "{reference}"
+            );
+        }
+        match node {
+            Value::Object(fields) => fields.values().for_each(|v| check_refs(doc, v)),
+            Value::Array(items) => items.iter().for_each(|v| check_refs(doc, v)),
+            _ => {}
+        }
+    }
+    check_refs(&published, &published);
+    for (model, accepted, rejected) in [
+        (
+            "PlanItem",
+            json!({"text":"do this","needs":["build",42]}),
+            json!({"text":"wrong","thread_id":1}),
+        ),
+        ("PlanItem", json!({"thread_id":42}), json!({})),
+        (
+            "NewMessage",
+            json!({"channel":"work","text":"ok"}),
+            json!({"channel":null,"text":"wrong"}),
+        ),
+        ("NewTask", json!({"thread_id":4}), json!({"thread_id":0})),
+    ] {
+        let contract = json!({"$ref":format!("#/components/schemas/{model}"),"components":published["components"]});
+        let check = jsonschema::validator_for(&contract).unwrap();
+        assert!(check.is_valid(&accepted), "{model}: {accepted}");
+        assert!(!check.is_valid(&rejected), "{model}: {rejected}");
+    }
+    let actor_query = published["paths"]["/actors"]["get"]["parameters"]
+        .as_array()
+        .unwrap();
+    assert!(actor_query.iter().all(|p| p["in"] == "query"));
+    assert!(actor_query.iter().any(|p| p["name"] == "id"));
+    for (path, methods) in published["paths"].as_object().unwrap() {
+        for (_, op) in methods.as_object().unwrap() {
+            for p in op["parameters"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|p| p["in"] == "path")
+            {
+                assert!(
+                    path.contains(&format!("{{{}}}", p["name"].as_str().unwrap())),
+                    "{path}: {p}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn advertised_resources_exist_and_sources_round_trip_offline() {
     use Method as M;
     let app = api();
@@ -508,20 +588,17 @@ async fn advertised_resources_exist_and_sources_round_trip_offline() {
 }
 
 #[tokio::test]
-async fn compound_label_filters_and_live_sse_recheck_revocation() {
+async fn retired_message_filters_fail_closed_and_live_sse_rechecks_revocation() {
     use Method as M;
     use futures_util::StreamExt;
     let app = api();
-    for (text, l) in [
-        ("release", json!({"ready":"","stage":"ok"})),
-        ("other", json!({"ready":"yes","stage":"ok"})),
-    ] {
+    for text in ["release", "other"] {
         assert_eq!(
             send(
                 &app,
                 M::POST,
                 "/v1/messages",
-                json!({"channel":"ops","text":text,"labels":l}),
+                json!({"channel":"ops","text":text}),
                 None
             )
             .await
@@ -529,7 +606,7 @@ async fn compound_label_filters_and_live_sse_recheck_revocation() {
             201
         );
     }
-    let (_, _, body) = send(
+    let (status, _, _) = send(
         &app,
         M::GET,
         "/v1/messages?label=ready%3D&label=stage%3Dok%7Cgo",
@@ -537,10 +614,7 @@ async fn compound_label_filters_and_live_sse_recheck_revocation() {
         None,
     )
     .await;
-    let docs = parse(&body);
-    let hits = docs["messages"].as_array().unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0]["text"], "release");
+    assert!(status.is_client_error());
     let (s, _, _) = send(
         &app,
         M::POST,

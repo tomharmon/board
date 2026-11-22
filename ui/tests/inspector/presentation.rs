@@ -223,37 +223,3 @@ fn optional_hash_on_a_composer_destination_survives_restart_and_posts_to_the_exa
     tree.expect_text("Check the restore");
     assert!(board.load_composer("reader", "new").unwrap().is_none());
 }
-
-#[test]
-fn empty_task_action_creates_a_persisted_task_and_filters_can_be_cleared() {
-    let f = Fixture::new();
-    let tree = f.render(
-        json!([
-            {"t":0.1,"type":"tap","key":"tasks"},{"t":0.35,"type":"tap","key":"empty-new-task"},
-            {"t":0.6,"paste":"Verify backups"},{"t":0.85,"type":"tap","key":"create-task"}
-        ]),
-        DESKTOP,
-        "1.2",
-    );
-    let db = Board::open(&f.db).unwrap();
-    let tasks = board_local::automation::list_tasks(&db, None, Some("all")).unwrap();
-    assert_eq!(tasks.len(), 1);
-    assert_eq!(
-        (&tasks[0].channel[..], &tasks[0].text[..]),
-        ("general", "Verify backups")
-    );
-    tree.expect_key(&format!("task-row-{}", tasks[0].id));
-    let filter = json!([
-        {"t":0.1,"type":"tap","key":"tasks"},{"t":0.3,"type":"tap","key":"task-criteria"},
-        {"t":0.5,"type":"tap","key":"criteria-channel"},{"t":0.7,"paste":"other"},
-        {"t":0.9,"type":"tap","key":"apply-task-filters"}
-    ]);
-    let filtered = f.render(filter.clone(), DESKTOP, "1.8");
-    filtered.expect_key("empty-clear-task-filters");
-    filtered.expect_text("No tasks match these filters");
-    let mut clear = filter.as_array().unwrap().clone();
-    clear.push(json!({"t":1.8,"type":"tap","key":"empty-clear-task-filters"}));
-    let tree = f.render(Value::Array(clear), DESKTOP, "2.8");
-    tree.expect_key(&format!("task-row-{}", tasks[0].id));
-    assert!(!tree.has_key("tasks-empty"));
-}

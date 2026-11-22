@@ -17,7 +17,7 @@ pub struct Watcher {
     pub kind: Option<String>,
     pub all: bool,
     pub cursor: i64,
-    /// Writes made as this watcher's profile don't feed back into it (except pre-v16 timed posts).
+    /// Writes made as this watcher's profile don't feed back into it.
     pub run_as: Option<String>,
 }
 
@@ -80,36 +80,13 @@ pub(super) fn init(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS watcher_lane ON watcher_queue(name,lane,cursor) WHERE state='pending';
         CREATE INDEX IF NOT EXISTS watcher_pending ON watcher_queue(name,cursor) WHERE state='pending';
         CREATE TABLE IF NOT EXISTS watcher_verbose(name TEXT PRIMARY KEY REFERENCES watchers(name) ON DELETE CASCADE);
-        CREATE TABLE IF NOT EXISTS watcher_filter_start(
-            singleton INTEGER PRIMARY KEY CHECK(singleton=1),through INTEGER NOT NULL);
-        INSERT OR IGNORE INTO watcher_filter_start SELECT 1,coalesce(max(cursor),0) FROM events;
         CREATE TABLE IF NOT EXISTS watcher_filter_hits(
             name TEXT NOT NULL REFERENCES watchers(name) ON DELETE CASCADE,
             cursor INTEGER NOT NULL REFERENCES events(cursor),PRIMARY KEY(name,cursor)
         ) WITHOUT ROWID;
         CREATE INDEX IF NOT EXISTS watcher_identity_filters ON watchers(kind,name)
-            WHERE json_extract(filter,'$.by') IS NOT NULL OR json_extract(filter,'$.mentions') IS NOT NULL;
-        INSERT OR IGNORE INTO watcher_scan(name,scanned)
-            SELECT name,cursor FROM watchers;",
+            WHERE json_extract(filter,'$.by') IS NOT NULL OR json_extract(filter,'$.mentions') IS NOT NULL;",
     )?;
-    let legacy: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='watcher_delivery')",
-        [],
-        |r| r.get(0),
-    )?;
-    if legacy {
-        // v1 had a single in-flight delivery. Preserve its receipt, deadline, and last
-        // acknowledged cursor. Insert-or-ignore below will not replace it while catching up.
-        conn.execute_batch(
-            "INSERT OR IGNORE INTO watcher_queue(name,cursor,lane,attempts,receipt,lease_until)
-            SELECT d.name,d.pending,coalesce(m.re,m.id,0),1,d.receipt,d.lease_until
-            FROM watcher_delivery d JOIN events e ON e.cursor=d.pending LEFT JOIN messages m ON m.id=e.message_id;
-          INSERT OR IGNORE INTO watcher_queue(name,cursor,lane,state,last_receipt)
-            SELECT d.name,d.last_ack,coalesce(m.re,m.id,0),'acked',d.last_receipt
-            FROM watcher_delivery d JOIN events e ON e.cursor=d.last_ack LEFT JOIN messages m ON m.id=e.message_id;
-          DROP TABLE watcher_delivery;",
-        )?;
-    }
     Ok(())
 }
 
@@ -149,7 +126,7 @@ pub(crate) fn capture_filters(tx: &Transaction<'_>, cursor: i64) -> Result<()> {
         loop {
             let name: String = row.get(0)?;
             let matches = if let Some((resolver, e)) = &mut audience {
-                let filter = serde_json::from_str(&row.get::<_, String>(1)?)?;
+                let filter: Filter = serde_json::from_str(&row.get::<_, String>(1)?)?;
                 resolver.resolve(&filter)?.matches(e)
             } else {
                 false
@@ -407,6 +384,7 @@ fn subscribe(
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct WatchSpec {
     pub name: String,
     #[serde(default)]
@@ -469,9 +447,10 @@ pub fn replace_watchers(b: &Board, actor: &str, specs: &[WatchSpec]) -> Result<V
             {
                 // Any event before reconfiguration is evaluated against the OLD scope/filter.
                 let head = crate::read::cursor_on(&tx)?;
-                if let Some(id) = credential.as_deref()
-                    && Board::credential_access_on(&tx, id)?.is_none()
-                {
+                if match credential.as_deref() {
+                    Some(id) => Board::credential_access_on(&tx, id)?.is_none(),
+                    None => false,
+                } {
                     tx.execute("DELETE FROM watcher_queue WHERE name=?", [&old.key])?;
                     tx.execute("DELETE FROM watcher_filter_hits WHERE name=?", [&old.key])?;
                     tx.execute(
@@ -607,16 +586,7 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
     };
     let captured =
         p.owner.is_some() || watcher.filter.by.is_some() || watcher.filter.mentions.is_some();
-    let since = if captured {
-        tx.query_row(
-            "SELECT through FROM watcher_filter_start WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )?
-    } else {
-        i64::MAX
-    };
-    let hits: std::collections::HashSet<i64> = if captured && last > since {
+    let hits: std::collections::HashSet<i64> = if captured {
         tx.prepare_cached(
             "SELECT cursor FROM watcher_filter_hits WHERE name=? AND cursor>? AND cursor<=?",
         )?
@@ -625,23 +595,12 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
     } else {
         Default::default()
     };
-    let legacy = if captured && scanned < since {
-        Some(crate::feed::EventMatcher::resolve(
-            tx,
-            p.owner.as_ref().unwrap_or(&p.caller),
-            &watcher.filter,
-        )?)
-    } else {
-        None
-    };
     for event in events {
         let Some(event) = p.registered(tx, event)? else {
             continue;
         };
-        let matched = if event.message.is_some() && event.cursor > since {
+        let matched = if event.message.is_some() && captured {
             hits.contains(&event.cursor)
-        } else if let Some(legacy) = &legacy {
-            legacy.matches(&event)
         } else {
             event.matches(&watcher.filter)
         };
@@ -653,14 +612,15 @@ fn scan(tx: &Transaction<'_>, watcher: &Watcher, p: &Policies) -> Result<bool> {
                 || (!watcher.all
                     && matches!(
                         event.kind.as_str(),
-                        "task.renewed" | "message.synced" | "message.files_synced"
+                        "task.renewed"
+                            | "source.metadata"
+                            | "message.synced"
+                            | "message.files_synced"
                     )))
         {
             continue;
         }
-        let scheduled = event.kind == "message.posted"
-            && event.message.as_ref().is_some_and(|m| m.schedule.is_some());
-        if watcher.run_as.as_ref() == Some(&event.actor) && !scheduled {
+        if watcher.run_as.as_ref() == Some(&event.actor) {
             continue;
         }
         let lane = event.message.as_ref().map_or(0, |m| m.re.unwrap_or(m.id));
@@ -830,7 +790,9 @@ pub fn lease_matches(b: &Board, limit: usize, seconds: i64) -> Result<Vec<Delive
     for n in names {
         match Policies::open(b, &tx, &n) {
             Ok(w) => open.push(w),
-            Err(e) if crate::errors::classify(&e).1 == "registration_revoked" => (),
+            Err(e) if matches!(crate::errors::classify(&e).1, "registration_revoked") => {
+                continue;
+            }
             Err(e) => return Err(e),
         }
     }
@@ -962,7 +924,6 @@ pub fn settle_delivery_if(
         policy.delivered(&tx, event_at(&tx, cursor)?)?.is_some(),
         stale()
     );
-    // A legacy expired/skipped row could retain a previous, failed attempt's receipt.
     let settled = match row.state.as_str() {
         "acked" => true,
         "skipped" => row.error.is_none(),

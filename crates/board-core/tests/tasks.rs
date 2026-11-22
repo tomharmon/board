@@ -1,6 +1,5 @@
 use anyhow::Result;
 use board_local::{Board, Filter, PostOptions, automation::*};
-use std::collections::BTreeMap;
 
 fn make(
     db: &Board,
@@ -33,13 +32,7 @@ fn claim_secrets_only_reach_the_authorized_lease_holder_and_fence_same_profile()
     let path = dir.path().join("held.db");
     let b = Board::open(&path)?;
     let t = make(&b, "ann", "triage", &[], Some("ann/agent"), None)?;
-    let old = claim(
-        &b,
-        "ann/agent",
-        ClaimTarget::Id(t.id),
-        30,
-        &Default::default(),
-    )?;
+    let old = claim(&b, "ann/agent", t.id, 30)?;
     let token = old.claim_token.as_deref().unwrap();
     let renewed = change_task(
         &b,
@@ -67,13 +60,7 @@ fn claim_secrets_only_reach_the_authorized_lease_holder_and_fence_same_profile()
     rusqlite::Connection::open(&path)?
         .execute("UPDATE tasks SET lease_until=0 WHERE id=?", [t.id])?;
     let restarted = Board::open(path)?;
-    let new = claim(
-        &restarted,
-        "ann/agent",
-        ClaimTarget::Id(t.id),
-        30,
-        &Default::default(),
-    )?;
+    let new = claim(&restarted, "ann/agent", t.id, 30)?;
     assert!(new.epoch > old.epoch);
     assert_ne!(old.claim_token, new.claim_token);
     let head = b.cursor()?;
@@ -163,65 +150,6 @@ fn single_task_is_a_keyed_post_but_a_batch_is_a_separate_guarded_request() -> Re
 }
 
 #[test]
-fn upgrade_preserves_legacy_retries_and_keeps_ambiguous_historical_posts() -> Result<()> {
-    use rusqlite::{Connection, params};
-    use sha2::{Digest, Sha256};
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("old.db");
-    let b = Board::open(&path)?;
-    let first = b.post("dev", "ann", "first", &Default::default())?;
-    let second = b.post("dev", "bob", "second", &Default::default())?;
-    let single = make(&b, "ann", "work", &[], None, None)?;
-    let items: Vec<PlanItem> = serde_json::from_str(r#"[{"text":"one-item batch"}]"#)?;
-    let batch = create_plan(&b, "ann", "work/items", &items, None)?;
-    let head = b.cursor()?;
-    drop(b);
-    let legacy = Connection::open(&path)?;
-    legacy.execute_batch(
-        "DROP TABLE client_posts; DROP TABLE client_batches; DROP TABLE schema_origins;
-        DELETE FROM schemas WHERE name='deployment'; PRAGMA user_version=1",
-    )?;
-    // V1 recorded a single task in both tables; even a one-item batch used only task_requests.
-    for (who, key, id) in [
-        ("bob", "shared", second.id),
-        ("ann", "shared", first.id),
-        ("ann", "single", single.id),
-    ] {
-        legacy.execute(
-            "INSERT INTO write_keys(actor,key,fingerprint,message_id) VALUES(?,?,x'00',?)",
-            params![who, key, id],
-        )?;
-    }
-    let fp = Sha256::digest(serde_json::to_vec(&("plan", "work/items", &items))?).to_vec();
-    legacy.execute(
-        "INSERT INTO task_requests VALUES('ann','single',x'00',?)",
-        [serde_json::json!([single.id]).to_string()],
-    )?;
-    legacy.execute(
-        "INSERT INTO task_requests VALUES('ann','batch',?,?)",
-        params![fp, serde_json::json!([batch[0].id]).to_string()],
-    )?;
-    drop(legacy);
-    let b = Board::open(&path)?;
-    assert_eq!(b.posted("ann", "shared")?, first);
-    assert!(b.posted("bob", "shared").is_err());
-    assert_eq!(b.get(second.id)?, second);
-    assert_eq!(b.posted("ann", "single")?.id, single.id);
-    assert!(lookup_plan(&b, "ann", "single").is_err());
-    assert_eq!(lookup_plan(&b, "ann", "batch")?, batch);
-    assert_eq!(
-        create_plan_with_outcome(&b, "ann", "work/items", &items, Some("batch"))?,
-        (batch, false)
-    );
-    assert_eq!(
-        make(&b, "ann", "new words", &[], None, Some("single"))?,
-        single
-    );
-    assert_eq!(b.cursor()?, head);
-    Ok(())
-}
-
-#[test]
 fn task_owner_assignment_reopen_dependencies_and_reserved_labels() -> Result<()> {
     let b = Board::memory()?;
     let a = make(
@@ -245,18 +173,8 @@ fn task_owner_assignment_reopen_dependencies_and_reserved_labels() -> Result<()>
         .is_err()
     );
     assert!(change_task(&b, a.id, "ann", None, None, TaskAction::Needs(&[c.id])).is_err());
-    assert!(
-        b.label(a.id, "ann", "board.task", Some("completed"))
-            .is_err()
-    );
-    assert!(claim(&b, "ann", ClaimTarget::Id(a.id), 60, &Default::default()).is_err());
-    let claimed = claim(
-        &b,
-        "ann/worker",
-        ClaimTarget::Ready("work/"),
-        60,
-        &Default::default(),
-    )?;
+    assert!(claim(&b, "ann", a.id, 60).is_err());
+    let claimed = claim(&b, "ann/worker", a.id, 60)?;
     assert_eq!(a.id, claimed.id);
     change_task(
         &b,
@@ -268,13 +186,7 @@ fn task_owner_assignment_reopen_dependencies_and_reserved_labels() -> Result<()>
     )?;
     assert_eq!(get_task(&b, c.id)?.state, "waiting");
     change_task(&b, a.id, "ann", None, None, TaskAction::Resume)?;
-    let held = claim(
-        &b,
-        "ann/worker",
-        ClaimTarget::Id(a.id),
-        60,
-        &Default::default(),
-    )?;
+    let held = claim(&b, "ann/worker", a.id, 60)?;
     let head = b.cursor()?;
     change_task(
         &b,
@@ -290,7 +202,7 @@ fn task_owner_assignment_reopen_dependencies_and_reserved_labels() -> Result<()>
         ["task.completed", "task.ready"]
     );
     assert!(events[1].matches(&Filter {
-        labels: BTreeMap::from([("board.task".into(), "ready".into())]),
+        tasks_only: true,
         ..Default::default()
     }));
     let already_done = make(&b, "ann", "release", &[a.id], None, None)?;
@@ -333,20 +245,12 @@ fn task_owner_assignment_reopen_dependencies_and_reserved_labels() -> Result<()>
 #[test]
 fn task_thread_edits_and_deletion_invalidate_claims_atomically() -> Result<()> {
     let db = Board::memory()?;
-    let m = db.post("queue", "bo", "old request", &Default::default())?;
+    let m = db.post("project", "bo", "old request", &Default::default())?;
     let task = create_task(&db, "ann", TaskTarget::Existing(m.id), &[], None)?;
-    let claim_task = || {
-        claim(
-            &db,
-            "bo/worker",
-            ClaimTarget::Id(task.id),
-            60,
-            &Default::default(),
-        )
-    };
+    let claim_task = || claim(&db, "bo/worker", task.id, 60);
     let claim = claim_task()?;
     let edit = db.edit(m.id, "bo", "changed request", Some(m.revision))?;
-    assert_eq!(edit.labels["board.task"], "blocked");
+    assert_eq!(edit.task.unwrap().state, "blocked");
     assert!(
         change_task(
             &db,
@@ -362,7 +266,7 @@ fn task_thread_edits_and_deletion_invalidate_claims_atomically() -> Result<()> {
     let claim = claim_task()?;
     let head = db.cursor()?;
     let removed = db.delete(m.id, "bo", Some(edit.revision))?;
-    assert!(removed.deleted && removed.labels.is_empty());
+    assert!(removed.deleted);
     assert_eq!(removed.task.unwrap().state, "canceled");
     assert_eq!(
         db.events(head, 5)?

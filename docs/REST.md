@@ -1,5 +1,7 @@
 # REST API
 
+The Axum router and its OpenAPI path inventory are built from the same utoipa route registrations. Inspect `/v1/openapi.json` for request shapes and query parameters.
+
 Board ships an optional HTTP + Server-Sent Events (SSE) API (`board serve`) built with Axum over `board-core`. Native CLI, MCP, and Rune clients open SQLite directly and do not need this server; use it for HTTP clients, sandboxed delegated agents, or future hosted deployments.
 
 ## Running and authentication
@@ -22,9 +24,8 @@ Base URL: `http://127.0.0.1:4100/v1`
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /channels`, `POST /channels`, `GET /channels/{name}` | List, create (public or private), and inspect channels. |
-| `POST /messages`, `GET /messages`, `GET /messages/{id}` | Post roots or replies (with `Idempotency-Key`, labels, inline/reusable attachments, optional `sync_targets`), search/list, or fetch a message. |
+| `POST /messages`, `GET /messages`, `GET /messages/{id}` | Post roots or replies (with `Idempotency-Key`, inline/reusable attachments, optional `sync_targets`), search/list, or fetch a message. |
 | `PATCH /messages/{id}`, `DELETE /messages/{id}` | Revision-checked edits and tombstones (`if_revision`). |
-| `PATCH /messages/{id}/labels` | Atomic conditional label updates. |
 | `PUT/DELETE /messages/{id}/reactions/{name}` | Toggle reactions. |
 | `GET /threads`, `GET /threads/{id}` | Paged thread summaries and full/paged thread reads. |
 | `GET /events` | Ordered event feed via JSON long-poll (`wait_ms`) or SSE (`Accept: text/event-stream` with `Last-Event-ID`). |
@@ -41,9 +42,9 @@ Base URL: `http://127.0.0.1:4100/v1`
 ### Tasks and watchers
 | Endpoint | Purpose |
 | --- | --- |
-| `GET/POST /tasks`, `POST /task-batches`, `GET/PATCH /tasks/{id}` | Create tasks or DAG plans, inspect, and transition state (`completed`, `failed`, `blocked`, `canceled`, `ready`). |
+| `GET/POST /tasks`, `POST /task-batches`, `GET/PATCH /tasks/{id}` | Create tasks or atomic plans of 1–100 tasks, inspect, and transition state (`completed`, `failed`, `blocked`, `canceled`, `ready`). |
 | `PUT /tasks/{id}/assignment`, `PUT /tasks/{id}/dependencies` | Update assignees and prerequisites. |
-| `POST/GET/PATCH/DELETE /tasks/{id}/claim`, `POST /task-claims`, `POST /task-claims/recover` | Acquire, queue-claim, renew, release, and recover fenced leases. |
+| `POST/GET/PATCH/DELETE /tasks/{id}/claim`, `POST /task-claims/recover` | Acquire by task ID, renew, release, and recover fenced leases. |
 | `GET/POST/PUT/DELETE /watchers`, `POST /watchers/{name}/deliveries`, `PUT /watchers/{name}/acknowledgements/{cursor}` | Manage durable event subscriptions and leased deliveries. |
 
 ### Access and connectors

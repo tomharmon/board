@@ -148,15 +148,6 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
                     }
                 }),
         );
-    if t.show_labels {
-        body = body.child(field(
-            "quick-task-labels",
-            "Labels (one per line)",
-            &t.labels,
-            |s| &mut s.desk.task_entry.labels,
-            true,
-        ));
-    }
     if t.reload_needed {
         body = body.child(reload_task());
     }
@@ -170,20 +161,6 @@ pub(super) fn composer(s: &State, inset: f32) -> El {
         .child(
             tool("quick-task-attach", "Attach task file", &icons::PAPERCLIP)
                 .on_press_tx(State::pick_task_file),
-        )
-        .child(
-            tool("quick-task-tags", "Task labels", &icons::TAG)
-                .fill(if t.show_labels {
-                    c(TINT)
-                } else {
-                    Color::TRANSPARENT
-                })
-                .on_press_tx(|s: &mut State, tx| {
-                    s.desk.task_entry.show_labels = !s.desk.task_entry.show_labels;
-                    if s.desk.task_entry.show_labels {
-                        tx.focus_when_shown("quick-task-labels", true)
-                    }
-                }),
         )
         .child(
             tool(
@@ -248,37 +225,24 @@ fn state_mark(t: &Task) -> El {
 }
 fn task_row(s: &State, t: &Task, compact: bool) -> El {
     let id = t.id;
-    let meta = s.desk.task_rows.get(&id);
+    let files = t.attachment_names.join(", ");
     let summary = t
         .text
         .lines()
         .find(|l| !l.trim().is_empty())
-        .or_else(|| meta.map(|m| m.files.as_str()))
-        .unwrap_or("");
-    let mut title = row()
+        .unwrap_or(&files);
+    let title = row()
         .grow(1.0)
         .min_w(0.0)
         .gap(6.0)
         .center_y()
         .child(mono(format!("#{id}"), FAINT))
         .child(label(summary, 13.0, 400.0, DIM).min_w(0.0).truncate());
-    let mut clock = String::new();
-    if let Some(meta) = meta {
-        if !compact
-            && let Some((k, v)) = meta.labels.iter().find(|(k, _)| k.as_str() != "board.task")
-        {
-            title = title.child(
-                mono(format!("{k}={v}"), MUTED)
-                    .px(4.0)
-                    .py(1.0)
-                    .max_w(106.0)
-                    .truncate()
-                    .border(1.0, c(EDGE))
-                    .fill(c(TINT)),
-            );
-        }
-        clock = messages::relative(&meta.created, chrono::Utc::now());
-    }
+    let clock = t
+        .created_at
+        .as_deref()
+        .map(|at| messages::relative(at, chrono::Utc::now()))
+        .unwrap_or_default();
     let needs = if t.needs.is_empty() {
         String::new()
     } else {
@@ -286,12 +250,7 @@ fn task_row(s: &State, t: &Task, compact: bool) -> El {
             "needs {}",
             t.needs
                 .iter()
-                .map(|id| s
-                    .desk
-                    .tasks
-                    .iter()
-                    .find(|t| t.id == *id)
-                    .map_or_else(|| format!("#{id}"), |t| format!("#{id} {}", t.state)))
+                .map(|id| format!("#{id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         )
@@ -377,13 +336,6 @@ pub(super) fn new_task(s: &State) -> El {
             true,
         ))
         .child(routing(s, true))
-        .child(field(
-            "task-labels",
-            "Labels (one per line)",
-            &d.task_entry.labels,
-            |s| &mut s.desk.task_entry.labels,
-            true,
-        ))
         .child(attachments(s))
         .child(
             row()
@@ -459,13 +411,6 @@ pub(super) fn list(s: &State, compact: bool) -> El {
                 |s| &mut s.desk.filter_form.extra,
                 false,
             ))
-            .child(field(
-                "criteria-labels",
-                "Labels (one per line)",
-                &f.body,
-                |s| &mut s.desk.filter_form.body,
-                true,
-            ))
             .child(
                 row()
                     .w_full()
@@ -513,12 +458,6 @@ pub(super) fn list(s: &State, compact: bool) -> El {
     }
     if let Some(n) = criteria.needs {
         terms.push(format!("Needs #{n}"));
-    }
-    for t in &criteria.label_terms {
-        terms.push(t.values.as_ref().map_or_else(
-            || format!("Has {}", t.key),
-            |v| format!("{}={}", t.key, v.join("|")),
-        ));
     }
     if !terms.is_empty() {
         panel = panel.child(mono(terms.join("   "), MUTED).w_full().wrap_anywhere());
@@ -614,13 +553,9 @@ pub(super) fn banner(s: &State) -> El {
             .center_y()
             .gap(6.0)
             .child(mono("needs", FAINT).w(48.0));
-        for &id in t.needs.iter().take(3) {
-            let name = s
-                .desk
-                .tasks
-                .iter()
-                .find(|n| n.id == id)
-                .map_or_else(|| format!("#{id}"), |n| format!("#{id} {}", n.state));
+        for input in t.inputs.iter().take(3) {
+            let id = input.id;
+            let name = format!("#{id} {}", input.state);
             links = links.child(
                 click(
                     row()

@@ -45,9 +45,6 @@ pub fn classify(err: &Error) -> (Kind, &'static str) {
     if let Some(r) = err.downcast_ref::<Rejection>() {
         return (r.kind, r.code);
     }
-    if err.is::<crate::automation::NothingReady>() {
-        return (Conflict, "nothing_ready");
-    }
     if let Some(sql) = err.downcast_ref::<SqlError>() {
         return match sql {
             SqlError::QueryReturnedNoRows => (Missing, "not_found"),

@@ -1,59 +1,57 @@
 use super::*;
-use axum::{
-    extract::{Path, Query},
-    routing::post,
-};
+use axum::extract::{Path, Query};
 use board_local::sources::*;
 use serde::Deserialize;
 
 type Data = ApiResult<Json<Value>>;
-pub(super) fn routes() -> Router<App> {
-    Router::new()
-        .route("/messages/{id}/sync", get(targets))
-        .route("/links", get(locate))
-        .route("/messages/{id}/deliveries", get(notices))
-        .route("/sources", get(list).post(add))
-        .route("/sources/{name}", get(one).patch(configure))
-        .route("/sources/{name}/imports", post(import))
-        .route("/sources/{name}/links", put(link).get(find))
-        .route(
-            "/sources/{name}/thread-links",
-            get(thread_link).put(join_thread),
-        )
-        .route("/sources/{name}/starts", post(start))
-        .route("/sources/{name}/backfills", post(backfill))
-        .route("/sources/{name}/files/{id}", get(files).post(share_file))
-        .route("/sources/{name}/copies/{id}", get(copies))
-        .route("/sources/{name}/inbox", get(inbox).post(push))
-        .route("/sources/{name}/outbox", get(outbox))
-        .route("/sources/{name}/deliveries", post(lease))
-        .route("/sources/{name}/deliveries/{id}", get(item))
-        .route("/sources/{name}/deliveries/{id}/receipt", put(ack))
-        .route("/sources/{name}/deliveries/{id}/failure", post(fail))
-        .route("/sources/{name}/deliveries/{id}/resolution", put(resolve))
+pub(super) fn routes() -> OpenApiRouter<App> {
+    OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(targets))
+        .routes(utoipa_axum::routes!(locate))
+        .routes(utoipa_axum::routes!(notices))
+        .routes(utoipa_axum::routes!(list, add))
+        .routes(utoipa_axum::routes!(one, configure))
+        .routes(utoipa_axum::routes!(import))
+        .routes(utoipa_axum::routes!(link, find))
+        .routes(utoipa_axum::routes!(thread_link, join_thread))
+        .routes(utoipa_axum::routes!(start))
+        .routes(utoipa_axum::routes!(backfill))
+        .routes(utoipa_axum::routes!(files, share_file))
+        .routes(utoipa_axum::routes!(copies))
+        .routes(utoipa_axum::routes!(inbox, push))
+        .routes(utoipa_axum::routes!(outbox))
+        .routes(utoipa_axum::routes!(lease))
+        .routes(utoipa_axum::routes!(item))
+        .routes(utoipa_axum::routes!(ack))
+        .routes(utoipa_axum::routes!(fail))
+        .routes(utoipa_axum::routes!(resolve))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 struct Permalink {
     url: String,
 }
+#[utoipa::path(get, path = "/links", params(Permalink), tag = "links")]
 async fn locate(State(a): State<App>, Query(q): Query<Permalink>) -> Data {
     Ok(Json(json!(
         a.call(move |b, _| b.locate_link(&q.url)).await?
     )))
 }
+#[utoipa::path(get, path="/messages/{id}/sync", params(("id" = i64, Path)), tag="messages")]
 async fn targets(State(a): State<App>, Path(id): Path<i64>) -> Data {
     Ok(Json(json!(a.call(move |b, _| b.sync_targets(id)).await?)))
 }
+#[utoipa::path(get, path="/messages/{id}/deliveries", params(("id" = i64, Path)), tag="messages")]
 async fn notices(State(a): State<App>, Path(id): Path<i64>) -> Data {
     Ok(Json(
         json!({"deliveries":a.call(move|b,u|b.message_deliveries(u,id)).await?}),
     ))
 }
+#[utoipa::path(get, path = "/sources", tag = "sources")]
 async fn list(State(a): State<App>) -> Data {
     Ok(Json(json!({"sources":a.call(|b,u|b.sources(u)).await?})))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct New {
     name: String,
@@ -61,6 +59,7 @@ struct New {
     remote: String,
     channel: String,
 }
+#[utoipa::path(post, path = "/sources", tag = "sources")]
 async fn add(State(a): State<App>, Json(i): Json<New>) -> ApiResult<Response> {
     let (s, new) = a
         .call(move |b, u| b.create_source(u, &i.name, i.provider, &i.remote, &i.channel))
@@ -71,9 +70,11 @@ async fn add(State(a): State<App>, Json(i): Json<New>) -> ApiResult<Response> {
         Json(json!(s)).into_response()
     })
 }
+#[utoipa::path(get, path="/sources/{name}", params(("name" = String, Path)), tag="sources")]
 async fn one(State(a): State<App>, Path(n): Path<String>) -> Data {
     Ok(Json(json!(a.call(move |b, u| b.source(u, &n)).await?)))
 }
+#[utoipa::path(patch, path="/sources/{name}", params(("name" = String, Path)), tag="sources")]
 async fn configure(
     State(a): State<App>,
     Path(n): Path<String>,
@@ -83,20 +84,22 @@ async fn configure(
         a.call(move |b, u| b.patch_source(u, &n, &i)).await?
     )))
 }
+#[utoipa::path(post, path="/sources/{name}/imports", params(("name" = String, Path)), tag="sources")]
 async fn import(State(a): State<App>, Path(n): Path<String>, Json(e): Json<Envelope>) -> Data {
     Ok(Json(json!(
         a.call(move |b, u| b.import_source(u, &n, &e)).await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct Link {
+struct SourceLink {
     thread: String,
     external: String,
     message: i64,
     url: Option<String>,
 }
-async fn link(State(a): State<App>, Path(n): Path<String>, Json(i): Json<Link>) -> Data {
+#[utoipa::path(put, path="/sources/{name}/links", params(("name" = String, Path)), tag="sources")]
+async fn link(State(a): State<App>, Path(n): Path<String>, Json(i): Json<SourceLink>) -> Data {
     Ok(Json(json!(
         a.call(move |b, u| b.attach_source(
             u,
@@ -109,13 +112,14 @@ async fn link(State(a): State<App>, Path(n): Path<String>, Json(i): Json<Link>) 
         .await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 struct Lookup {
     thread: Option<String>,
     external: Option<String>,
     url: Option<String>,
 }
+#[utoipa::path(get, path="/sources/{name}/links", params(("name" = String, Path), Lookup), tag="sources")]
 async fn find(State(a): State<App>, Path(n): Path<String>, Query(q): Query<Lookup>) -> Data {
     let m = a
         .call(move |b, u| match (q.thread, q.url, q.external) {
@@ -129,16 +133,18 @@ async fn find(State(a): State<App>, Path(n): Path<String>, Query(q): Query<Looku
         "no linked source message"
     ))?)))
 }
+#[utoipa::path(get, path="/sources/{name}/copies/{id}", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn copies(State(a): State<App>, Path((n, id)): Path<(String, i64)>) -> Data {
     Ok(Json(
         json!({"copies":a.call(move|b,u|b.source_copies(u,&n,id)).await?}),
     ))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct Start {
+struct JoinThread {
     root: i64,
 }
+#[utoipa::path(get, path="/sources/{name}/thread-links", params(("name" = String, Path), Backfill), tag="sources")]
 async fn thread_link(
     State(a): State<App>,
     Path(n): Path<String>,
@@ -149,11 +155,12 @@ async fn thread_link(
             .await?
     )))
 }
+#[utoipa::path(put, path="/sources/{name}/thread-links", params(("name" = String, Path), Backfill), tag="sources")]
 async fn join_thread(
     State(a): State<App>,
     Path(n): Path<String>,
     Query(q): Query<Backfill>,
-    Json(i): Json<Start>,
+    Json(i): Json<JoinThread>,
 ) -> ApiResult<Response> {
     let (link, fresh) = a
         .call(move |b, u| b.join_source_thread(u, &n, &q.thread, i.root))
@@ -173,10 +180,11 @@ async fn join_thread(
     )
         .into_response())
 }
+#[utoipa::path(post, path="/sources/{name}/starts", operation_id="sources_start", params(("name" = String, Path)), tag="sources")]
 async fn start(
     State(a): State<App>,
     Path(n): Path<String>,
-    Json(i): Json<Start>,
+    Json(i): Json<JoinThread>,
 ) -> ApiResult<Response> {
     let j = a
         .call(move |b, u| b.start_source_thread(u, &n, i.root))
@@ -193,25 +201,29 @@ async fn start(
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[derive(utoipa::ToSchema, utoipa::IntoParams)]
 struct Backfill {
     thread: String,
 }
+#[utoipa::path(post, path="/sources/{name}/backfills", params(("name" = String, Path)), tag="sources")]
 async fn backfill(State(a): State<App>, Path(n): Path<String>, Json(i): Json<Backfill>) -> Data {
     Ok(Json(
         json!({"queued":a.call(move|b,u|b.backfill_source(u,&n,&i.thread)).await?}),
     ))
 }
+#[utoipa::path(get, path="/sources/{name}/files/{id}", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn files(State(a): State<App>, Path((n, id)): Path<(String, i64)>) -> Data {
     Ok(Json(
         json!({"files":a.call(move|b,u|b.source_files(u,&n,id)).await?}),
     ))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Share {
     thread: String,
     attachment: i64,
 }
+#[utoipa::path(post, path="/sources/{name}/files/{id}", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn share_file(
     State(a): State<App>,
     Path((n, id)): Path<(String, i64)>,
@@ -230,6 +242,7 @@ async fn share_file(
     )
         .into_response())
 }
+#[utoipa::path(post, path="/sources/{name}/inbox", params(("name" = String, Path)), tag="sources")]
 async fn push(
     State(a): State<App>,
     Path(n): Path<String>,
@@ -249,7 +262,7 @@ async fn push(
     )
         .into_response())
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 struct Page {
     after: Option<i64>,
@@ -262,18 +275,21 @@ async fn queue(a: App, n: String, q: Page, d: Direction) -> Data {
         .await?;
     Ok(Json(json!({"cursor":cursor,"items":rows})))
 }
+#[utoipa::path(get, path="/sources/{name}/inbox", params(("name" = String, Path), Page), tag="sources")]
 async fn inbox(State(a): State<App>, Path(n): Path<String>, Query(q): Query<Page>) -> Data {
     queue(a, n, q, Direction::In).await
 }
+#[utoipa::path(get, path="/sources/{name}/outbox", params(("name" = String, Path), Page), tag="sources")]
 async fn outbox(State(a): State<App>, Path(n): Path<String>, Query(q): Query<Page>) -> Data {
     queue(a, n, q, Direction::Out).await
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Acquire {
     direction: Direction,
     lease_seconds: Option<i64>,
 }
+#[utoipa::path(post, path="/sources/{name}/deliveries", params(("name" = String, Path)), tag="sources")]
 async fn lease(
     State(a): State<App>,
     Path(n): Path<String>,
@@ -290,24 +306,26 @@ async fn lease(
         None => StatusCode::NO_CONTENT.into_response(),
     })
 }
+#[utoipa::path(get, path="/sources/{name}/deliveries/{id}", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn item(State(a): State<App>, Path((n, id)): Path<(String, i64)>) -> Data {
     Ok(Json(json!(
         a.call(move |b, u| b.queue_item(u, &n, id)).await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Ack {
     receipt: String,
     result: Option<DeliveryResult>,
 }
+#[utoipa::path(put, path="/sources/{name}/deliveries/{id}/receipt", operation_id="sources_ack", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn ack(State(a): State<App>, Path((n, id)): Path<(String, i64)>, Json(i): Json<Ack>) -> Data {
     Ok(Json(json!(
         a.call(move |b, u| b.ack_source(u, &n, id, &i.receipt, i.result.as_ref()))
             .await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Failure {
     receipt: String,
@@ -316,6 +334,7 @@ struct Failure {
     uncertain: bool,
     retry_after: Option<i64>,
 }
+#[utoipa::path(post, path="/sources/{name}/deliveries/{id}/failure", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn fail(
     State(a): State<App>,
     Path((n, id)): Path<(String, i64)>,
@@ -336,12 +355,13 @@ async fn fail(
         .await?
     )))
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 struct Resolution {
     action: String,
     result: Option<DeliveryResult>,
 }
+#[utoipa::path(put, path="/sources/{name}/deliveries/{id}/resolution", params(("name" = String, Path), ("id" = i64, Path)), tag="sources")]
 async fn resolve(
     State(a): State<App>,
     Path((n, id)): Path<(String, i64)>,

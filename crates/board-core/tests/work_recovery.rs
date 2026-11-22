@@ -1,70 +1,26 @@
 use anyhow::Result;
 use board_local::{Board, PostOptions, access::Rules, automation::*, errors::classify};
 use rusqlite::Connection;
-use std::collections::BTreeMap;
 
 const PROOF: &str = "precommitted-private-token";
 
 #[test]
-fn large_plans_checkpoint_chunks_and_allow_repairs_only_to_uncommitted_items() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let db = dir.path().join("plans.db");
-    let board = Board::open(&db)?;
-    let external = create_task(&board, "ada", new("inputs", &Default::default()), &[], None)?;
-    let mut raw: Vec<_> = (0..105)
-        .map(|i| serde_json::json!({"key":format!("k{i}"),"text":format!("step {i}")}))
-        .collect();
-    raw[0]["needs"] = serde_json::json!([{"key":"k104"}]);
-    raw[104]["needs"] = serde_json::json!(["k1", {"key":"k1"}, {"id":external.id.to_string()}]);
-    let items: Vec<PlanItem> = serde_json::from_value(serde_json::json!(raw))?;
-    let inspect = Connection::open(&db)?;
-    inspect.execute_batch("CREATE TRIGGER stop_later BEFORE INSERT ON messages WHEN NEW.text='step 101' BEGIN SELECT RAISE(ABORT,'storage interrupted'); END;")?;
-    assert!(create_plan(&board, "ada", "work", &items, Some("durable-plan")).is_err());
-    let committed = lookup_plan(&board, "ada", "durable-plan")?;
-    assert_eq!(committed.len(), 100);
-    assert_eq!(committed[0].text, "step 1");
-    assert!(lookup_plan(&board, "outsider", "durable-plan").is_err());
-    drop(board);
-    let other = Board::open(&db)?;
-    let taken = claim(
-        &other,
-        "ada/worker",
-        ClaimTarget::Ready("work"),
-        30,
-        &Default::default(),
-    )?;
-    assert_eq!(taken.id, committed[0].id);
-    inspect.execute_batch("DROP TRIGGER stop_later")?;
-    let mut changed = items.clone();
-    changed[5].text = "rewrote committed".into();
-    let high = other.cursor()?;
-    assert_eq!(
-        classify(&create_plan(&other, "ada", "work", &changed, Some("durable-plan")).unwrap_err())
-            .1,
-        "duplicate_id"
-    );
-    assert_eq!(other.cursor()?, high);
-    let mut repaired = items;
-    repaired[101].text = "repaired tail".into();
-    let out = create_plan(&other, "ada", "work", &repaired, Some("durable-plan"))?;
-    assert_eq!(out.len(), 105);
-    assert_eq!(out[1].id, taken.id);
-    assert_eq!(out[1].state, "claimed");
-    assert_eq!(out[0].needs, vec![out[104].id]);
-    assert_eq!(out[104].needs, vec![out[1].id, external.id]);
-    assert_eq!(out[101].text, "repaired tail");
-    let high = other.cursor()?;
-    assert_eq!(
-        create_plan(&other, "ada", "work", &repaired, Some("durable-plan"))?,
-        out
-    );
-    assert_eq!(other.cursor()?, high);
-    repaired.push(serde_json::from_value(serde_json::json!({"text":"extra"}))?);
-    assert_eq!(
-        classify(&create_plan(&other, "ada", "work", &repaired, Some("durable-plan")).unwrap_err())
-            .1,
-        "duplicate_id"
-    );
+fn plans_commit_all_items_or_none_and_retry_without_duplicates() -> Result<()> {
+    let b = Board::memory()?;
+    let item: PlanItem = serde_json::from_value(serde_json::json!({"text":"work"}))?;
+    let before = b.cursor()?;
+    let publish = |items: &[PlanItem]| create_plan(&b, "ada", "work", items, Some("batch"));
+    assert!(publish(&vec![item.clone(); 101]).is_err());
+    let mut items = vec![item; 100];
+    items[99].needs.push(Prerequisite::Id(999999));
+    assert!(publish(&items).is_err());
+    assert_eq!(b.cursor()?, before);
+    items[99].needs.clear();
+    let tasks = publish(&items)?;
+    assert_eq!(tasks.len(), 100);
+    let head = b.cursor()?;
+    assert_eq!(publish(&items)?, tasks);
+    assert_eq!(b.cursor()?, head);
     Ok(())
 }
 
@@ -74,12 +30,98 @@ fn atomic_plans_keep_input_order_and_distinguish_numeric_keys_from_task_ids() ->
     let external = create_task(&board, "ada", new("inputs", &Default::default()), &[], None)?;
     let key = external.id.to_string();
     let items: Vec<PlanItem> = serde_json::from_value(serde_json::json!([
-        {"text":"dependent","needs":[key, {"key":key}, external.id]},
+        {"text":"dependent","needs":[key, external.id]},
         {"text":"local prerequisite","key":key}
     ]))?;
     let tasks = create_plan(&board, "ada", "work", &items, None)?;
     assert!(tasks[0].id < tasks[1].id);
     assert_eq!(tasks[0].needs, vec![tasks[1].id, external.id]);
+    let missing_key = create_plan(&board, "ada", "work", &items[..1], None).unwrap_err();
+    assert_eq!(classify(&missing_key).1, "invalid_needs");
+    for object in [
+        serde_json::json!({"key":"x"}),
+        serde_json::json!({"id":external.id}),
+    ] {
+        assert!(serde_json::from_value::<Prerequisite>(object).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn plan_adopts_the_conversation_in_place_without_claiming_or_rewriting_it() -> Result<()> {
+    let board = Board::memory()?;
+    let root = board.post(
+        "incidents",
+        "bo",
+        "Investigate slow builds",
+        &Default::default(),
+    )?;
+    let reply = board.reply(root.id, "bo", "Found the slow step", &Default::default())?;
+    let items = serde_json::from_value::<Vec<PlanItem>>(serde_json::json!([
+        {"text":"Verify the fix","needs":[root.id]},
+        {"key":"fix","thread_id":root.id,"for":"builder"}
+    ]))?;
+    let batch = create_plan(&board, "ada", "build", &items, Some("fix-build"))?;
+    assert_eq!(batch[0].needs, [root.id]);
+    assert_eq!(batch[1].id, root.id);
+    assert_eq!(batch[1].channel, "incidents");
+    assert_eq!(batch[1].state, "ready");
+    assert_eq!(batch[1].holder, None);
+    assert_eq!(batch[1].assignee.as_deref(), Some("ada/builder"));
+    let thread = board.conversation(root.id, &Default::default())?;
+    assert_eq!(thread.message.text, root.text);
+    assert_eq!(thread.replies[0].id, reply.id);
+    let high = board.cursor()?;
+    assert_eq!(
+        create_plan(&board, "ada", "build", &items, Some("fix-build"))?,
+        batch
+    );
+    assert_eq!(
+        classify(&create_plan(&board, "ada", "build", &items, None).unwrap_err()).1,
+        "already_a_task"
+    );
+    assert_eq!(board.cursor()?, high);
+    Ok(())
+}
+
+#[test]
+fn plan_rejects_invalid_adoptions_without_leaving_a_partial_batch() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("board");
+    let b = Board::open(&path)?;
+    let root = b.post("work", "ada", "live", &Default::default())?;
+    let reply = b.reply(root.id, "ada", "not a root", &Default::default())?;
+    let deleted = b.post("work", "ada", "deleted", &Default::default())?;
+    b.delete(deleted.id, "ada", None)?;
+    let secret = b.post("private", "ada", "hidden", &Default::default())?;
+    b.set_grant("ada", None, "sam", &Rules::parse("work=read,post")?)?;
+    let token = b.issue_credential("ada", "sam", None, None)?;
+    let mut sam = Board::open(&path)?;
+    sam.bind_token(&token.token)?;
+    let high = b.cursor()?;
+    let attempt = |db, actor, item| -> Result<_> {
+        let items: Vec<PlanItem> =
+            serde_json::from_value(serde_json::json!([{"text":"new task"},item]))?;
+        create_plan(db, actor, "work", &items, None)
+    };
+    for invalid in [
+        serde_json::json!({"thread_id":reply.id}),
+        serde_json::json!({"thread_id":deleted.id}),
+        serde_json::json!({"thread_id":root.id,"text":"replacement"}),
+        serde_json::json!({"thread_id":root.id,"labels":{"x":"y"}}),
+        serde_json::json!({"thread_id":root.id,"needs":[root.id]}),
+    ] {
+        assert!(attempt(&b, "ada", invalid).is_err());
+    }
+    assert_eq!(
+        classify(&attempt(&sam, "sam", serde_json::json!({"thread_id":root.id})).unwrap_err()).1,
+        "missing_permission"
+    );
+    assert_eq!(
+        classify(&attempt(&sam, "sam", serde_json::json!({"thread_id":secret.id})).unwrap_err()).1,
+        "message_not_found"
+    );
+    assert_eq!(b.cursor()?, high);
     Ok(())
 }
 
@@ -179,14 +221,7 @@ fn creation_adoption_and_claim_are_atomic_and_lost_responses_recover_after_resta
     assert_eq!(b.cursor()?, high);
     assert!(!serde_json::to_string(&b.events(0, 100)?)?.contains(PROOF));
     let q = || {
-        claim_with_token(
-            &b,
-            "ann",
-            ClaimTarget::Ready("ops"),
-            lease("private-ready-token"),
-            &BTreeMap::new(),
-            &[],
-        )
+        claim_in_assignment(&b, "ann", dep.id, lease("private-ready-token"), None).map(|(t, _)| t)
     };
     let one = q()?;
     let prior = b.cursor()?;
@@ -211,7 +246,7 @@ fn creation_adoption_and_claim_are_atomic_and_lost_responses_recover_after_resta
 }
 
 #[test]
-fn scoped_tasks_hide_prerequisites_and_queue_limits_do_not_hide_allowed_work() -> Result<()> {
+fn scoped_tasks_hide_prerequisites_and_allow_claims_on_visible_work() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("access.db");
     let b = Board::open(&db)?;
@@ -275,17 +310,7 @@ fn scoped_tasks_hide_prerequisites_and_queue_limits_do_not_hide_allowed_work() -
             .iter()
             .all(|t| t.channel == "work/shared")
     );
-    assert_eq!(
-        claim(
-            &agent,
-            "ann/w",
-            ClaimTarget::Ready("work/"),
-            30,
-            &Default::default()
-        )?
-        .id,
-        z.id
-    );
+    assert_eq!(claim(&agent, "ann/w", z.id, 30)?.id, z.id);
     assert!(watchers(&agent)?.is_empty());
     assert!(expire_leases(&agent).is_err());
     Ok(())

@@ -1,21 +1,23 @@
 CREATE TABLE IF NOT EXISTS swarm_runs (
     id INTEGER PRIMARY KEY,
     slug TEXT NOT NULL UNIQUE, goal TEXT NOT NULL,
-    channel TEXT NOT NULL UNIQUE REFERENCES channels(name),
+    channel TEXT NOT NULL REFERENCES channels(name),
     root_id INTEGER NOT NULL REFERENCES messages(id), repo_root TEXT,
     coordinator_actor TEXT NOT NULL,
     status TEXT NOT NULL CHECK (status IN ('active','completed','stopped')),
     max_notifications INTEGER NOT NULL, notifications_sent INTEGER NOT NULL DEFAULT 0,
-    coordinator_cursor INTEGER NOT NULL DEFAULT 0, coordinator_pid INTEGER,
-    created_at TEXT NOT NULL, ended_at TEXT, stop_cursor INTEGER
+    coordinator_cursor INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL, ended_at TEXT, stop_cursor INTEGER, start_fingerprint BLOB NOT NULL
 );
 CREATE TABLE IF NOT EXISTS swarm_workers (
     id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL REFERENCES swarm_runs(id) ON DELETE CASCADE,
     name TEXT NOT NULL, actor TEXT NOT NULL, role_slug TEXT, pinned_role_version INTEGER,
     pinned_system_prompt TEXT NOT NULL, pinned_skills_json TEXT NOT NULL,
     brief TEXT NOT NULL, workspace_path TEXT, branch_name TEXT,
-    status TEXT NOT NULL CHECK (status IN ('registered','working','waiting','done','stopped','launch_failed')),
-    waiter_pid INTEGER, last_read_cursor INTEGER NOT NULL DEFAULT 0,
+    thread_id INTEGER REFERENCES messages(id),
+    status TEXT NOT NULL CHECK (status IN ('registered','working','done','stopped','launch_failed')),
+    model TEXT, workspace_mode TEXT, session_ref TEXT,
+    last_read_cursor INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
     checked_in_at TEXT, last_activity_at TEXT, launch_error TEXT,
     UNIQUE(run_id,name), UNIQUE(run_id,actor)

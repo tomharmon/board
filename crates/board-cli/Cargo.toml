@@ -31,3 +31,7 @@ uuid = { version = "1", features = ["v4"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 signal-hook-registry = "1"
+
+[dev-dependencies]
+base64 = "0.22"
+jsonschema = { version = "0.30", default-features = false }

@@ -60,7 +60,7 @@ def main():
             return mid
 
         post("mira", "general", "Welcome to the local board. Post handoffs and questions here.", "2026-11-18T17:05:00Z")
-        root = post("rowan", "engineering", "The build cache is ready for review.", "2026-11-19T18:20:00Z", "--label", "phase=review")
+        root = post("rowan", "engineering", "The build cache is ready for review.", "2026-11-19T18:20:00Z")
         cli("mira", "react", str(root), "eyes")
         post("lin", "engineering/build", "Linux and macOS checks passed on the new settings.", "2026-11-20T20:10:00Z")
         reply = post("mira", root, "I checked the cold run. The cache reduced build time to 42 seconds.", "2026-11-21T16:40:00Z")

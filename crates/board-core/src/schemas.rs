@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 mod formats;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Block {
     pub schema: String,
     pub version: u32,
@@ -45,6 +46,15 @@ pub struct Schema {
 }
 
 impl Schema {
+    pub fn valid_examples(&self) -> Result<impl Iterator<Item = &Value>> {
+        let validator = formats::validator(&local_definition(self.schema.clone()))?;
+        Ok(self.schema["examples"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(move |v| v.is_object() && validator.is_valid(v)))
+    }
+
     /// Check an example block against this immutable registered version, without publishing it.
     pub fn accepts_sample(&self, data: &Value) -> Result<bool> {
         Ok(data.is_object()
@@ -52,47 +62,9 @@ impl Schema {
     }
 }
 
-/// Before v14, imported text was incorrectly promoted to typed data. Its original
-/// text and immutable event records stay untouched; only correct the derived views.
-pub(crate) fn migrate_imported_blocks(c: &Connection) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS legacy_platform_revisions(message INTEGER PRIMARY KEY,through INTEGER NOT NULL);
-        INSERT OR IGNORE INTO legacy_platform_revisions
-            SELECT m.id,m.revision FROM messages m WHERE EXISTS(SELECT 1 FROM sync_copies cp WHERE cp.message=m.id AND cp.origin=1);
-        UPDATE messages SET blocks='[]' WHERE blocks!='[]' AND EXISTS(
-            SELECT 1 FROM legacy_platform_revisions fix WHERE fix.message=messages.id AND messages.revision<=fix.through);")?;
-    Ok(())
-}
-pub(crate) fn correct_snapshot(c: &Connection, m: &mut crate::Message) -> Result<()> {
-    if !m.blocks.is_empty()
-        && c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM legacy_platform_revisions WHERE message=? AND through>=?)",
-            params![m.id, m.revision],
-            |r| r.get::<_, bool>(0),
-        )?
-    {
-        m.blocks.clear();
-    }
-    Ok(())
-}
-
 pub(crate) fn init(c: &Connection) -> Result<()> {
-    c.execute_batch("CREATE TABLE IF NOT EXISTS schema_origins(
-        name TEXT NOT NULL,version INTEGER NOT NULL,builtin INTEGER NOT NULL,actor TEXT,at TEXT,
-        PRIMARY KEY(name,version),FOREIGN KEY(name,version) REFERENCES schemas(name,version));
-        INSERT OR IGNORE INTO schema_origins(name,version,builtin,actor,at)
-          SELECT s.name,s.version,0,e.actor,e.created_at FROM events e JOIN schemas s
-          ON s.name=json_extract(e.payload,'$.name') AND s.version=json_extract(e.payload,'$.version')
-          WHERE e.kind='schema.registered' ORDER BY e.cursor;")?;
     let schema = json!({"type":"object","additionalProperties":false,"required":["sha","title"],"properties":{
  "sha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"},"title":{"type":"string","minLength":1,"maxLength":1024}}});
-    c.execute(
-        "INSERT OR IGNORE INTO schemas VALUES('git-commit',1,'A commit hash and its title.',?)",
-        [schema.to_string()],
-    )?;
-    c.execute(
-        "INSERT OR IGNORE INTO schema_origins(name,version,builtin) VALUES('git-commit',1,1)",
-        [],
-    )?;
     let deployment = json!({"type":"object","required":["url"],"additionalProperties":false,
         "properties":{"url":{"type":"string","format":"uri","pattern":"^https?://[^/\\s?#]+","maxLength":2048},
         "gitSha":{"type":"string","pattern":"^(?:[0-9a-f]{40}|[0-9a-f]{64})$"}}});
@@ -103,9 +75,8 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
         "required":["name","status"],"properties":{"name":string,"status":verdict_status,"command":string,"output":string}}}}});
     let diff = json!({"type":"object","required":["patch"],"properties":{"base":string,"head":string,
         "files":{"type":"array","items":string},"patch":string}});
-    // An older installation could have registered a formerly unreserved name.
-    // Never change what an existing version means, even during an upgrade.
     for (name, description, definition) in [
+        ("git-commit", "A commit hash and its title.", schema),
         (
             "deployment",
             "A deployment address and optional source commit.",
@@ -125,17 +96,10 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
     .into_iter()
     .chain(crate::swarm::coordination_schemas())
     {
-        if c.execute(
-            "INSERT INTO schemas(name,version,description,definition)
-        SELECT ?1,1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM schemas WHERE name=?1)",
+        c.execute(
+            "INSERT INTO schemas(name,version,description,definition,builtin) VALUES(?,1,?,?,1)",
             params![name, description, definition.to_string()],
-        )? == 1
-        {
-            c.execute(
-                "INSERT INTO schema_origins(name,version,builtin) VALUES(?,1,1)",
-                [name],
-            )?;
-        }
+        )?;
     }
     Ok(())
 }
@@ -155,20 +119,49 @@ fn validate_id(name: &str, version: u32) -> Result<()> {
     );
     Ok(())
 }
-const PROJECTION:&str="SELECT s.name,s.version,s.description,s.definition,coalesce(o.builtin,0),o.actor,o.at FROM schemas s
-                         LEFT JOIN schema_origins o USING(name,version)";
+const PROJECTION: &str = "SELECT name,version,description,definition,builtin,actor,at FROM schemas";
 fn schema_row(r: &rusqlite::Row<'_>) -> Result<Schema> {
     let name: String = r.get(0)?;
     let version = r.get(1)?;
+    let mut schema: Value = serde_json::from_str(r.get_ref(3)?.as_str()?)?;
+    let built_in: bool = r.get(4)?;
+    // Examples are presentation hints, not part of the stored validation rules.
+    if built_in
+        && version == 1
+        && let Some(sample) = builtin_example(&name)
+    {
+        schema["examples"] = json!([sample]);
+    }
     Ok(Schema {
         id: format!("{name}@{version}"),
         name,
         version,
         description: r.get(2)?,
-        schema: serde_json::from_str(&r.get::<_, String>(3)?)?,
-        built_in: r.get(4)?,
+        schema,
+        built_in,
         by: r.get(5)?,
         at: r.get(6)?,
+    })
+}
+fn builtin_example(name: &str) -> Option<Value> {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let revision = || json!({"kind":"git-commit","value":sha});
+    Some(match name {
+        "git-commit" => json!({"sha":sha,"title":"Describe the change"}),
+        "deployment" => json!({"url":"https://example.org/releases/1"}),
+        "verdict" => json!({"status":"not-run","summary":"Verification pending"}),
+        "diff" => json!({"patch":"@@ -1 +1 @@\n-before\n+after"}),
+        "handoff" => {
+            json!({"revision":revision(),"summary":"Ready for review","changes":["Describe the change"],"to":"reviewer"})
+        }
+        "verification" => {
+            json!({"handoff":1,"revision":revision(),"summary":"Verification pending","checks":[{"name":"tests","status":"not-run","command":"cargo test"}]})
+        }
+        "decision-request" => {
+            json!({"to":"coordinator","summary":"Which release should include this change?"})
+        }
+        "decision-resolution" => json!({"request":1,"summary":"Use the next release."}),
+        _ => return None,
     })
 }
 fn check_shape(v: &Value, depth: usize, count: &mut usize) -> Result<()> {
@@ -233,6 +226,7 @@ fn check_shape(v: &Value, depth: usize, count: &mut usize) -> Result<()> {
                 "enum needs at least one value"
             ),
             "const" => (),
+            "examples" => ensure!(val.is_array(), "examples must be an array"),
             "$schema" | "title" | "description" => ensure!(val.is_string(), "{k} must be text"),
             "format" => ensure!(
                 matches!(
@@ -390,7 +384,7 @@ impl Board {
             validate_id(name, version)?;
             ensure!(description.encode_utf16().count() <= 2000,
                 Invalid.error("invalid_schema", "schema description exceeds 2000 characters"));
-            let reserved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM schema_origins WHERE name=? AND builtin)", [name], |r| r.get(0))?;
+            let reserved:bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM schemas WHERE name=? AND builtin)", [name], |r| r.get(0))?;
             ensure!(!reserved, Conflict.error("reserved_schema", "reserved schema name"));
             check_definition(schema).map_err(|e|Invalid.error("invalid_schema",e.to_string()))?;
             if let Some((d, def)) = tx
@@ -407,13 +401,8 @@ impl Board {
                 );
                 return Ok(false);
             }
-            let count: u32 = tx.query_row("SELECT count(*) FROM schemas s WHERE NOT EXISTS(
-                SELECT 1 FROM schema_origins o WHERE o.name=s.name AND o.version=s.version AND o.builtin)", [], |r| r.get(0))?;
+            let count: u32 = tx.query_row("SELECT count(*) FROM schemas WHERE NOT builtin", [], |r| r.get(0))?;
             ensure!(count < 500, Invalid.error("too_many_schemas", "at most 500 registered versions"));
-            tx.execute(
-                "INSERT INTO schemas VALUES(?,?,?,?)",
-                params![name, version, description, schema.to_string()],
-            )?;
             let cursor = Board::event_tx(
                 tx,
                 "schema.registered",
@@ -421,7 +410,7 @@ impl Board {
                 None,
                 json!({"name":name,"version":version}),
             )?;
-            tx.execute("INSERT INTO schema_origins(name,version,builtin,actor,at) SELECT ?,?,0,actor,created_at FROM events WHERE cursor=?", params![name,version,cursor])?;
+            tx.execute("INSERT INTO schemas(name,version,description,definition,builtin,actor,at) SELECT ?,?,?,?,0,actor,created_at FROM events WHERE cursor=?", params![name,version,description,schema.to_string(),cursor])?;
             Ok(true)
         })
     }
@@ -429,8 +418,7 @@ impl Board {
         let tx = self.conn.unchecked_transaction()?;
         self.access_on(&tx)?;
         let mut stmt = tx.prepare(&format!(
-            "{PROJECTION} ORDER BY coalesce(o.builtin,0) DESC,
-             CASE WHEN o.builtin AND s.name='git-commit' THEN 0 ELSE 1 END,s.name,s.version"
+            "{PROJECTION} ORDER BY builtin DESC, (name='git-commit') DESC, name, version"
         ))?;
         let mut rs = stmt.query([])?;
         let mut out = vec![];
@@ -448,7 +436,7 @@ impl Board {
         self.access_on(&tx)?;
         let result = {
             let mut stmt =
-                tx.prepare_cached(&format!("{PROJECTION} WHERE s.name=? AND s.version=?"))?;
+                tx.prepare_cached(&format!("{PROJECTION} WHERE name=? AND version=?"))?;
             let mut rows = stmt.query(params![name, version])?;
             schema_row(rows.next()?.context(
                 crate::errors::Kind::Missing.error("schema_not_found", "schema not found"),

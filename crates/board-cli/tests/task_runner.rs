@@ -144,13 +144,13 @@ fn failed_ack_after_cli_claim_commit_recovers_pending_proof_without_sharing_prof
 }
 
 #[test]
-fn multi_chunk_file_plan_round_trips_through_independent_cli_processes() {
+fn atomic_file_plan_round_trips_through_independent_cli_processes() {
     let (dir, db) = board();
     let plan = dir.path().join("plan.json");
-    let mut items: Vec<_> = (0..101)
+    let mut items: Vec<_> = (0..100)
         .map(|i| serde_json::json!({"key":format!("task{i}"),"text":format!("step {i}")}))
         .collect();
-    items[0]["needs"] = serde_json::json!([{"key":"task100"}]);
+    items[0]["needs"] = serde_json::json!(["task99"]);
     std::fs::write(&plan, serde_json::to_vec(&items).unwrap()).unwrap();
     let cmd = [
         "tasks",
@@ -162,8 +162,8 @@ fn multi_chunk_file_plan_round_trips_through_independent_cli_processes() {
         "cross-process-plan",
     ];
     let first = ok(&db, &cmd);
-    assert_eq!(first.as_array().unwrap().len(), 101);
-    assert_eq!(first[0]["needs"][0], first[100]["id"]);
+    assert_eq!(first.as_array().unwrap().len(), 100);
+    assert_eq!(first[0]["needs"][0], first[99]["id"]);
     let claimed = ok(
         &db,
         &[

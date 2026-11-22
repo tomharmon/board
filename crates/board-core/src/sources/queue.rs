@@ -50,6 +50,7 @@ fn outbound_text(
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub enum Direction {
     In,
     Out,
@@ -90,6 +91,7 @@ fn remember_promotion(
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct Envelope {
     pub key: String,
     pub import: Import,
@@ -129,6 +131,7 @@ pub struct Lease {
     pub deadline: i64,
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct DeliveryResult {
     pub external: String,
     #[serde(default)]
@@ -265,14 +268,6 @@ pub(super) fn abandon_skipped_starts(tx: &Transaction<'_>, name: &str) -> Result
 }
 fn refresh_outbound(tx: &Transaction<'_>, source: &Source, id: i64) -> Result<bool> {
     let job = get(tx, &source.name, id)?;
-    if job.payload["event"] == "source.response" {
-        if !tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_threads t JOIN messages m ON m.id=t.root LEFT JOIN private_messages p ON p.id=m.id WHERE t.source=? AND t.thread=? AND (p.id IS NOT NULL OR m.deleted))",params![source.name,job.thread],|r|r.get::<_,bool>(0))?{return Ok(true);}
-        tx.execute(
-            "UPDATE sync_queue SET state='skipped',error='thread no longer shareable',receipt=NULL,deadline=NULL WHERE id=?",
-            [id],
-        )?;
-        return Ok(false);
-    }
     let mut d: Delivery = serde_json::from_value(job.payload)?;
     let m = Board::get_on(tx, d.message)?;
     let predates_join: bool = tx.query_row(
@@ -378,7 +373,6 @@ fn complete(
             ensure!(remote.is_none(), "no remote receipt for an inbound event");
             clear_to_import(tx, &s.name, &j.thread)?;
             let input: Import = serde_json::from_value(j.payload.clone())?;
-            ensure!(!tx.query_row("SELECT EXISTS(SELECT 1 FROM sync_responses WHERE source=? AND thread=? AND external=?)",params![s.name,input.thread,input.external],|r|r.get::<_,bool>(0))?,Kind::Invalid.error("response_echo","already-confirmed policy response"));
             tx.execute(
                 "INSERT INTO sync_import_context VALUES(1,?,?,?)",
                 params![s.name, input.thread, input.external],
@@ -413,7 +407,7 @@ fn complete(
                     for action in [
                         crate::access::Action::Read,
                         crate::access::Action::Sync,
-                        crate::access::Action::Label,
+                        crate::access::Action::Task,
                     ] {
                         a.require(action, &s.channel)?;
                     }
@@ -572,12 +566,7 @@ fn try_import(tx: &Transaction<'_>, s: &Source, j: &Job) -> Result<Result<Messag
             tx.execute_batch("RELEASE inbound_policy")?;
             Ok(Ok(m))
         }
-        Err(e)
-            if matches!(
-                crate::errors::classify(&e).1,
-                "response_echo" | "ignored_event"
-            ) =>
-        {
+        Err(e) if matches!(crate::errors::classify(&e).1, "ignored_event") => {
             tx.execute_batch("ROLLBACK TO inbound_policy; RELEASE inbound_policy")?;
             tx.execute("UPDATE sync_queue SET state='skipped',receipt=NULL,deadline=NULL,error=? WHERE id=?",params![e.to_string(),j.id])?;
             Board::event_tx(
@@ -592,30 +581,6 @@ fn try_import(tx: &Transaction<'_>, s: &Source, j: &Job) -> Result<Result<Messag
         Err(e) => Err(e),
     }
 }
-fn response_receipt(tx: &Transaction<'_>, s: &Source, j: &Job, r: &DeliveryResult) -> Result<()> {
-    ident(&r.external)?;
-    ensure!(
-        r.thread.as_deref().is_none_or(|t| t == j.thread),
-        "unexpected response thread"
-    );
-    tx.execute(
-        "INSERT INTO sync_responses VALUES(?,?,?,?)",
-        params![s.name, j.thread, r.external, j.id],
-    )?;
-    tx.execute(
-        "UPDATE sync_queue SET state='done',receipt=NULL,deadline=NULL,error=NULL WHERE id=?",
-        [j.id],
-    )?;
-    Board::event_tx(
-        tx,
-        "source.receipt",
-        &s.owner,
-        None,
-        json!({"source":s.name,"item":j.id,"direction":"out"}),
-    )?;
-    Ok(())
-}
-
 impl Board {
     /// Latest 100 outbound receipts and outstanding writes for one exact message. Do not expose raw inbox data.
     pub fn message_deliveries(&self, who: &str, id: i64) -> Result<Vec<DeliveryNotice>> {
@@ -769,7 +734,7 @@ impl Board {
         ensure!(events.len() <= 500, "up to 500 events per inbox batch");
         self.write(|tx|{let s=self.authorized_source(tx,name,who)?;
             let access=self.access_on(tx)?;
-            if as_tasks {access.require(crate::access::Action::Label,&s.channel)?;}
+            if as_tasks {access.require(crate::access::Action::Task,&s.channel)?;}
             let ids=events.iter().map(|e|{
                 let (id,_) = push(tx,&s,e)?;
                 if as_tasks {
@@ -860,7 +825,7 @@ impl Board {
         self.write(|tx|{let s=self.authorized_source(tx,name,who)?;
             let promoter=if mode == LeaseMode::PromoteRoots {
                 let access=self.access_on(tx)?;
-                access.require(crate::access::Action::Label,&s.channel)?;
+                access.require(crate::access::Action::Task,&s.channel)?;
                 Some(access)
             } else {None};
             let now=time();expire(tx,name,now)?;
@@ -950,9 +915,6 @@ impl Board {
             let m = if j.direction == Direction::In {
                 ensure!(result.is_none(), "unexpected remote receipt");
                 try_import(tx, &s, &j)?.ok()
-            } else if j.payload["event"] == "source.response" {
-                response_receipt(tx, &s, &j, result.context("expected remote response id")?)?;
-                None
             } else {
                 Some(complete(tx, &s, &j, result)?)
             };
@@ -996,7 +958,7 @@ impl Board {
         self.write(|tx|{let s=self.authorized_source(tx,name,who)?;expire(tx,name,time())?;let j=get(tx,name,id)?;
             ensure!(matches!(j.state.as_str(),"failed"|"uncertain"),Kind::Conflict.error("not_failed","only failed or uncertain deliveries can be reconciled"));
             match action{
-                "delivered"=>{ensure!(j.direction==Direction::Out,"inbound events cannot have remote receipts");if j.payload["event"]=="source.response"{response_receipt(tx,&s,&j,confirmed.context("expected response id")?)?;}else{complete(tx,&s,&j,confirmed)?;}}
+                "delivered"=>{ensure!(j.direction==Direction::Out,"inbound events cannot have remote receipts");complete(tx,&s,&j,confirmed)?;}
                 "retry"|"skip"=>{ensure!(confirmed.is_none(),"unexpected receipt");ensure!(action=="skip"||j.direction==Direction::In||s.outbound,"publishing is disabled");
                     tx.execute("UPDATE sync_queue SET state=?,attempts=0,available=0,error=NULL WHERE id=?",params![if action=="retry"{"pending"}else{"skipped"},id])?;
                     if action=="skip"&&j.payload["event"]=="thread.start"{abandon_skipped_starts(tx,name)?;}

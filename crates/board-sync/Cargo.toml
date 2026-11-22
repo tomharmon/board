@@ -20,4 +20,5 @@ hex = "0.4"
 pulldown-cmark = { version="0.13", default-features=false }
 
 [dev-dependencies]
+rusqlite = "0.37"
 tempfile = "3"

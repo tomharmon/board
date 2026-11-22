@@ -3,7 +3,6 @@ mod access_api;
 mod catalog;
 mod files_api;
 mod messages;
-mod openapi;
 pub use catalog::document as discovery_document;
 mod sources;
 mod sse;
@@ -18,7 +17,6 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{get, patch, put},
 };
 use board_local::{
     Board,
@@ -29,6 +27,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     sync::{Arc, Mutex},
 };
+use utoipa_axum::router::{OpenApiRouter, UtoipaMethodRouterExt};
 
 #[derive(Clone)]
 struct App {
@@ -43,6 +42,13 @@ struct RequestIdentity {
     profile: Option<String>,
 }
 tokio::task_local! {static IDENTITY:RequestIdentity;}
+
+#[derive(serde::Serialize, utoipa::ToSchema)]
+struct Problem<'a> {
+    status: u16,
+    code: &'a str,
+    detail: &'a str,
+}
 
 struct ApiError {
     status: StatusCode,
@@ -76,7 +82,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut response = (
             self.status,
-            Json(json!({"status":self.status.as_u16(),"code":self.code,"detail":self.detail})),
+            Json(Problem {
+                status: self.status.as_u16(),
+                code: self.code,
+                detail: &self.detail,
+            }),
         )
             .into_response();
         response.headers_mut().insert(
@@ -220,38 +230,29 @@ async fn authorize(State(app): State<App>, req: Request, next: Next) -> Response
 
 fn routes(app: App) -> Router {
     use messages::*;
-    let api = Router::new()
-        .route("/channels", get(channels).post(channel))
-        .route("/channels/{*name}", get(one_channel))
-        .route("/actors", get(actors))
-        .route("/profile", put(save_profile))
-        .route("/threads", get(threads))
-        .route("/threads/{id}", get(thread))
-        .route(
-            "/messages",
-            get(messages)
-                .post(post_message)
-                .layer(DefaultBodyLimit::max(56 * 1024 * 1024)),
-        )
-        .route("/messages/{id}", get(message).patch(edit).delete(remove))
-        .route("/posts/{key}", get(posted))
-        .route("/messages/{id}/labels", patch(labels))
-        .route(
-            "/messages/{id}/reactions/{name}",
-            put(react).delete(unreact),
-        )
-        .route("/attachments/{id}", get(attachment))
-        .route("/events", get(events))
-        .route("/schemas", get(schemas))
-        .route(
-            "/schemas/{name}/{version}",
-            get(schema).put(register_schema),
-        )
+    let (api, contract) = OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(threads))
+        .routes(utoipa_axum::routes!(thread))
+        .routes(utoipa_axum::routes!(messages))
+        .routes(utoipa_axum::routes!(channels, channel))
+        .routes(utoipa_axum::routes!(one_channel))
+        .routes(utoipa_axum::routes!(actors))
+        .routes(utoipa_axum::routes!(save_profile))
+        .routes(utoipa_axum::routes!(post_message).layer(DefaultBodyLimit::max(56 * 1024 * 1024)))
+        .routes(utoipa_axum::routes!(message, edit, remove))
+        .routes(utoipa_axum::routes!(posted))
+        .routes(utoipa_axum::routes!(react, unreact))
+        .routes(utoipa_axum::routes!(attachment))
+        .routes(utoipa_axum::routes!(events))
+        .routes(utoipa_axum::routes!(schemas))
+        .routes(utoipa_axum::routes!(schema, register_schema))
         .merge(access_api::routes())
         .merge(catalog::routes())
         .merge(files_api::routes())
         .merge(sources::routes())
-        .merge(work::routes());
+        .merge(work::routes())
+        .split_for_parts();
+    let api = api.layer(axum::Extension(Arc::new(catalog::spec(contract))));
     Router::new()
         .nest("/v1", api)
         .layer(middleware::from_fn_with_state(app.clone(), authorize))

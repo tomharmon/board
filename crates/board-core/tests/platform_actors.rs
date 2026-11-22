@@ -1,7 +1,7 @@
 use anyhow::Result;
 use board_local::{
     Board,
-    automation::{ClaimTarget, TaskTarget, claim, create_task, get_task},
+    automation::{TaskTarget, claim, create_task, get_task},
     errors::classify,
     sources::{Envelope, Provider},
 };
@@ -32,13 +32,7 @@ fn an_authoritative_source_edit_names_the_editor_and_holds_another_actors_claim(
     }
     assert_eq!(b.get(root.id)?.revision, root.revision);
     create_task(&b, &root.actor, TaskTarget::Existing(root.id), &[], None)?;
-    let t = claim(
-        &b,
-        &root.actor,
-        ClaimTarget::Id(root.id),
-        300,
-        &Default::default(),
-    )?;
+    let t = claim(&b, &root.actor, root.id, 300)?;
     assert_eq!(t.state, "claimed");
     let editor = "source:incoming/moderator";
     let before = b.cursor()?;

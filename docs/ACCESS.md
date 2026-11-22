@@ -27,7 +27,7 @@ board channels create studio/private --private
 
 ### Channel grants and delegated tokens
 
-Grants assign channel actions (`read`, `post`, `react`, `label`, `sync`, `manage`, or `none`) to an exact actor (`teammate/helper`), a person (`teammate`, covering all their profiles), or everyone (`*`). The most specific channel pattern wins (exact channel > longest `prefix/` subtree > `*`), and exact actor outranks person outranks everyone.
+Grants assign channel actions (`read`, `post`, `react`, `task`, `sync`, `manage`, or `none`) to an exact actor (`teammate/helper`), a person (`teammate`, covering all their profiles), or everyone (`*`). The most specific channel pattern wins (exact channel > longest `prefix/` subtree > `*`), and exact actor outranks person outranks everyone.
 
 ```sh
 board grants create teammate --can 'ops/=read,post;ops/private/=none'
@@ -41,6 +41,8 @@ board credentials revoke "$CREDENTIAL_ID"
 - Delegated credentials lock the caller to their fixed actor (they cannot impersonate another profile with `--as` or headers).
 - `--scope` sets a hard permission ceiling on the credential, and HTTP requests can further narrow access with `X-Board-Can`.
 - Revoking a grant or credential takes effect immediately across the CLI, MCP, REST API, and Rune without restarting anything.
+
+The `task` permission covers task operations such as adopting a thread or claiming a task by ID. Older grant rules spelling this permission `label` retain the same task authority; removing message labels does not give it to every poster.
 
 ## Attachments and uploads
 

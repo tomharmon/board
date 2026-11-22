@@ -1,9 +1,6 @@
+use super::client::Client;
 use serde_json::{Value, json};
-use std::{
-    io::{BufRead, BufReader, Write},
-    path::Path,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-};
+use std::{path::Path, process::Command};
 
 fn board(db: &Path) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_board"));
@@ -28,40 +25,39 @@ fn invalid_identity_defaults_never_fall_back_to_the_chat_actor() {
         assert!(!out.status.success(), "{key}");
     }
 }
-struct Mcp {
-    child: Child,
-    input: Option<ChildStdin>,
-    output: BufReader<ChildStdout>,
-    seq: u64,
+fn connect(cmd: Command, mode: Option<&str>) -> Client {
+    let mut client = Client::spawn(cmd, mode);
+    client.initialize();
+    client
 }
 
 #[test]
 fn named_workers_verify_a_revision_and_resolve_a_decision_without_tasks_or_leases() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("workflow.sqlite");
-    let mut chat = Mcp::open(board(&db));
+    let mut chat = connect(board(&db), None);
     chat.tool(
         "swarm_start",
-        json!({"goal":"Verify revision","slug":"audit"}),
+        json!({"channel":"release","goal":"Verify revision","slug":"audit"}),
         true,
     );
     let root = chat.tool(
         "board_post",
-        json!({"channel":"swarms/audit","text":"Review the Unicode fix"}),
+        json!({"channel":"code","text":"Review the Unicode fix"}),
         true,
     )["id"]
         .clone();
     for name in ["impl", "verify"] {
         chat.tool(
             "swarm_add",
-            json!({"run":"audit","name":name,"brief":format!("Own your slice on #{root}")}),
+            json!({"run":"audit","name":name,"thread_id":root,"brief":"Review the fix"}),
             true,
         );
     }
     let worker = |name| {
         let mut command = board(&db);
         command.args(["--worker", name]);
-        Mcp::open(command)
+        connect(command, None)
     };
     let mut implementer = worker("audit/impl");
     let mut verifier = worker("audit/verify");
@@ -104,70 +100,32 @@ fn named_workers_verify_a_revision_and_resolve_a_decision_without_tasks_or_lease
     assert!(!create.status.success());
     assert!(String::from_utf8_lossy(&create.stderr).contains("swarm_stopped"));
 }
-impl Mcp {
-    fn full(cmd: Command) -> Self {
-        Self::with_args(cmd, &["--full"])
-    }
-    fn open(cmd: Command) -> Self {
-        Self::with_args(cmd, &[])
-    }
-    fn with_args(mut cmd: Command, args: &[&str]) -> Self {
-        let mut child = cmd
-            .arg("mcp")
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let input = child.stdin.take();
-        let output = BufReader::new(child.stdout.take().unwrap());
-        let mut m = Self {
-            child,
-            input,
-            output,
-            seq: 0,
-        };
-        assert_eq!(
-            m.rpc("initialize", json!({}))["serverInfo"]["name"],
-            "board-mcp"
-        );
-        m
-    }
-    fn rpc(&mut self, method: &str, params: Value) -> Value {
-        self.seq += 1;
-        writeln!(
-            self.input.as_mut().unwrap(),
-            "{}",
-            json!({"jsonrpc":"2.0","id":self.seq,"method":method,"params":params})
-        )
-        .unwrap();
-        let mut line = String::new();
-        self.output.read_line(&mut line).unwrap();
-        let frame: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(frame["id"], self.seq);
-        frame["result"].clone()
-    }
-    fn tool(&mut self, name: &str, args: Value, ok: bool) -> Value {
-        let v = self.rpc("tools/call", json!({"name":name,"arguments":args}));
-        assert_eq!(v["isError"], !ok, "{name}: {v}");
-        serde_json::from_str(v["content"][0]["text"].as_str().unwrap()).unwrap()
-    }
-}
-impl Drop for Mcp {
-    fn drop(&mut self) {
-        drop(self.input.take());
-        let _ = self.child.wait();
-    }
-}
 
 #[test]
 fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("portable.sqlite");
-    let mut boss = Mcp::full(board(&db));
+    let board_db = board_local::Board::open(&db).unwrap();
+    let library = board_db.role_library_as("ada");
+    {
+        let files = tempfile::tempdir().unwrap();
+        let skill = files.path().join("release-check");
+        std::fs::create_dir_all(skill.join("references")).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "---\nname: release-check\ndescription: Check a release\n---\nRead references/checks.md").unwrap();
+        std::fs::write(
+            skill.join("references/checks.md"),
+            "Check the pinned revision.",
+        )
+        .unwrap();
+        library.skill_import(&skill).unwrap();
+        library
+            .role_attach_skill("verifier", "release-check")
+            .unwrap();
+    }
+    let mut boss = connect(board(&db), Some("--full"));
     boss.tool(
         "swarm_start",
-        json!({"slug":"sample","goal":"Ship a portable brief"}),
+        json!({"slug":"sample","channel":"shipping","goal":"Ship a portable brief"}),
         true,
     );
     let register = |name, role| json!({"run":"sample","name":name,"role":role,"brief":"Check only your slice"});
@@ -177,12 +135,15 @@ fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
     boss.tool("swarm_add", register("build", "implementer"), true);
     assert!(!tmp.path().join("portable.sqlite.data").exists());
     assert_eq!(
-        boss.tool("worker_assignment", json!({}), false)["code"],
-        "worker_binding_required"
+        boss.request(
+            "tools/call",
+            json!({"name":"worker_assignment","arguments":{}})
+        )["error"]["code"],
+        -32602
     );
     let mut cmd = board(&db);
     cmd.args(["--worker", "sample/check"]);
-    let mut worker = Mcp::full(cmd);
+    let mut worker = connect(cmd, Some("--full"));
     let assignment = worker.tool("worker_assignment", json!({}), true);
     assert_eq!(assignment["goal"], "Ship a portable brief");
     assert_eq!(assignment["worker"]["brief"], "Check only your slice");
@@ -200,6 +161,31 @@ fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
         worker.tool("worker_assignment", json!({}), true),
         assignment
     );
+    library.delete_skill_bundle("release-check", true).unwrap();
+    let file = worker.tool(
+        "worker_assignment",
+        json!({"skill":"release-check","path":"references/checks.md"}),
+        true,
+    );
+    let via_cli = board(&db)
+        .args([
+            "--worker",
+            "sample/check",
+            "swarm",
+            "assignment",
+            "--skill",
+            "release-check",
+            "--path",
+            "references/checks.md",
+        ])
+        .output()
+        .unwrap();
+    assert!(via_cli.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&via_cli.stdout).unwrap(),
+        file
+    );
+    assert_eq!(file["text"], "Check the pinned revision.");
     let read = worker.tool(
         "worker_assignment",
         json!({"skill":"board-verifier","path":"SKILL.md"}),
@@ -217,12 +203,21 @@ fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
         false,
     );
     worker.tool("worker_assignment", json!({"name":"build"}), false);
-    worker.tool("swarm_check_in",json!({"compact":true,"model":"example-model","workspace_mode":"isolated","session_ref":"test:session-1"}),true);
+    worker.tool(
+        "swarm_check_in",
+        json!({"model":"example-model","workspace_mode":"isolated","session_ref":"test:session-1"}),
+        true,
+    );
     let status = boss.tool("swarm_status", json!({"run":"sample"}), true);
     assert_eq!(status["workers"][0]["session_ref"], "test:session-1");
     assert_eq!(status["workers"][0]["model"], "example-model");
     assert_eq!(status["workers"][0]["workspace_mode"], "isolated");
     assert!(status["workers"][1].get("model").is_none());
+    worker.tool("swarm_check_in", json!({}), true);
+    assert_eq!(
+        boss.tool("swarm_status", json!({"run":"sample"}), true)["workers"][0]["model"],
+        "example-model"
+    );
     worker.tool("swarm_check_in", json!({"model":"contains\nbreak"}), false);
     worker.tool(
         "swarm_check_in",
@@ -238,39 +233,27 @@ fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
 fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("board test.sqlite3");
-    let mut chat = Mcp::open(board(&db));
+    let mut chat = connect(board(&db), None);
     chat.tool(
         "swarm_start",
-        json!({"goal":"Check two roles","slug":"release"}),
+        json!({"channel":"release","goal":"Check two roles","slug":"release","repo_root":"/workspace/release"}),
         true,
     );
     chat.tool(
         "swarm_start",
-        json!({"goal":"Other run","slug":"other"}),
+        json!({"channel":"release","goal":"Other run","slug":"other"}),
         true,
     );
     for (name, role) in [("build", "implementer"), ("check", "verifier")] {
         let spawn = chat.tool(
             "swarm_add",
-            json!({"run":"release","name":name,"role":role,"brief":"Test the saved revision","export_local":true}),
+            json!({"run":"release","name":name,"role":role,"brief":"Test the saved revision"}),
             true,
         );
         let actor = format!("ada/{name}");
         let selector = format!("release/{name}");
-        assert_eq!(spawn["env_vars"]["BOARD_WORKER"], selector);
-        assert!(spawn["env_vars"].get("BOARD_TOKEN").is_none());
+        assert_eq!(spawn["selector"], selector);
         let prefix: Vec<String> = serde_json::from_value(spawn["cli_args"].clone()).unwrap();
-        assert!(
-            spawn["assembled_prompt"]
-                .as_str()
-                .unwrap()
-                .contains("--worker")
-        );
-        assert!(
-            Path::new(spawn["skills_dir"].as_str().unwrap())
-                .join(format!("board-{role}/SKILL.md"))
-                .is_file()
-        );
         // Subagents can inherit the entire coordinator environment and no child overrides.
         let scoped = || {
             let mut c = board(&db);
@@ -280,6 +263,31 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
                 .env("BOARD_USER", "other-person");
             c
         };
+        let assignment = scoped().args(["swarm", "assignment"]).output().unwrap();
+        assert!(assignment.status.success());
+        let assignment: Value = serde_json::from_slice(&assignment.stdout).unwrap();
+        assert_eq!(assignment["repo_root"], "/workspace/release");
+        assert_eq!(assignment["worker"]["actor"], actor);
+        assert_eq!(assignment["worker"]["brief"], "Test the saved revision");
+        let file = scoped()
+            .args([
+                "swarm",
+                "assignment",
+                "--skill",
+                &format!("board-{role}"),
+                "--path",
+                "SKILL.md",
+            ])
+            .output()
+            .unwrap();
+        assert!(file.status.success());
+        assert!(
+            serde_json::from_slice::<Value>(&file.stdout).unwrap()["text"]
+                .as_str()
+                .unwrap()
+                .contains("description:")
+        );
+        assert!(!tmp.path().join("board test.sqlite3.data").exists());
         let who = scoped().arg("whoami").output().unwrap();
         let who: Value = serde_json::from_slice(&who.stdout).unwrap();
         assert_eq!(who["actor"], actor);
@@ -307,8 +315,8 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
                 "{bad:?}"
             );
         }
-        let mut own = Mcp::open(scoped());
-        let advertised: Vec<_> = own.rpc("tools/list", json!({}))["tools"]
+        let mut own = connect(scoped(), None);
+        let advertised: Vec<_> = own.request("tools/list", json!({}))["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
@@ -330,12 +338,13 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
         }
         assert_eq!(advertised.len(), 5);
         let assignment = own.tool("worker_assignment", json!({}), true);
+        assert_eq!(assignment["repo_root"], "/workspace/release");
         assert_eq!(assignment["worker"]["actor"], actor);
         assert_eq!(assignment["worker"]["name"], name);
         own.tool("swarm_observe", json!({"run":"other"}), false);
         own.tool(
             "board_post",
-            json!({"channel":"swarms/release","text":"using a dedicated connection"}),
+            json!({"channel":"release","text":"using a dedicated connection"}),
             true,
         );
     }
@@ -356,7 +365,7 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
         );
         serde_json::from_slice::<Value>(&out.stdout).unwrap()
     };
-    run(&["grants", "create", "ada", "--can", "swarms/release=all"]);
+    run(&["grants", "create", "ada", "--can", "release=all"]);
     let key = run(&["credentials", "issue", "ada/build"]);
     let token = key["token"].as_str().unwrap();
     let scoped = |selector: &str| {
@@ -370,7 +379,7 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
     assert!(!scoped("release/check").status.success());
     let shared = chat.tool(
         "board_post",
-        json!({"channel":"swarms/release","text":"Still the coordinator"}),
+        json!({"channel":"release","text":"Still the coordinator"}),
         true,
     );
     assert_eq!(shared["actor"], "ada");

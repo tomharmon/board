@@ -10,7 +10,6 @@ mod sources;
 mod swarms;
 mod task_drafts;
 mod templates;
-mod video;
 mod workspace;
 pub use browse::{Browse, Position};
 pub use compose_keys::markdown_key;
@@ -21,10 +20,9 @@ pub use people::People;
 pub use roles::{RoleConfirm, RoleMode};
 pub use swarms::{FeedKind, SwarmTab, SwarmTarget};
 pub use templates::SchemaPart;
-pub use video::Clip;
 pub use workspace::{ActivityMode, Desk, TaskCommand};
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -72,7 +70,6 @@ impl Page {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Property {
-    Labels,
     Reactions,
     Body,
 }
@@ -82,12 +79,9 @@ pub struct Properties {
     pub revision: i64,
     pub property: Property,
     pub edit: TextEdit,
-    pub label_key: TextEdit,
-    pub label_value: TextEdit,
     pub reaction: TextEdit,
     pub confirm_delete: bool,
     pub deliveries: Vec<board_local::sources::DeliveryNotice>,
-    labels_at_open: BTreeMap<String, String>,
 }
 
 impl Properties {
@@ -95,21 +89,12 @@ impl Properties {
         Self {
             id: message.id,
             revision: message.revision,
-            property: Property::Labels,
+            property: Property::Reactions,
             edit: TextEdit::new(&message.text),
-            label_key: TextEdit::new(""),
-            label_value: TextEdit::new(""),
             reaction: TextEdit::new(""),
             confirm_delete: false,
             deliveries: Vec::new(),
-            labels_at_open: message.labels.clone(),
         }
-    }
-
-    pub fn select_label(&mut self, key: &str, value: &str) {
-        self.label_key = TextEdit::new(key);
-        self.label_value = TextEdit::new(value);
-        self.labels_at_open.insert(key.to_owned(), value.to_owned());
     }
 }
 
@@ -146,7 +131,6 @@ pub struct State {
     pub properties: Option<Properties>,
     pub preview: Option<AttachmentPreview>,
     pub raw_blocks: HashSet<(i64, usize)>,
-    pub builtin_evidence: HashSet<&'static str>,
     pub expanded_checks: HashSet<(i64, usize, usize)>,
     pub patch_lines: HashMap<(i64, usize), usize>,
     pub delivery: Delivery,
@@ -173,10 +157,23 @@ impl State {
     }
 
     pub fn open() -> Self {
-        Self::opened(Self::connect())
+        Self::opened(Self::connect(), local::actor_name(), Layout::load())
     }
 
-    fn opened(connection: Result<(Board, Option<String>)>) -> Self {
+    #[cfg(test)]
+    fn test_board(board: Board, bound_actor: Option<&str>) -> Self {
+        Self::opened(
+            Ok((board, bound_actor.map(str::to_owned))),
+            "reader".into(),
+            Layout::default(),
+        )
+    }
+
+    fn opened(
+        connection: Result<(Board, Option<String>)>,
+        local_actor: String,
+        layout: Layout,
+    ) -> Self {
         let (board, identity, error) = match connection {
             Ok((b, actor)) => (Some(b), actor, None),
             Err(e) => (None, None, Some(format!("{e:#}"))),
@@ -186,7 +183,7 @@ impl State {
             error,
             delegated: identity.is_some(),
             access_blocked: false,
-            actor: identity.unwrap_or_else(local::actor_name),
+            actor: identity.unwrap_or(local_actor),
             desk: Desk::default(),
             history: Vec::new(),
             page: Page::Feed,
@@ -213,7 +210,6 @@ impl State {
             properties: None,
             preview: None,
             raw_blocks: HashSet::new(),
-            builtin_evidence: HashSet::new(),
             expanded_checks: HashSet::new(),
             patch_lines: HashMap::new(),
             delivery: Delivery::default(),
@@ -222,7 +218,7 @@ impl State {
             feed_size: 50,
             older: None,
             nav: false,
-            layout: Layout::load(),
+            layout,
             version: -1,
             next_poll: 0.0,
         };
@@ -273,18 +269,6 @@ impl State {
         let db = self.board.as_ref().context("Database is not open")?;
         // Sample before reading: a concurrent writer during the load forces another refresh.
         let version = db.data_version()?;
-        if self.version < 0 {
-            // Schema versions are immutable. An upgraded board can own either name itself.
-            for name in ["verdict", "diff"] {
-                match db.schema(name, 1) {
-                    Ok(s) if s.built_in => {
-                        self.builtin_evidence.insert(name);
-                    }
-                    Err(e) if classify(&e).0 != Kind::Missing => return Err(e),
-                    _ => (),
-                }
-            }
-        }
         let mut hide_draft = false;
         let mut hide_task = false;
         if self.delegated
@@ -334,9 +318,7 @@ impl State {
         filter.channel = if has_feed { self.channel.clone() } else { None };
         filter.text =
             (!self.query.text.trim().is_empty()).then(|| self.query.text.trim().to_owned());
-        if self.tasks_only && has_feed {
-            filter.labels.insert("board.task".into(), String::new());
-        }
+        filter.tasks_only = self.tasks_only && has_feed;
         let before = self.starts.last().copied();
         let (threads, activity_messages, older) = if has_feed && self.is_timeline() {
             let window = db.messages_window(&filter, before, self.feed_size)?;
@@ -660,12 +642,6 @@ impl State {
             Err(e) => self.error = Some(e.to_string()),
         }
     }
-    pub fn has_visible_label(&self, id: i64, key: &str, value: &str) -> bool {
-        self.db()
-            .and_then(|db| db.get(id))
-            .is_ok_and(|m| !m.deleted && m.labels.get(key).is_some_and(|v| v == value))
-    }
-
     pub fn close_properties(&mut self, tx: &mut Tx) {
         if let Some(p) = self.properties.take() {
             let key = format!("inspect-{}", p.id);
@@ -691,34 +667,6 @@ impl State {
             Err(e) => {
                 self.error = Some(format!("{e:#}"));
                 None
-            }
-        }
-    }
-
-    pub fn change_label(&mut self, remove: bool) {
-        let changed = self.property_write(|b, actor, p| {
-            let k = p.label_key.text.trim().to_owned();
-            let mut set = BTreeMap::new();
-            let mut unset = Vec::new();
-            if remove {
-                unset.push(k.clone());
-            } else {
-                set.insert(k.clone(), p.label_value.text.clone());
-            }
-            b.labels(
-                p.id,
-                actor,
-                &set,
-                &unset,
-                &[(k.clone(), p.labels_at_open.get(&k).cloned())].into(),
-            )
-        });
-        if let (Some(m), Some(p)) = (changed, &mut self.properties) {
-            let k = p.label_key.text.trim();
-            if let Some(value) = m.labels.get(k) {
-                p.labels_at_open.insert(k.to_owned(), value.clone());
-            } else {
-                p.labels_at_open.remove(k);
             }
         }
     }
@@ -756,28 +704,17 @@ impl State {
         }) = &mut self.preview
         {
             let changed = m.poll(now, tx);
-            if changed && !video::visible(self.board.as_ref(), *message, file.id) {
+            if changed
+                && !self.board.as_ref().is_some_and(|db| {
+                    db.get(*message)
+                        .is_ok_and(|m| !m.deleted && m.attachments.iter().any(|a| a.id == file.id))
+                })
+            {
                 self.preview = None;
                 self.refresh();
                 return true;
             }
             changed
-        } else if let Some(AttachmentPreview {
-            content: Preview::Clip(clip),
-            message,
-            file,
-        }) = &mut self.preview
-        {
-            match clip.poll(now, tx, || {
-                video::visible(self.board.as_ref(), *message, file.id)
-            }) {
-                Some(changed) => changed,
-                None => {
-                    self.preview = None;
-                    self.refresh();
-                    return true;
-                }
-            }
         } else {
             false
         };
@@ -837,10 +774,7 @@ impl State {
         }
         match db.data_version() {
             Ok(version) if version == self.version => {
-                self.desk.swarm.refresh_waiters()
-                    || frame_changed
-                    || draft_update
-                    || length != self.typing.len()
+                frame_changed || draft_update || length != self.typing.len()
             }
             Ok(_) => {
                 self.refresh();

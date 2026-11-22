@@ -553,37 +553,8 @@ fn message(
     if let Some(at) = m.edited_at.as_deref().filter(|_| !m.deleted) {
         content = content.child(mono(format!("Edited {} UTC", stamp(at)), MUTED));
     }
-    if m.labels.keys().any(|k| k != "board.task") || !m.reactions.is_empty() {
+    if !m.reactions.is_empty() {
         let mut chips = row().w_full().flex_wrap().center_y().gap(4.).pt(4.);
-        for (i, (k, v)) in m
-            .labels
-            .iter()
-            .filter(|(k, _)| k.as_str() != "board.task")
-            .enumerate()
-        {
-            let key = k.clone();
-            chips = chips.child(
-                click(
-                    chip(format!("{k}={v}")).key(format!("{p}label-chip-{id}-{i}")),
-                    &format!("Edit {k}"),
-                )
-                .on_press_tx(move |s: &mut State, tx| {
-                    if at_message(s, id, from_feed) {
-                        s.open_properties(id);
-                        if let Some(value) = s
-                            .thread
-                            .iter()
-                            .find(|m| m.id == id)
-                            .and_then(|m| m.labels.get(&key))
-                            && let Some(editor) = &mut s.properties
-                        {
-                            editor.select_label(&key, value);
-                        }
-                        tx.focus_when_shown("label-value", true);
-                    }
-                }),
-            );
-        }
         for (i, (name, actors)) in m.reactions.iter().enumerate() {
             let name = name.clone();
             let mine = actors.contains(&s.actor);

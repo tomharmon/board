@@ -1,7 +1,7 @@
 use serde_json::Value;
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::{Child, Command, Output, Stdio},
     thread,
     time::{Duration, Instant},
@@ -48,8 +48,13 @@ fn cli_checkin_handoff_verification_and_operator_decision_form_one_receipt() {
         ],
     );
     let started = b.get("verify", &["swarm", "check-in"]);
-    assert_eq!(started["workers"][1]["status"], "working");
-    assert!(started["workers"][1]["launch_error"].is_null());
+    assert_eq!(
+        started,
+        json!({"actor":"operator/verify","run":"sample","worker":"verify","status":"working"})
+    );
+    let roster = b.get("", &["swarm", "status"]);
+    assert_eq!(roster["workers"][1]["status"], "working");
+    assert!(roster["workers"][1]["launch_error"].is_null());
     let post = |who, schema, data: Value| {
         b.get(
             who,
@@ -64,7 +69,19 @@ fn cli_checkin_handoff_verification_and_operator_decision_form_one_receipt() {
         )
     };
     let revision = json!({"kind":"git-commit","value":"a".repeat(40)});
-    let task = b.get("", &["tasks", "create", "swarms/sample", "Fix split"])["id"].clone();
+    let task = b.get("", &["tasks", "create", "engineering", "Fix split"])["id"].clone();
+    b.get(
+        "",
+        &[
+            "swarm",
+            "add",
+            "reviewer",
+            "--brief",
+            "Track the fix",
+            "--thread",
+            &task.to_string(),
+        ],
+    );
     let h = post(
         "impl",
         "handoff@1",
@@ -132,7 +149,15 @@ impl TestBoard {
     fn start(&self) {
         self.get(
             "",
-            &["swarm", "start", "Verify the behavior", "--slug", "sample"],
+            &[
+                "swarm",
+                "start",
+                "Verify the behavior",
+                "--slug",
+                "sample",
+                "--channel",
+                "engineering",
+            ],
         );
         for name in ["impl", "verify"] {
             let w = self.get(
@@ -147,12 +172,7 @@ impl TestBoard {
                     "Use a disposable file.",
                 ],
             );
-            assert_eq!(w["env_vars"]["BOARD_PROFILE"], name);
-            assert!(
-                Path::new(w["skills_dir"].as_str().unwrap())
-                    .join("board-implementer/SKILL.md")
-                    .is_file()
-            );
+            assert_eq!(w["worker"]["name"], name);
         }
     }
     fn wait(&self, who: &str) -> WaitChild {
@@ -166,13 +186,16 @@ impl TestBoard {
         let start = Instant::now();
         loop {
             let s = self.get("", &["swarm", "status"]);
-            if s["workers"].as_array().unwrap().iter().any(|w| {
-                w["name"] == who && w["status"] == "waiting" && w["waiter_pid"] == child.id()
-            }) {
+            if s["workers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["name"] == who && w["status"] == "working")
+            {
                 return child;
             }
             if start.elapsed() >= Duration::from_secs(8) {
-                panic!("wait did not register: {s}");
+                panic!("worker did not check in: {s}");
             }
             thread::sleep(Duration::from_millis(25));
         }
@@ -379,14 +402,11 @@ fn actual_git_diff_and_verdict_roundtrip() {
             "post",
             "--diff",
             "@verify ready to inspect",
-            "--label",
-            "phase=review",
             "--idempotency-key",
             "diff-first-key",
         ],
     );
     assert_eq!(diff_first["notified"], serde_json::json!(["verify"]));
-    assert_eq!(diff_first["message"]["labels"]["phase"], "review");
     assert_eq!(diff_first["message"]["blocks"][0]["schema"], "diff");
     let retry = b.get(
         "impl",
@@ -438,7 +458,7 @@ fn actual_git_diff_and_verdict_roundtrip() {
 }
 #[cfg(unix)]
 #[test]
-fn interrupted_wait_clears_live_pid() {
+fn interrupted_wait_leaves_the_checked_in_roster_unchanged() {
     let b = TestBoard::new();
     b.start();
     let child = b.wait("impl");
@@ -454,7 +474,7 @@ fn interrupted_wait_clears_live_pid() {
         .find(|w| w["name"] == "impl")
         .unwrap();
     assert_eq!(w["status"], "working");
-    assert!(w["waiter_pid"].is_null());
+    assert!(w.get("waiter_pid").is_none());
 }
 
 #[test]

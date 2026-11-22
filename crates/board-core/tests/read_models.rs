@@ -45,8 +45,7 @@ fn compare(b: &Board) -> Result<()> {
     Ok(())
 }
 #[test]
-fn v11_upgrade_and_independent_mutations_keep_indexed_read_models_equal_to_the_message_fold()
--> Result<()> {
+fn independent_mutations_keep_indexed_read_models_equal_to_the_message_fold() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("projection.db");
     let b = Board::open(&path)?;
@@ -77,12 +76,6 @@ fn v11_upgrade_and_independent_mutations_keep_indexed_read_models_equal_to_the_m
     b.delete(roots[0], "writer", None)?;
     let head = b.cursor()?;
     drop(b);
-    let fixture = rusqlite::Connection::open(&path)?;
-    fixture.execute_batch(
-        "DROP TRIGGER activity_on_post; DROP TRIGGER activity_on_tombstone;
-        DROP TABLE thread_activity; DROP TABLE channel_activity; PRAGMA user_version=11;",
-    )?;
-    drop(fixture);
     let b = Board::open(&path)?;
     let writer = Board::open(&path)?;
     assert_eq!(b.cursor()?, head, "building read indexes published events");

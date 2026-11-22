@@ -18,6 +18,7 @@ pub struct GrantSpec {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct GrantInput {
     pub subject: Option<String>,
     pub subjects: Option<Vec<String>>,

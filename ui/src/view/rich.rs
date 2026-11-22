@@ -63,7 +63,6 @@ fn mark_fences(m: &Message) -> (String, HashMap<String, usize>) {
 struct Display {
     block: Block,
     raw: bool,
-    builtin_evidence: bool,
     checks: HashSet<usize>,
     lines: usize,
 }
@@ -115,9 +114,7 @@ fn structured(prefix: &str, id: i64, index: usize, display: &Display) -> El {
             .wrap_anywhere()
             .selectable(true),
         );
-    } else if display.builtin_evidence
-        && let Some(evidence) = evidence::card(prefix, id, index, display)
-    {
+    } else if let Some(evidence) = evidence::card(prefix, id, index, display) {
         panel = panel.child(evidence);
     } else if let Some(fields) = b.data.as_object() {
         if fields.is_empty() {
@@ -250,7 +247,6 @@ pub(super) fn scoped_body(s: &State, m: &Message, prefix: &'static str) -> El {
             .map(|(i, b)| Display {
                 block: b.clone(),
                 raw: s.raw_blocks.contains(&(m.id, i)),
-                builtin_evidence: b.version == 1 && s.builtin_evidence.contains(b.schema.as_str()),
                 checks: s
                     .expanded_checks
                     .iter()

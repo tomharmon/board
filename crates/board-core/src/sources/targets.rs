@@ -55,24 +55,6 @@ pub struct ThreadLink {
     pub root: i64,
 }
 
-// Recover the publication boundary on early v12 databases. Do not erase a confirmed
-// receipt or claim that a send already in flight never reached the provider.
-pub(super) fn migrate_joins(c: &Connection) -> Result<()> {
-    if !c.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('sync_explicit_joins') WHERE name='joined_at')", [], |r| r.get::<_, bool>(0))? {
-        c.execute_batch("ALTER TABLE sync_explicit_joins ADD COLUMN joined_at INTEGER NOT NULL DEFAULT 0;
-            UPDATE sync_explicit_joins AS j SET joined_at=coalesce(
-                (SELECT min(e.cursor) FROM events e JOIN sync_threads t ON t.root=e.message_id
-                 WHERE t.source=j.source AND t.thread=j.thread AND e.kind='thread.sync_requested'
-                 AND json_extract(e.payload,'$.source')=j.source AND json_extract(e.payload,'$.thread')=j.thread),
-                (SELECT coalesce(max(cursor),0) FROM events));
-            UPDATE sync_queue AS q SET state='skipped',receipt=NULL,deadline=NULL,error='message predates thread join'
-                WHERE direction='out' AND state IN ('pending','leased') AND EXISTS(
-                SELECT 1 FROM sync_explicit_joins j WHERE j.source=q.source AND j.thread=q.thread
-                AND json_extract(q.payload,'$.message')<=j.joined_at);")?;
-    }
-    Ok(())
-}
-
 impl Board {
     pub fn source_thread_link(&self, who: &str, name: &str, thread: &str) -> Result<ThreadLink> {
         let tx = self.conn.unchecked_transaction()?;

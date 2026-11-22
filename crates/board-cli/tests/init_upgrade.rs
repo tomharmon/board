@@ -6,8 +6,6 @@ use std::{
 };
 use tempfile::TempDir;
 
-const PREVIOUS: &str = include_str!("fixtures/coordinator-v15.md");
-const CURRENT: &[u8] = include_bytes!("../assets/board-swarm-SKILL.md");
 const BOARD: &str = env!("CARGO_BIN_EXE_board");
 
 struct Home {
@@ -93,22 +91,9 @@ fn success(o: Output) -> Value {
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     serde_json::from_slice(&o.stdout).unwrap()
 }
-fn backups(file: &Path) -> Vec<Vec<u8>> {
-    let skills = file.parent().unwrap().parent().unwrap();
-    fs::read_dir(skills)
-        .unwrap()
-        .map(Result::unwrap)
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with(".board-skill-backup-")
-        })
-        .map(|e| fs::read(e.path().join("coordinator.previous")).unwrap())
-        .collect()
-}
 
 #[test]
-fn init_preserves_an_explicit_queue_or_full_catalog() {
+fn init_leaves_retired_queue_configuration_untouched_and_accepts_full_catalog() {
     let h = Home::new();
     write(
         &h.codex.join("config.toml"),
@@ -122,7 +107,7 @@ fn init_preserves_an_explicit_queue_or_full_catalog() {
     let full =
         json!({"mcpServers":{"board":{"command":BOARD,"args":["mcp","--full"]}}}).to_string();
     write(&path, full.as_bytes());
-    success(h.init("codex", false));
+    assert!(!h.init("codex", false).status.success());
     success(h.init("claude", false));
     assert_eq!(fs::read_to_string(path).unwrap(), full);
     assert!(
@@ -133,59 +118,63 @@ fn init_preserves_an_explicit_queue_or_full_catalog() {
 }
 
 #[test]
-fn init_upgrades_exact_stock_in_place_and_retains_old_bytes() {
+fn stock_install_upgrades_only_receipted_unchanged_instructions() {
+    use sha2::{Digest, Sha256};
     let h = Home::new();
-    let slot = h.claude.join("skills/board-swarm/SKILL.md");
-    write(&slot, PREVIOUS.as_bytes());
-    let plan = success(h.init("claude", true));
-    assert_eq!(plan["harnesses"][0]["skill"], "would-upgrade");
-    assert_eq!(fs::read(&slot).unwrap(), PREVIOUS.as_bytes());
-    assert!(backups(&slot).is_empty());
-    let upgraded = success(h.init("claude", false));
-    assert_eq!(upgraded["harnesses"][0]["skill"], "upgraded");
-    assert_eq!(fs::read(&slot).unwrap(), CURRENT);
-    assert_eq!(backups(&slot), [PREVIOUS.as_bytes()]);
-    let current = success(h.init("claude", false));
-    assert_eq!(current["harnesses"][0]["skill"], "unchanged");
-    assert_eq!(backups(&slot).len(), 1);
+    let slot = h.new_codex();
+    let old = "Previous stock instructions\n";
+    let previous = format!(
+        "{old}\n<!-- board-installed-sha256: {:x} -->\n",
+        Sha256::digest(old.as_bytes())
+    );
+    let previous_crlf = previous.replace('\n', "\r\n");
+    write(&slot, previous_crlf.as_bytes());
+    assert_eq!(
+        success(h.init("codex", true))["harnesses"][0]["skill"],
+        "would-upgrade"
+    );
+    assert_eq!(fs::read_to_string(&slot).unwrap(), previous_crlf);
+    let upgraded = success(h.call(&["skill", "install", "codex"]));
+    assert_eq!(upgraded["status"], "upgraded");
+    let installed = fs::read_to_string(&slot).unwrap();
+    assert!(
+        installed
+            .starts_with(&include_str!("../assets/board-swarm-SKILL.md").replace("\r\n", "\n"))
+    );
+    assert!(installed.contains("<!-- board-installed-sha256: "));
+    assert_eq!(
+        success(h.init("codex", false))["harnesses"][0]["skill"],
+        "unchanged"
+    );
+
+    for custom in [
+        old.to_owned(), // A file from an unmarked installation is not Board-owned.
+        previous.replace("Previous", "My own"),
+        previous.replace("sha256:", "malformed:"),
+        previous.trim_end_matches(" -->\n").to_owned(),
+    ] {
+        write(&slot, custom.as_bytes());
+        assert_eq!(
+            success(h.init("codex", false))["harnesses"][0]["skill"],
+            "customized"
+        );
+        assert!(!h.call(&["skill", "install", "codex"]).status.success());
+        assert_eq!(fs::read_to_string(&slot).unwrap(), custom);
+    }
 }
 
 #[test]
-fn direct_installer_migrates_legacy_codex_without_leaving_another_active_skill() {
+fn installer_leaves_custom_bundles_and_unrelated_directories_alone() {
     let h = Home::new();
-    let old = h.dir.path().join(".codex/skills/board-swarm/SKILL.md");
-    let crlf = PREVIOUS.replace("\r\n", "\n").replace('\n', "\r\n");
-    write(&old, crlf.as_bytes());
-    let installed = success(h.call(&["skill", "install", "codex"]));
-    assert_eq!(installed["status"], "upgraded");
-    assert!(!old.exists());
-    assert_eq!(fs::read(h.new_codex()).unwrap(), CURRENT);
-    assert_eq!(backups(&old), [crlf.as_bytes()]);
-    let again = success(h.init("codex", false));
-    assert_eq!(again["harnesses"][0]["skill"], "unchanged");
-    assert!(!old.exists());
-}
-
-#[test]
-fn ambiguous_or_customized_legacy_bundles_require_manual_resolution() {
-    let h = Home::new();
-    let old = h.codex.join("skills/board-swarm/SKILL.md");
-    write(&old, b"my coordinator");
-    let direct = h.call(&["skill", "install", "codex"]);
-    assert!(!direct.status.success());
-    assert!(String::from_utf8_lossy(&direct.stderr).contains("custom legacy Codex skill"));
-    assert!(!h.init("codex", false).status.success());
+    let unrelated = h.codex.join("skills/board-swarm/SKILL.md");
+    write(&unrelated, b"unrelated instructions");
+    let notes = h.new_codex().with_file_name("notes.md");
+    write(&notes, b"custom bundle");
+    assert_eq!(
+        success(h.init("codex", false))["harnesses"][0]["skill"],
+        "customized"
+    );
     assert!(!h.new_codex().exists());
-    assert_eq!(fs::read(&old).unwrap(), b"my coordinator");
-    write(&old, PREVIOUS.as_bytes());
-    let notes = old.with_file_name("notes.txt");
-    write(&notes, b"user customization");
-    assert!(!h.call(&["skill", "install", "codex"]).status.success());
-    assert!(!h.new_codex().exists());
-    assert_eq!(fs::read(&notes).unwrap(), b"user customization");
-    write(&h.new_codex(), b"intentional new version");
-    assert!(!h.init("codex", true).status.success());
-    assert_eq!(fs::read(h.new_codex()).unwrap(), b"intentional new version");
-    assert_eq!(fs::read(&old).unwrap(), PREVIOUS.as_bytes());
-    assert!(backups(&old).is_empty());
+    assert_eq!(fs::read(notes).unwrap(), b"custom bundle");
+    assert_eq!(fs::read(unrelated).unwrap(), b"unrelated instructions");
 }

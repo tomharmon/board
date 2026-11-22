@@ -63,8 +63,6 @@ pub struct WriteOptions {
     pub no_sync: bool,
     #[command(flatten)]
     pub body: Body,
-    #[arg(long, value_name = "KEY=VALUE")]
-    pub label: Vec<String>,
     #[arg(long, value_name = "FILE")]
     pub attach: Vec<PathBuf>,
     /// Carry an existing upload by its ID or opaque key
@@ -90,8 +88,6 @@ pub struct Query {
     pub re: Option<i64>,
     #[arg(long, num_args=0..=1, default_missing_value="")]
     pub mentions: Option<String>,
-    #[arg(long, value_name = "KEY[=VALUE]")]
-    pub label: Vec<String>,
     #[arg(long)]
     pub after: Option<i64>,
 }
@@ -120,12 +116,9 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::skill_install::Skill,
     },
-    /// Serve the message board over MCP on stdin/stdout. Task queues are opt-in.
+    /// Serve the message board over MCP on stdin/stdout.
     Mcp {
-        /// Also expose the tools to claim, renew, release and settle queue work.
-        #[arg(long, conflicts_with = "full")]
-        queue: bool,
-        /// Expose the full compatibility catalog, subject to the same identity and grants.
+        /// Expose the extended tool catalog, subject to the same identity and grants.
         #[arg(long)]
         full: bool,
     },
@@ -146,11 +139,6 @@ pub enum Command {
     },
     /// Make a consistent SQLite backup to a new file, even while writers are active
     Backup { destination: PathBuf },
-    /// Recover data from a previous Board version.
-    Migrate {
-        #[command(subcommand)]
-        command: Migration,
-    },
     /// Show the local author handle and database
     Whoami,
     /// Describe this release's local API and capabilities without a running server
@@ -281,19 +269,6 @@ pub enum Command {
         #[arg(long)]
         remove: bool,
     },
-    /// Atomically set and remove labels, optionally checking previous values
-    Label {
-        #[arg(value_parser=crate::parse_id)]
-        id: i64,
-        #[arg(value_name = "KEY=VALUE")]
-        labels: Vec<String>,
-        #[arg(long)]
-        unset: Vec<String>,
-        #[arg(long = "if")]
-        conditions: Vec<String>,
-        #[arg(long)]
-        if_unset: Vec<String>,
-    },
     /// Extract an attachment by file ID (use - for stdout)
     Download { id: String, path: Option<PathBuf> },
     /// Store immutable attachment bytes for one or more posts
@@ -339,12 +314,6 @@ pub enum Command {
     #[command(flatten)]
     Automation(crate::automation_cli::Commands),
 }
-#[derive(Subcommand)]
-pub enum Migration {
-    /// Export archived pre-v16 schedules as JSON to stdout (local owner only; never sends).
-    ExportSchedules,
-}
-
 #[derive(Subcommand)]
 pub enum SchemaCommand {
     List,

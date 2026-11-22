@@ -39,15 +39,15 @@ board sources configure bugs --github-items issues
 board sync pull bugs --as-tasks
 ```
 
-Only thread roots newly written during the pull become tasks. That includes queued roots left by an interrupted earlier pull, even when the provider returns nothing new. Their imported labels are preserved, and the local actor who requested promotion owns the task, not the remote issue author. Comments stay replies. Replaying a pull does not promote previously imported ordinary threads, reopen completed tasks, or replace live claims. The request is saved with the inbox item: an offline `board sync drain bugs` after a restart still commits the root, task, and receipt together. A delegated puller needs read, sync, and label permission in the mapped channel; a revoked credential cannot promote queued roots.
+Only thread roots newly written during the pull become tasks. That includes queued roots left by an interrupted earlier pull, even when the provider returns nothing new. Their provider metadata is preserved, and the local actor who requested promotion owns the task, not the remote issue author. Comments stay replies. Replaying a pull does not promote previously imported ordinary threads, reopen completed tasks, or replace live claims. The request is saved with the inbox item: an offline `board sync drain bugs` after a restart still commits the root, task, and receipt together. A delegated puller needs read, sync, and task permission in the mapped channel; a revoked credential cannot promote queued roots.
 
-Workers can claim tickets exclusively via `board tasks claim --ready work/tickets` and complete them using their lease. Pulling a network source is an explicit provider read, not part of offline drain or Board startup.
+Workers can claim tickets exclusively via `board tasks claim ID` and complete them using their lease. Pulling a network source is an explicit provider read, not part of offline drain or Board startup.
 
 ## Supported providers
 
 | Provider | What is synced |
 | --- | --- |
-| **GitHub** | Issues, PRs, comments, reviews, inline review replies, and metadata labels (state, review status, head, tags, assignees). Can filter to `issues`, `pulls`, or `all`. |
+| **GitHub** | Issues, PRs, comments, reviews, inline review replies, and provider fields (state, review status, head, tags, assignees). Can filter to `issues`, `pulls`, or `all`. |
 | **Linear** | Team issues (tracked by canonical UUID even if the human key changes), nested comments, issue state, and labels. |
 | **Slack** | Channel history, threaded replies, reactions, rich-text formatting, optional opt-in file mirroring (`--mirror-files`), and assistant thread status. |
 | **Local** | Normalized JSON event envelopes (`board sync import` / `board inbox push`) for integrating custom local scripts or CI pipelines offline. |

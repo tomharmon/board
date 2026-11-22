@@ -64,39 +64,6 @@ fn offline_watchers_match_author_families_and_canonical_mentions_at_the_event_no
 }
 
 #[test]
-fn v13_unscanned_identity_filters_use_the_upgrade_directory_without_losing_existing_leases()
--> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("v13.db");
-    let b = Board::open(&path)?;
-    b.set_actor_profile("person-7", "lead", "Jules")?;
-    add_watcher(
-        &b,
-        "review",
-        Filter {
-            by: Some("lead".into()),
-            ..Default::default()
-        },
-        Some("message.posted"),
-    )?;
-    let first = b.post("work", "person-7", "first", &Default::default())?;
-    let lease = lease_event(&b, "review", 30)?.unwrap();
-    assert_eq!(lease.event.cursor, first.id);
-    let unscanned = b.post("work", "person-7", "waiting", &Default::default())?;
-    drop(b);
-    Connection::open(&path)?.execute_batch(
-        "DROP TABLE watcher_filter_hits; DROP TABLE watcher_filter_start; PRAGMA user_version=13;",
-    )?;
-    let b = Board::open(&path)?;
-    ack_delivery(&b, "review", first.id, Some(&lease.receipt))?;
-    assert_eq!(
-        lease_event(&b, "review", 30)?.unwrap().event.cursor,
-        unscanned.id
-    );
-    Ok(())
-}
-
-#[test]
 fn conditional_ack_has_one_winner_and_only_its_proof_can_report_no_match_after_reopen() -> Result<()>
 {
     let dir = tempfile::tempdir()?;
@@ -221,37 +188,6 @@ fn leased_delivery_is_exclusive_expires_and_fences_stale_acknowledgements() -> R
     ack_event(&b, "jobs", second.id)?;
     ack_event(&b, "jobs", second.id)?;
     assert!(next_event(&b, "jobs")?.is_none());
-    Ok(())
-}
-
-#[test]
-fn watcher_filters_use_event_time_not_the_current_thread() -> Result<()> {
-    let b = Board::memory()?;
-    let old = b.post("ops/ci", "ada", "old", &PostOptions::default())?;
-    add_watcher(
-        &b,
-        "triage",
-        Filter {
-            channel: Some("ops/".into()),
-            labels: BTreeMap::from([("state".into(), "new".into())]),
-            ..Default::default()
-        },
-        None,
-    )?;
-    b.label(old.id, "ada", "state", Some("new"))?;
-    let reply = b.reply(old.id, "sam", "follow-up", &PostOptions::default())?;
-    b.label(old.id, "ada", "state", None)?;
-    b.reply(old.id, "sam", "not in view", &PostOptions::default())?;
-    let entered = next_event(&b, "triage")?.unwrap();
-    assert_eq!(entered.kind, "labels.changed");
-    ack_event(&b, "triage", entered.cursor)?;
-    let inherited = next_event(&b, "triage")?.unwrap();
-    assert_eq!(inherited.cursor, reply.id);
-    ack_event(&b, "triage", inherited.cursor)?;
-    let left = next_event(&b, "triage")?.unwrap();
-    assert_eq!(left.kind, "labels.changed");
-    ack_event(&b, "triage", left.cursor)?;
-    assert!(next_event(&b, "triage")?.is_none());
     Ok(())
 }
 
@@ -400,38 +336,9 @@ fn interrupted_deliveries_resist_stale_ack_and_unblock_the_lane_at_ten() -> Resu
 }
 
 #[test]
-fn v1_watcher_receipts_and_checkpoint_are_migrated_without_loss() -> Result<()> {
+fn task_assignment_cannot_authorize_claims_by_another_persons_profiles() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let path = dir.path().join("old.db");
-    let db = Board::open(&path)?;
-    let watcher = add_watcher(&db, "old", Filter::default(), Some("message.posted"))?;
-    let a = db.post("ops", "sam", "seen", &Default::default())?;
-    let b = db.reply(a.id, "sam", "leased", &Default::default())?;
-    let c = db.reply(a.id, "sam", "pending", &Default::default())?;
-    drop(db);
-    let old = Connection::open(&path)?;
-    old.execute_batch("DROP TABLE watcher_queue; DROP TABLE watcher_scan;
-       CREATE TABLE watcher_delivery(name TEXT PRIMARY KEY,pending INTEGER,receipt TEXT,lease_until INTEGER,last_ack INTEGER,last_receipt TEXT);
-       PRAGMA user_version=1;")?;
-    old.execute("UPDATE watchers SET cursor=? WHERE name='old'", [a.id])?;
-    old.execute(
-        "INSERT INTO watcher_delivery VALUES('old',?1,'active',?2,?3,'acked')",
-        rusqlite::params![b.id, chrono::Utc::now().timestamp() + 120, a.id],
-    )?;
-    drop(old);
-    let new = Board::open(&path)?;
-    assert!(get_watcher(&new, &watcher.name)?.cursor >= a.id);
-    assert!(next_event(&new, "old")?.is_none());
-    ack_delivery(&new, "old", a.id, Some("acked"))?;
-    ack_delivery(&new, "old", b.id, Some("active"))?;
-    assert_eq!(next_event(&new, "old")?.unwrap().cursor, c.id);
-    Ok(())
-}
-
-#[test]
-fn assignments_cannot_enqueue_another_persons_instructions_without_opt_in() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("queue.db");
+    let path = dir.path().join("claims.db");
     let db = Board::open(&path)?;
     let make = |who: &str, assignee: Option<&str>| {
         create_task(
@@ -464,101 +371,11 @@ fn assignments_cannot_enqueue_another_persons_instructions_without_opt_in() -> R
     let items: Vec<PlanItem> =
         serde_json::from_value(serde_json::json!([{"text":"one","for":"bo/agent"}]))?;
     assert!(create_plan(&db, "ada", "ops", &items, None).is_err());
-    // Even rows written by v1 must not jump ahead of a worker's own queue.
+    // A malformed legacy assignment still cannot confer claim rights.
     Connection::open(&path)?.execute(
         "UPDATE tasks SET assignee='bo/agent' WHERE id=?",
         [foreign.id],
     )?;
-    assert!(
-        claim(
-            &db,
-            "bo/agent",
-            ClaimTarget::Ready("ops"),
-            60,
-            &BTreeMap::new()
-        )
-        .unwrap_err()
-        .is::<NothingReady>()
-    );
-    change_task(&db, foreign.id, "ada", None, None, TaskAction::Assign(None))?;
-    let own = make("bo", Some("bo/agent"))?;
-    let picked = claim_from(
-        &db,
-        "bo/agent",
-        ClaimTarget::Ready("ops"),
-        60,
-        &BTreeMap::new(),
-        &["ada".into()],
-    )?;
-    assert_eq!(picked.id, own.id);
-    assert!(
-        claim(
-            &db,
-            "bo/agent",
-            ClaimTarget::Ready("ops"),
-            60,
-            &BTreeMap::new()
-        )
-        .is_err()
-    );
-    assert_eq!(
-        claim_from(
-            &db,
-            "bo/agent",
-            ClaimTarget::Ready("ops"),
-            60,
-            &BTreeMap::new(),
-            &["ada".into()]
-        )?
-        .id,
-        foreign.id
-    );
-    Ok(())
-}
-
-#[test]
-fn queue_labels_are_exact_and_owner_opt_ins_name_people() -> Result<()> {
-    let db = Board::memory()?;
-    let task = create_task(
-        &db,
-        "ada",
-        TaskTarget::New {
-            channel: "ops/ci",
-            text: "test exact filters",
-            options: &PostOptions {
-                labels: BTreeMap::from([("role".into(), "reviewer".into())]),
-                ..Default::default()
-            },
-        },
-        &[],
-        None,
-    )?;
-    let try_claim = |value: &str, owners: &[String]| {
-        claim_from(
-            &db,
-            "bo/worker",
-            ClaimTarget::Ready("ops/"),
-            60,
-            &BTreeMap::from([("role".into(), value.into())]),
-            owners,
-        )
-    };
-    let high = db.cursor()?;
-    for v in ["", "worker|reviewer"] {
-        assert!(
-            try_claim(v, &["ada".into()])
-                .unwrap_err()
-                .to_string()
-                .contains("one exact")
-        );
-    }
-    assert!(try_claim("reviewer", &["ada/profile".into()]).is_err());
-    assert!(
-        try_claim("worker", &["ada".into()])
-            .unwrap_err()
-            .is::<NothingReady>()
-    );
-    assert_eq!(db.cursor()?, high);
-    assert_eq!(try_claim("reviewer", &["ada".into()])?.id, task.id);
+    assert!(claim(&db, "bo/agent", foreign.id, 60).is_err());
     Ok(())
 }

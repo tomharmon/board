@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{cell::OnceCell, collections::HashMap};
 
 use crate::{Toolset, tools::wait::Parked};
 use board_local::Board;
@@ -13,7 +13,7 @@ pub struct ActorContext {
     pub(crate) leases: HashMap<i64, (i64, String)>,
     pub(crate) toolset: Toolset,
     initialized: bool,
-    structured: bool,
+    catalog: OnceCell<Vec<crate::tools::Published>>,
 }
 
 impl ActorContext {
@@ -25,13 +25,19 @@ impl ActorContext {
             leases: HashMap::new(),
             toolset: Toolset::Board,
             initialized: false,
-            structured: false,
+            catalog: OnceCell::new(),
         }
     }
 
     pub fn with_toolset(mut self, toolset: Toolset) -> Self {
         self.toolset = toolset;
+        self.catalog.take();
         self
+    }
+
+    fn catalog(&self, board: &Board) -> &[crate::tools::Published] {
+        self.catalog
+            .get_or_init(|| crate::tools::catalog(board, self.toolset, self.worker.is_some()))
     }
 
     fn instructions(&self) -> String {
@@ -42,7 +48,9 @@ impl ActorContext {
         }.to_owned();
         hint.push_str("Use board_post to post or reply to a task, board_read for the feed or a thread, swarm_wait for addressed messages, and swarm_observe for progress and blockers. Reading does not acknowledge a message.");
         if self.toolset != Toolset::Board {
-            hint.push_str(" For shared queues, tasks_claim leases ready work. Renew, release or settle it on this connection.");
+            hint.push_str(
+                " Claim a task by ID and renew, release or settle it on this connection.",
+            );
         }
         hint
     }
@@ -52,53 +60,38 @@ pub(crate) fn error(id: Value, code: i32, message: &str) -> Value {
     json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}})
 }
 
-/// Dispatch one decoded JSON-RPC message; notifications never get replies.
-pub fn handle_request(board: &Board, session: &mut ActorContext, request: Value) -> Option<Value> {
-    let mut parked = Vec::new();
-    let immediate = route(board, session, request, &mut parked);
-    let Some(mut wait) = parked.pop() else {
-        return immediate;
-    };
-    loop {
-        std::thread::sleep(
-            wait.next_poll
-                .saturating_duration_since(std::time::Instant::now()),
-        );
-        if let Some(reply) = poll(board, session, &mut wait) {
-            return Some(reply);
+pub(crate) fn poll(wait: &mut Parked<'_>) -> Option<Value> {
+    let result = wait.poll().transpose()?;
+    Some(json!({"jsonrpc":"2.0","id":wait.id,"result":tool_result(result)}))
+}
+
+fn tool_result(result: anyhow::Result<Value>) -> rmcp::model::CallToolResult {
+    use rmcp::model::CallToolResult;
+    match result {
+        Ok(v) => {
+            let is_object = v.is_object();
+            let mut result = CallToolResult::structured(v);
+            if !is_object {
+                result.structured_content =
+                    Some(json!({"items": result.structured_content.take()}));
+            }
+            result
         }
-    }
-}
-
-pub(crate) fn poll(
-    board: &Board,
-    session: &mut ActorContext,
-    wait: &mut Parked<'_>,
-) -> Option<Value> {
-    let result = wait.poll(board, session).transpose()?;
-    Some(json!({"jsonrpc":"2.0","id":wait.id,"result":tool_result(session,result)}))
-}
-
-fn tool_result(ctx: &ActorContext, result: anyhow::Result<Value>) -> Value {
-    let (v, error) = match result {
-        Ok(v) => (v, false),
         Err(e) => {
             let (_, code) = board_local::errors::classify(&e);
-            (json!({"code":code,"message":e.to_string()}), true)
+            CallToolResult::structured_error(json!(crate::tools::ToolOutput::<()>::Error {
+                code: code.into(),
+                message: e.to_string(),
+            }))
         }
-    };
-    let mut out = json!({"content":[{"type":"text","text":v.to_string()}],"isError":error});
-    if ctx.structured {
-        out["structuredContent"] = if v.is_object() { v } else { json!({"items":v}) };
     }
-    out
 }
 
 pub(crate) fn route<'a>(
     board: &'a Board,
     session: &mut ActorContext,
     request: Value,
-    parked: &mut Vec<Parked<'a>>,
+    parked: &mut Option<Parked<'a>>,
 ) -> Option<Value> {
     let method = request.get("method").and_then(Value::as_str);
     let id = request.get("id");
@@ -111,11 +104,12 @@ pub(crate) fn route<'a>(
     if id.is_none()
         && method == Some("notifications/cancelled")
         && let Some(cancelled) = request.pointer("/params/requestId")
+        && parked.as_ref().is_some_and(|p| &p.id == cancelled)
     {
-        parked.retain_mut(|p| &p.id != cancelled || !p.retire());
+        *parked = None;
     }
     let id = id?.clone();
-    if parked.iter().any(|p| p.id == id) {
+    if parked.as_ref().is_some_and(|p| p.id == id) {
         return Some(error(id, -32600, "Request ID already in use"));
     }
     let method = method?;
@@ -125,7 +119,7 @@ pub(crate) fn route<'a>(
     }
     let result = match method {
         "initialize" if !session.initialized => {
-            let supported = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+            let supported = ["2025-11-25", "2025-06-18"];
             let requested = params
                 .and_then(|v| v.get("protocolVersion"))
                 .and_then(Value::as_str);
@@ -133,7 +127,6 @@ pub(crate) fn route<'a>(
                 .filter(|v| supported.contains(v))
                 .unwrap_or(supported[0]);
             session.initialized = true;
-            session.structured = version >= "2025-06-18";
             json!({"protocolVersion":version,"capabilities":{"tools":{}},
                 "instructions":session.instructions(),
                 "serverInfo":{"name":"board-mcp","version":env!("CARGO_PKG_VERSION")}})
@@ -147,45 +140,44 @@ pub(crate) fn route<'a>(
             if params.and_then(|p| p.get("cursor")).is_some() {
                 return Some(error(id, -32602, "This catalog fits on one page"));
             }
-            json!({"tools":crate::tools::catalog(board,session.toolset,session.worker.is_some(),session.structured)})
+            json!({"tools":session.catalog(board).iter().map(|t| &t.definition).collect::<Vec<_>>()})
         }
         "tools/call" => {
-            let Some(tool) = params
-                .and_then(|p| p.get("name"))
-                .and_then(Value::as_str)
-                .and_then(crate::tools::find)
+            let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+            let Some(published) = session
+                .catalog(board)
+                .iter()
+                .find(|t| Some(t.tool.name) == name)
             else {
-                return Some(error(id, -32602, "Unknown or missing Board tool name"));
-            };
-            // The compatibility catalog retains the old domain errors for a
-            // wrong-role call. In lean catalogs, hidden tools aren't routable.
-            if session.toolset != Toolset::Full
-                && !tool.offered(session.toolset, session.worker.is_some())
-            {
                 return Some(error(
                     id,
                     -32602,
                     "Tool not available in this catalog; use tools/list",
                 ));
-            }
+            };
             let empty = json!({});
             let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
-            let result = match Parked::prepare(board, session, tool, args, id.clone()) {
-                Ok(Some(wait)) if parked.iter().any(|p| p.same_kind(&wait)) => Err(
-                    anyhow::anyhow!("this session already has that kind of wait pending"),
-                ),
-                Ok(Some(mut wait)) => match wait.poll(board, session) {
-                    Ok(None) => {
-                        parked.push(wait);
-                        return None;
-                    }
-                    Ok(Some(value)) => Ok(value),
-                    Err(e) => Err(e),
-                },
-                Ok(None) => crate::tools::execute(board, session, tool, args),
+            let result = match published.parse(args) {
                 Err(e) => Err(e),
+                Ok(crate::tools::Call::SwarmWait(_)) if parked.is_some() => Err(anyhow::anyhow!(
+                    "this session already has an inbox wait pending"
+                )),
+                Ok(crate::tools::Call::SwarmWait(p)) => {
+                    match Parked::prepare(board, session, p, id.clone()) {
+                        Ok(mut wait) => match wait.poll() {
+                            Ok(None) => {
+                                *parked = Some(wait);
+                                return None;
+                            }
+                            Ok(Some(v)) => Ok(v),
+                            Err(e) => Err(e),
+                        },
+                        Err(e) => Err(e),
+                    }
+                }
+                Ok(call) => crate::tools::execute(board, session, call),
             };
-            tool_result(session, result)
+            json!(tool_result(result))
         }
         _ => return Some(error(id, -32601, "Method not found")),
     };

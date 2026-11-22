@@ -11,22 +11,6 @@ pub(super) static NEXT_FRAME: Icon = Icon {
     view: 24.,
     body: r#"<path d="m9 18 6-6-6-6" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>"#,
 };
-pub(super) static PAUSE: Icon = Icon {
-    name: "lucide-pause",
-    view: 24.,
-    body: r#"<g fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1"/><rect x="14" y="4" width="4" height="16" rx="1"/></g>"#,
-};
-pub(super) static SOUND: Icon = Icon {
-    name: "lucide-volume-2",
-    view: 24.,
-    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4z"/><path d="M15 8a6 6 0 0 1 0 8m3-11a10 10 0 0 1 0 14"/></g>"#,
-};
-pub(super) static MUTED_SOUND: Icon = Icon {
-    name: "lucide-volume-x",
-    view: 24.,
-    body: r#"<g fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5 6 9H3v6h3l5 4zM16 9l6 6m0-6-6 6"/></g>"#,
-};
-
 pub(super) static LIST_FILTER: Icon = Icon {
     name: "lucide-list-filter",
     view: 24.0,

@@ -17,7 +17,6 @@ use clap::Parser;
 use cli::{Args, Body, ChannelCommand, Command, Query, SchemaCommand, WriteOptions};
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeMap,
     env, fs,
     io::{self, Read, Write},
     path::{Path, PathBuf},
@@ -25,24 +24,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-type Labels = BTreeMap<String, String>;
-
-fn pairs(items: &[String], bare: bool) -> Result<Labels> {
-    let mut out = Labels::new();
-    for item in items {
-        let (key, value) = match item.split_once('=') {
-            Some((k, v)) => (k, v),
-            None if bare => (item.as_str(), ""),
-            _ => bail!("expected key=value, got {item:?}"),
-        };
-        ensure!(
-            !key.is_empty() && out.insert(key.into(), value.into()).is_none(),
-            "empty or repeated label key: {key:?}"
-        );
-    }
-    Ok(out)
-}
 
 fn message_id(target: &str) -> Option<i64> {
     parse_id(target).ok()
@@ -88,7 +69,6 @@ impl WriteOptions {
     fn prepare(self, board: &Board, actor: &str, target: &str) -> Result<(String, PostOptions)> {
         let key = automation_cli::output_key(board, actor, self.key.as_deref())?;
         let text = self.body.read()?;
-        let labels = pairs(&self.label, false)?;
         // A retried, committed post must not upload a second file, even if the local path is gone.
         // The actual post still verifies the target, writer and current permissions.
         let attachments = if let Some(key) = &key
@@ -106,7 +86,6 @@ impl WriteOptions {
             text,
             PostOptions {
                 no_sync: self.no_sync,
-                labels,
                 key,
                 after: self.after,
                 ..attachments
@@ -129,8 +108,7 @@ impl Query {
             re: self.re,
             after: self.after,
             mentions: self.mentions,
-            labels: Default::default(),
-            label_terms: board_local::LabelTerm::parse(&self.label)?,
+            ..Default::default()
         };
         f.bind_actor(actor);
         Ok(f)
@@ -165,17 +143,12 @@ fn safe(text: &str) -> String {
 }
 
 fn show_message(m: &Message) {
-    let mut badges = String::new();
-    for (k, v) in &m.labels {
-        badges.push_str(&format!(" [{k}={v}]"));
-    }
     println!(
-        "#{}  {}  {}  {}{}",
+        "#{}  {}  {}  {}",
         m.id,
         safe(&m.channel),
         safe(&m.actor),
-        safe(&m.created_at),
-        safe(&badges)
+        safe(&m.created_at)
     );
     println!(
         "    {}",
@@ -391,7 +364,6 @@ fn accepts_worker(cmd: &Command) -> bool {
             | Edit { .. }
             | Delete { .. }
             | React { .. }
-            | Label { .. }
             | Download { .. }
             | Upload { .. }
             | Tail { .. }
@@ -514,15 +486,13 @@ fn run(mut args: Args) -> Result<()> {
         Command::Init(_) | Command::Skill { .. } => unreachable!(),
         Command::Swarm { mut command } => {
             command.select_run(binding.as_ref())?;
-            swarm_cli::run(&board, &actor, command, js)?;
+            swarm_cli::run(&board, &actor, binding.as_ref(), command, js)?;
         }
         Command::Roles { command } => roles_cli::roles(&board, &actor, command, js)?,
         Command::Skills { command } => roles_cli::skills(&board, &actor, command, js)?,
-        Command::Mcp { queue, full } => {
+        Command::Mcp { full } => {
             let tools = if full {
                 board_mcp::Toolset::Full
-            } else if queue {
-                board_mcp::Toolset::Queue
             } else {
                 board_mcp::Toolset::Board
             };
@@ -578,9 +548,6 @@ fn run(mut args: Args) -> Result<()> {
                 println!("{}", safe(&destination.display().to_string()));
             }
         }
-        Command::Migrate {
-            command: cli::Migration::ExportSchedules,
-        } => board_local::automation::export_legacy_schedules(&board, std::io::stdout().lock())?,
         Command::Profile { handle, name } => {
             board.set_actor_profile_with_avatar(&actor, &handle, &name, args.avatar.as_deref())?;
             if js {
@@ -733,30 +700,6 @@ fn run(mut args: Args) -> Result<()> {
             if remove { "unreacted" } else { "reacted" },
             js,
         ),
-        Command::Label {
-            id,
-            labels,
-            unset,
-            conditions,
-            if_unset,
-        } => {
-            let mut cond: BTreeMap<_, _> = pairs(&conditions, false)?
-                .into_iter()
-                .map(|(k, v)| (k, Some(v)))
-                .collect();
-            for key in if_unset {
-                ensure!(cond.insert(key, None).is_none(), "conflicting conditions");
-            }
-            ensure!(
-                !labels.is_empty() || !unset.is_empty(),
-                "specify labels to set or --unset"
-            );
-            written(
-                board.labels(id, &actor, &pairs(&labels, false)?, &unset, &cond)?,
-                "labeled",
-                js,
-            );
-        }
         Command::Upload {
             channel,
             file,
@@ -825,7 +768,7 @@ fn run(mut args: Args) -> Result<()> {
                         && filter.mentions.is_none()
                         && filter.from.is_none()
                         && filter.re.is_none(),
-                    "a thread read accepts --after, --label and --limit; use a channel read to search for threads"
+                    "a thread read accepts --after and --limit; use a channel read to search for threads"
                 );
                 let thread = board.conversation_window(id, &filter, limit)?;
                 if js {

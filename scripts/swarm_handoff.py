@@ -8,9 +8,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
-import time
 
-from swarm_pool import Client
+from swarm_client import Client
 
 
 def render(ui, db, run, task, directory, reply=None):
@@ -48,11 +47,13 @@ def exercise(bindir, directory):
             return client
 
         boss = connect()
-        run = boss.call("swarm_start", slug="pool", goal="Verify a published evidence file")
         title = "Review the release checksum"
-        task = boss.call("tasks_plan", channel=run["channel"], tasks=[{"text": title}])["tasks"][0]["id"]
+        thread = boss.call("board_post", channel="release", text=title)["id"]
+        run = boss.call("swarm_start", slug="review", channel="coordination", goal="Verify a published evidence file")
+        task = boss.call("tasks_plan", run="review", channel="release", tasks=[{"thread_id": thread}])["tasks"][0]["id"]
+        assert task == thread
         for name, role in (("author", "implementer"), ("verify", "verifier")):
-            boss.call("swarm_add", run="pool", name=name, role=role, brief=f"Own the {name} assignment")
+            boss.call("swarm_add", run="review", name=name, role=role, brief=f"Own the {name} assignment")
         author, verifier = connect("author"), connect("verify")
         # The public review uses default sessions; optional binary evidence uses the same identities.
         author_files, verifier_files = connect("author", mode="--full"), connect("verify", mode="--full")
@@ -60,7 +61,7 @@ def exercise(bindir, directory):
 
         def submit(data, summary):
             revision = {"kind": "sha256", "value": hashlib.sha256(data).hexdigest()}
-            file = author_files.call("board_file_upload", channel=run["channel"], name="release.txt",
+            file = author_files.call("board_file_upload", channel="release", name="release.txt",
                                content_type="text/plain", data_base64=base64.b64encode(data).decode())
             handoff = author.call("board_post", reply_to=task, text=summary,
                                   attachment_ids=[file["id"]], schema="handoff@1",
@@ -92,19 +93,13 @@ def exercise(bindir, directory):
         verifier.send({"jsonrpc": "2.0", "id": verifier.seq, "method": "tools/call",
                        "params": {"name": "swarm_wait", "arguments": {"ack": first["cursor"], "timeout_seconds": 300}}})
 
-        def wait_for_status(expected):
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                if verifier_files.call("worker_assignment")["worker"]["status"] == expected:
-                    return
-                time.sleep(0.05)
-            raise AssertionError(f"verifier did not become {expected}")
-
-        wait_for_status("waiting")
+        pending = verifier.seq
+        verifier.rpc("ping", {})  # the wait is parked; the session still answers requests
         question = "Please check the published checksum."
         render(bindir / "board-ui", db, run["id"], task, directory, "@verify " + question)
-        wait_for_status("working")
-        verifier.close()  # discard the response; do not acknowledge the human's reply
+        delivery = json.loads(verifier.lines.get(timeout=15))
+        assert delivery["id"] == pending and not delivery["result"]["isError"]
+        verifier.close()  # discard the delivery without acknowledging the human's reply
         verifier = connect("verify")
         replay = verifier.call("swarm_wait", timeout_seconds=0)
         notice, = replay["messages"]
@@ -122,7 +117,7 @@ def exercise(bindir, directory):
         assert [m["id"] for m in delivered["messages"]] == [check["id"]]
         assert len(delivered["notifications"]) == 1
         boss = connect()
-        receipts = {h["id"]: h for h in connect(mode="--full").call("swarm_receipt", run="pool")["handoffs"]}
+        receipts = {h["id"]: h for h in connect(mode="--full").call("swarm_receipt", run="review")["handoffs"]}
         assert receipts[handoff["id"]]["verification"]["revision"] == revision
         assert receipts[handoff["id"]]["verification"]["checks"][0]["status"] == "fail"
         assert receipts[fix["id"]]["verification"]["revision"] == new_revision

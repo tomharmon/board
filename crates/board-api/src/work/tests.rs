@@ -1,4 +1,5 @@
 use super::*;
+use axum::Router;
 use axum::{
     body::{Body, to_bytes},
     http::Request,
@@ -171,17 +172,14 @@ fn work_collections_validate_page_and_return_structured_failures() {
 fn task_collection_finds_reverse_dependencies_and_filters_before_pagination() {
     runtime().block_on(async {
         let db = Board::memory().unwrap();
-        let make = |channel: &str, tag: &str, needs: &[i64]| {
+        let make = |channel: &str, text: &str, needs: &[i64]| {
             work::create_task(
                 &db,
                 "ada",
                 TaskTarget::New {
                     channel,
-                    text: "review",
-                    options: &PostOptions {
-                        labels: Labels::from([("role".into(), tag.into())]),
-                        ..Default::default()
-                    },
+                    text,
+                    options: &PostOptions::default(),
                 },
                 needs,
                 None,
@@ -190,7 +188,7 @@ fn task_collection_finds_reverse_dependencies_and_filters_before_pagination() {
             .id
         };
         let pre = make("ops", "lead", &[]);
-        make("ops/ci", "skip", &[pre]);
+        make("ops/ci", "different prerequisite", &[]);
         let first = make("ops", "review", &[pre]);
         let second = make("ops/ci", "verify", &[pre]);
         make("ops-old", "review", &[pre]);
@@ -208,9 +206,7 @@ fn task_collection_finds_reverse_dependencies_and_filters_before_pagination() {
         let exact_actor = request(&router, "GET", "/tasks?by=me&limit=1", Value::Null, &[]).await;
         assert_eq!(exact_actor.body["tasks"][0]["id"], mine.body["id"]);
         assert!(exact_actor.body["next_after"].is_null());
-        let query = format!(
-            "/tasks?channel=ops%2F&needs={pre}&state=waiting&label=role%3Dreview%7Cverify&limit=1"
-        );
+        let query = format!("/tasks?channel=ops%2F&needs={pre}&state=waiting&limit=1");
         let page = request(&router, "GET", &query, Value::Null, &[]).await;
         assert_eq!(page.status, StatusCode::OK);
         assert_eq!(page.body["tasks"][0]["id"], first);
@@ -229,7 +225,7 @@ fn task_collection_finds_reverse_dependencies_and_filters_before_pagination() {
         let exact = request(
             &router,
             "GET",
-            &format!("/tasks?channel=ops&needs={pre}&label=role"),
+            &format!("/tasks?channel=ops&needs={pre}"),
             Value::Null,
             &[],
         )
@@ -427,7 +423,7 @@ async fn task_edits() {
         )
         .await
         .status,
-        StatusCode::NO_CONTENT
+        StatusCode::NOT_FOUND
     );
 }
 
@@ -465,6 +461,15 @@ async fn task_files() {
     assert_eq!(changed.body["id"], id);
     let root = request(&router, "GET", &format!("/messages/{id}"), Value::Null, &[]).await;
     let attachment = &root.body["attachments"][0];
+    let listed = request(&router, "GET", "/tasks?channel=evidence", Value::Null, &[]).await;
+    assert_eq!(
+        listed.body["tasks"][0]["attachment_names"],
+        json!(["trace.log"])
+    );
+    assert_eq!(
+        listed.body["tasks"][0]["created_at"],
+        root.body["created_at"]
+    );
     assert_eq!(attachment["name"], "trace.log");
     assert_eq!(attachment["size"], 1_600_000);
     let url = format!("/attachments/{}", attachment["id"]);
@@ -583,14 +588,7 @@ async fn task_round_trip() {
         StatusCode::NO_CONTENT
     );
 
-    let again = request(
-        &router,
-        "POST",
-        "/task-claims",
-        json!({"channel":"work/"}),
-        &[],
-    )
-    .await;
+    let again = request(&router, "POST", &path, json!({}), &[]).await;
     assert_eq!(again.body["id"], id, "{}", again.body);
     let update = format!("/tasks/{id}");
     let old = request(
@@ -629,21 +627,9 @@ fn task_batches_have_navigable_locations_and_atomic_keyed_retries() {
 }
 
 #[test]
-fn waiting_queue_claim_releases_connection_and_filters_tasks_by_root_author_and_assignment() {
+fn removed_queue_endpoint_cannot_acquire_tasks_while_task_filters_still_match() {
     runtime().block_on(async {
         let router = api(Board::memory().unwrap());
-        let query = router.clone();
-        let waiting = tokio::spawn(async move {
-            request(
-                &query,
-                "POST",
-                "/task-claims",
-                json!({"channel":"ops","wait_seconds":3}),
-                &[],
-            )
-            .await
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let t = request(
             &router,
             "POST",
@@ -652,9 +638,32 @@ fn waiting_queue_claim_releases_connection_and_filters_tasks_by_root_author_and_
             &[],
         )
         .await;
-        let claimed = waiting.await.unwrap();
-        assert_eq!(claimed.status, StatusCode::CREATED);
-        assert_eq!(claimed.body["id"], t.body["id"]);
+        let obsolete = request(
+            &router,
+            "POST",
+            "/task-claims",
+            json!({"channel":"ops","wait_seconds":3}),
+            &[],
+        )
+        .await;
+        assert_eq!(obsolete.status, StatusCode::NOT_FOUND);
+        let spec = request(&router, "GET", "/openapi.json", Value::Null, &[])
+            .await
+            .body;
+        assert!(spec["paths"].get("/task-claims").is_none());
+        let models = &spec["components"]["schemas"];
+        for (path, model) in [
+            ("/tasks/{id}/claim", "TaskClaim"),
+            ("/task-claims/recover", "RecoverClaim"),
+        ] {
+            assert_eq!(
+                spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"],
+                format!("#/components/schemas/{model}")
+            );
+            assert_eq!(models[model]["additionalProperties"], false);
+        }
+        assert_eq!(models["RecoverClaim"]["required"], json!(["token"]));
         let list = request(
             &router,
             "GET",
@@ -664,6 +673,7 @@ fn waiting_queue_claim_releases_connection_and_filters_tasks_by_root_author_and_
         )
         .await;
         assert_eq!(list.body["tasks"][0]["id"], t.body["id"]);
+        assert_eq!(list.body["tasks"][0]["state"], "ready");
         let other = request(&router, "GET", "/tasks?for=ada%2Fother", Value::Null, &[]).await;
         assert_eq!(other.body["tasks"], json!([]));
     })
@@ -696,9 +706,14 @@ fn http_client_can_recover_minted_claims_and_repeat_without_another_lease() {
 }
 
 async fn batch_resources() {
-    let router = api(Board::memory().unwrap());
+    let board = Board::memory().unwrap();
+    let discussed = board
+        .post("investigations", "ada", "test", &Default::default())
+        .unwrap()
+        .id;
+    let router = api(board);
     let key = [("idempotency-key", "release/first build")];
-    let body = json!({"channel":"work","tasks":[{"text":"ship","key":"ship","needs":[{"key":"test"}]},{"text":"test","key":"test"}]});
+    let body = json!({"channel":"work","tasks":[{"text":"ship","key":"ship","needs":["test"]},{"thread_id":discussed,"key":"test"}]});
     let first = request(&router, "POST", "/task-batches", body.clone(), &key).await;
     assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
     let location = first.headers[header::LOCATION]
@@ -709,6 +724,8 @@ async fn batch_resources() {
     let found = request(&router, "GET", location, Value::Null, &[]).await;
     assert_eq!(found.body, first.body);
     assert_eq!(first.body["tasks"][0]["state"], "waiting");
+    assert_eq!(first.body["tasks"][1]["id"], discussed);
+    assert_eq!(first.body["tasks"][1]["channel"], "investigations");
     assert_eq!(
         request(&router, "POST", "/task-batches", body, &key)
             .await
@@ -879,7 +896,16 @@ async fn automation_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("board.db");
     let router = api(Board::open(&path).unwrap());
-    let made=request(&router,"POST","/watchers",json!({"name":"pings","filter":{"channel":"ops/","labels":{"ping":"yes"}},"kind":"message.posted"}),&[]).await;
+    let old=request(&router,"POST","/watchers",json!({"name":"pings","filter":{"channel":"ops/","labels":{"ping":"yes"}},"kind":"message.posted"}),&[]).await;
+    assert!(old.status.is_client_error());
+    let made = request(
+        &router,
+        "POST",
+        "/watchers",
+        json!({"name":"pings","filter":{"channel":"ops/"},"kind":"message.posted"}),
+        &[],
+    )
+    .await;
     assert_eq!(made.status, StatusCode::CREATED, "{}", made.body);
     assert_eq!(made.headers[header::LOCATION], "/v1/watchers/pings");
     assert_eq!(
@@ -895,7 +921,7 @@ async fn automation_round_trip() {
         &router,
         "POST",
         "/messages",
-        json!({"channel":"ops/ci","text":"check","labels":{"ping":"yes"}}),
+        json!({"channel":"ops/ci","text":"check"}),
         &[],
     )
     .await;

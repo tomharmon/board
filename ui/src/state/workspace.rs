@@ -3,6 +3,9 @@ use anyhow::{bail, ensure};
 use automation::{Task, Watcher};
 use board_local::{Event, Schema};
 
+#[cfg(test)]
+mod tests;
+
 const PAGE: usize = 40;
 const LEASE: i64 = 300;
 
@@ -35,35 +38,17 @@ pub struct Form {
     pub value: TextEdit,
     pub extra: TextEdit,
 }
+#[derive(Default)]
 pub struct TaskEntry {
     instance: std::sync::Arc<()>,
     pub form: Form,
-    pub labels: TextEdit,
     pub files: Vec<(String, Vec<u8>)>,
     pub no_sync: bool,
-    pub show_labels: bool,
     pub reload_needed: bool,
     pub(super) stamp: Option<String>,
     pub(super) baseline: Option<(board_local::Draft, board_local::ComposerSettings)>,
     pub files_changed: bool,
 }
-impl Default for TaskEntry {
-    fn default() -> Self {
-        Self {
-            instance: Default::default(),
-            form: Form::default(),
-            labels: TextEdit::new(""),
-            files: Vec::new(),
-            no_sync: false,
-            show_labels: false,
-            reload_needed: false,
-            stamp: None,
-            baseline: None,
-            files_changed: false,
-        }
-    }
-}
-
 #[derive(Default)]
 pub struct AccessReview {
     pub viewer: Option<board_local::access::Viewer>,
@@ -132,7 +117,6 @@ pub struct Desk {
     pub tasks: Vec<Task>,
     pub selected_task: Option<Task>,
     pub task_options: bool,
-    pub task_rows: HashMap<i64, TaskRow>,
     pub task_filter: usize,
     pub filter_form: Form,
     pub filtering: bool,
@@ -158,11 +142,6 @@ pub struct Desk {
     claims: HashMap<(String, i64), (i64, String)>,
 }
 
-pub struct TaskRow {
-    pub created: String,
-    pub labels: BTreeMap<String, String>,
-    pub files: String,
-}
 impl Desk {
     pub const TASK_STATES: [&'static str; 8] = [
         "all",
@@ -181,7 +160,6 @@ impl Desk {
         self.events.clear();
         self.tasks.clear();
         self.selected_task = None;
-        self.task_rows.clear();
         self.access.viewer = None;
         self.access.decision = None;
         self.watchers.clear();
@@ -337,25 +315,6 @@ impl Desk {
                     tasks.truncate(PAGE);
                     self.next = tasks.last().map(|t| t.id);
                 }
-                self.task_rows = tasks
-                    .iter()
-                    .map(|t| {
-                        let m = db.get(t.id)?;
-                        Ok((
-                            t.id,
-                            TaskRow {
-                                created: m.created_at,
-                                labels: m.labels,
-                                files: m
-                                    .attachments
-                                    .into_iter()
-                                    .map(|f| f.name)
-                                    .collect::<Vec<_>>()
-                                    .join(", "),
-                            },
-                        ))
-                    })
-                    .collect::<Result<_>>()?;
                 self.tasks = tasks;
                 if let Page::Task(id) = page {
                     let t = automation::get_task(db, id)?;
@@ -588,11 +547,6 @@ impl State {
                 PostOptions {
                     no_sync: entry.no_sync,
                     files: entry.files.clone(),
-                    labels: board_local::ComposerSettings {
-                        labels: entry.labels.text.clone(),
-                        ..Default::default()
-                    }
-                    .parsed_labels()?,
                     ..Default::default()
                 }
             } else {
@@ -651,7 +605,6 @@ impl State {
         let generation = std::sync::Arc::downgrade(&entry.instance);
         let channel = entry.form.channel.text.clone();
         let private = entry.no_sync;
-        let labels = entry.labels.text.clone();
         let assignee = entry.form.name.text.clone();
         let needs = entry.form.extra.text.clone();
         tx.open_file(
@@ -668,7 +621,6 @@ impl State {
                         && !s.desk.filtering
                         && s.desk.task_entry.form.channel.text == channel
                         && s.desk.task_entry.no_sync == private
-                        && s.desk.task_entry.labels.text == labels
                         && s.desk.task_entry.form.name.text == assignee
                         && s.desk.task_entry.form.extra.text == needs =>
                 {
@@ -688,11 +640,6 @@ impl State {
                             ensure!(
                                 rights.contains(&board_local::access::Action::Post),
                                 "Posting to this channel is no longer permitted"
-                            );
-                            ensure!(
-                                labels.trim().is_empty()
-                                    || rights.contains(&board_local::access::Action::Label),
-                                "Labeling in this channel is no longer permitted"
                             );
                         }
                         super::files::read_attachment(&path)
@@ -717,17 +664,6 @@ impl State {
         f.name = TextEdit::new(c.owner.as_deref().unwrap_or(""));
         f.value = TextEdit::new(c.assignee.as_deref().unwrap_or(""));
         f.extra = TextEdit::new(c.needs.map(|n| n.to_string()).unwrap_or_default());
-        f.body = TextEdit::new(
-            c.label_terms
-                .iter()
-                .map(|t| {
-                    t.values
-                        .as_ref()
-                        .map_or_else(|| t.key.clone(), |v| format!("{}={}", t.key, v.join("|")))
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
         self.desk.filtering = true;
     }
 
@@ -735,7 +671,6 @@ impl State {
         let build = || -> Result<automation::TaskFilter> {
             let f = &self.desk.filter_form;
             let opt = |s: &str| (!s.trim().is_empty()).then(|| s.trim().to_string());
-            let terms: Vec<_> = f.body.text.lines().filter_map(opt).collect();
             let c = automation::TaskFilter {
                 channel: opt(&f.channel.text),
                 owner: opt(&f.name.text),
@@ -744,7 +679,6 @@ impl State {
                     .map(|s| s.trim_start_matches('#').parse::<i64>())
                     .transpose()
                     .context("Enter a positive prerequisite ID")?,
-                label_terms: board_local::LabelTerm::parse(&terms)?,
                 ..Default::default()
             };
             automation::filtered_tasks_page(self.db()?, &c, 0, 1)?;
@@ -766,13 +700,7 @@ impl State {
         let secret = self.desk.claims.get(&key);
         let result = self.db().and_then(|db| {
             if matches!(cmd, TaskCommand::Claim) {
-                return automation::claim(
-                    db,
-                    &self.actor,
-                    automation::ClaimTarget::Id(id),
-                    LEASE,
-                    &BTreeMap::new(),
-                );
+                return automation::claim(db, &self.actor, id, LEASE);
             }
             let reason = form.body.text.trim();
             let needs;

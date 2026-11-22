@@ -2,12 +2,11 @@ use super::*;
 use axum::{
     body::Bytes,
     extract::{Path, Query},
-    routing::post,
 };
 use board_local::MAX_ATTACHMENT_BYTES;
 use serde::Deserialize;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(untagged)]
 pub(super) enum FileRef {
     Id(i64),
@@ -25,35 +24,30 @@ pub(super) fn resolve(b: &Board, who: &str, refs: &[FileRef]) -> Result<Vec<i64>
         })
         .collect()
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::IntoParams)]
 #[serde(deny_unknown_fields)]
 struct Simple {
     channel: String,
     name: String,
 }
-#[derive(Deserialize)]
+#[derive(Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct Start {
+struct UploadStart {
     channel: String,
     name: String,
     content_type: Option<String>,
     size: i64,
     sha256: Option<String>,
 }
-pub(super) fn routes() -> Router<App> {
-    Router::new()
-        .route(
-            "/attachments",
-            post(upload).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)),
-        )
-        .route("/uploads", post(start))
-        .route("/uploads/{key}", get(status))
-        .route(
-            "/uploads/{key}/parts/{offset}",
-            put(part).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)),
-        )
-        .route("/uploads/{key}/completion", put(finish))
+pub(super) fn routes() -> OpenApiRouter<App> {
+    OpenApiRouter::new()
+        .routes(utoipa_axum::routes!(upload).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)))
+        .routes(utoipa_axum::routes!(start))
+        .routes(utoipa_axum::routes!(status))
+        .routes(utoipa_axum::routes!(part).layer(DefaultBodyLimit::max(MAX_ATTACHMENT_BYTES)))
+        .routes(utoipa_axum::routes!(finish))
 }
+#[utoipa::path(post, path="/attachments", params(Simple), request_body(content=Vec<u8>, content_type="application/octet-stream"), tag="attachments")]
 async fn upload(
     State(a): State<App>,
     Query(q): Query<Simple>,
@@ -73,7 +67,13 @@ async fn upload(
         json!(file),
     ))
 }
-async fn start(State(a): State<App>, Json(i): Json<Start>) -> ApiResult<Response> {
+#[utoipa::path(
+    post,
+    path = "/uploads",
+    operation_id = "files_api_start",
+    tag = "uploads"
+)]
+async fn start(State(a): State<App>, Json(i): Json<UploadStart>) -> ApiResult<Response> {
     let up = a
         .call(move |b, who| {
             b.start_upload(
@@ -90,11 +90,13 @@ async fn start(State(a): State<App>, Json(i): Json<Start>) -> ApiResult<Response
         .await?;
     Ok(created(format!("/v1/uploads/{}", up.key), json!(up)))
 }
+#[utoipa::path(get, path="/uploads/{key}", params(("key" = String, Path)), tag="uploads")]
 async fn status(State(a): State<App>, Path(key): Path<String>) -> ApiResult<Json<Value>> {
     Ok(Json(json!(
         a.call(move |b, who| b.upload_status(who, &key)).await?
     )))
 }
+#[utoipa::path(put, path="/uploads/{key}/parts/{offset}", params(("key" = String, Path), ("offset" = i64, Path)), request_body(content=Vec<u8>, content_type="application/octet-stream"), tag="uploads")]
 async fn part(
     State(a): State<App>,
     Path((key, offset)): Path<(String, i64)>,
@@ -105,6 +107,7 @@ async fn part(
             .await?
     )))
 }
+#[utoipa::path(put, path="/uploads/{key}/completion", params(("key" = String, Path)), tag="uploads")]
 async fn finish(State(a): State<App>, Path(key): Path<String>) -> ApiResult<Response> {
     let (file, new) = a.call(move |b, who| b.finish_upload(who, &key)).await?;
     Ok(if new {
