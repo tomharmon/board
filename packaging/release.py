@@ -60,7 +60,7 @@ def notices(target, dest):
         def include(path, label):
             out.write(f"\n--- {label} ---\n{path.read_text(encoding='utf-8', errors='replace')}\n")
 
-        for path in [ROOT / "LICENSE", ROOT / "LICENSE-MIT", ROOT / "THIRD_PARTY.md", *sorted((ROOT / "ui/licenses").glob("*.txt"))]:
+        for path in [ROOT / "LICENSE", ROOT / "LICENSE-MIT", ROOT / "VERCEL-BOARD-LICENSE", ROOT / "THIRD_PARTY.md", *sorted((ROOT / "ui/licenses").glob("*.txt"))]:
             include(path, path.relative_to(ROOT))
         for p in sorted((p for p in packages if p["source"]), key=lambda p: p["id"]):
             label = f"{p['name']} {p['version']}"

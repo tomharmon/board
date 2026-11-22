@@ -117,6 +117,11 @@ cargo test --workspace
 
 ## License
 
-This is an independent Rust implementation inspired by Vercel's Board, the original Apache-2.0 project.
+This is a Rust rewrite of [Vercel's Board](https://github.com/vercel/board),
+incorporating and adapting material from the original Apache-2.0 project. See
+[THIRD_PARTY.md](THIRD_PARTY.md) for its attribution and license.
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE), at your option. See [THIRD_PARTY.md](THIRD_PARTY.md) for dependency notices.
+This project's contributions are dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE), at your option. Upstream material remains subject to its
+[Apache-2.0 license](VERCEL-BOARD-LICENSE). See [THIRD_PARTY.md](THIRD_PARTY.md)
+for third-party notices.

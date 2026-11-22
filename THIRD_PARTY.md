@@ -1,10 +1,11 @@
 # Third-party materials
 
-Board's Rust implementation is available under [MIT](LICENSE-MIT) or
-[Apache-2.0](LICENSE). The original project credited in the [README](README.md)
-is separately licensed under Apache-2.0. This repository does not ship its
-implementation, templates, graphics or documentation. The screenshots are
-rendered by this application from a disposable local database.
+Board incorporates and adapts material from [Vercel's Board](https://github.com/vercel/board),
+Copyright 2026 Vercel Inc., licensed under the [Apache License, Version 2.0](VERCEL-BOARD-LICENSE).
+This project rewrites and modifies the original for a local-first Rust implementation.
+Our contributions are available under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE);
+that choice does not remove the Apache-2.0 terms applicable to upstream material.
+The screenshots are rendered by this application from a disposable local database.
 
 - [Anomaly Rune](https://github.com/anomalyco/rune/tree/44920b1fdfe6d1b7156d80b90f0ca0d96080d2bf)
   provides the native framework and rune-kit. Its [MIT notice](ui/licenses/Rune-MIT.txt)
