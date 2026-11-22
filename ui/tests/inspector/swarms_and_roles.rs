@@ -104,6 +104,7 @@ fn overview_shows_ordinary_workstreams_and_only_opens_history_on_demand() {
         }
         steps.tap("swarms");
         steps.tap(format!("swarm-run-{}", run.id));
+        steps.tap(format!("swarm-explain-{}", task.id));
         let (tree, _) = f.snapshot(
             json!(steps.0),
             (width, height),
@@ -112,6 +113,8 @@ fn overview_shows_ordinary_workstreams_and_only_opens_history_on_demand() {
         );
         tree.expect_key("swarm-overview-scroll");
         tree.expect_key(&format!("swarm-task-{}", task.id));
+        tree.expect_key(&format!("swarm-explain-step-{}", task.id));
+        assert!(has(&tree, "Ready to claim"));
         tree.expect_text("Recovery");
         assert!(has(&tree, "reader/verify"));
         assert!(!tree.has_key("swarm-feed") && !tree.has_key("swarm-receipt-scroll"));
@@ -152,6 +155,42 @@ fn public_read_marker_survives_restart_without_consuming_worker_notifications() 
     assert_eq!(b.swarm_public_seen("reader", &run.slug).unwrap(), posted);
     assert!(!Steps::swarm(run.id).view(&f).has_key("swarm-public-new"));
     assert_eq!(ack(), before);
+}
+
+#[test]
+fn suppressed_mention_is_visible_in_conversation_and_task_thread() {
+    use board_local::automation::{TaskTarget, create_task};
+    let f = Fixture::new();
+    let b = Board::open(&f.db).unwrap();
+    let run = seed(&b);
+    b.swarm_set_limit("reader", &run.slug, 0).unwrap();
+    let task = create_task(
+        &b,
+        "reader",
+        TaskTarget::New {
+            channel: &run.channel,
+            text: "Fix restore",
+            options: &Default::default(),
+        },
+        &[],
+        None,
+    )
+    .unwrap();
+    let post = b
+        .reply(
+            task.id,
+            "reader/impl",
+            "@verify Check my fix",
+            &Default::default(),
+        )
+        .unwrap();
+    let receipt = "Addressed @verify but not notified: run limit reached";
+    let mut steps = Steps::swarm(run.id);
+    steps.view(&f).expect_text(receipt);
+    steps.tap(format!("swarm-message-{}", post.id));
+    let thread = steps.view(&f);
+    assert!(!thread.has_key("swarm-feed"));
+    thread.expect_text(receipt);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 ## Desktop to MCP handoff
 
-Run `cargo build --locked -p board-cli -p board-ui`, then `python3 -B scripts/swarm_handoff.py --bin-dir target/debug`. The fixture uses an actual desktop task reply, separately bound stdio clients and a disposable SQLite database. A verifier reconnects after losing an inbox response, reads the same addressed reply and published evidence bytes, and retries a revision-bound verification. Only one verification and notification are recorded; the result opens in the original desktop thread. No vendor executable or model is involved.
+Run `cargo build --locked -p board-cli -p board-ui`, then `python3 -B scripts/swarm_handoff.py --bin-dir target/debug`. A desktop user replies to the task. A verifier reconnects after losing that inbox response, checks the uploaded bytes, and reports a missing version header. The coordinator then disconnects. Two independently bound stdio clients exchange the corrected artifact and its passing check on the same task. The fixture checks that retries duplicate neither evidence nor notifications, and that a returning reader can see both revisions in the original thread. It uses a disposable board and no vendor executable or model.
 
 ## Restartable worker pool
 

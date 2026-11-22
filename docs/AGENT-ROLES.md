@@ -57,7 +57,7 @@ Every swarm run gets a Board channel (`swarms/<run-slug>`), and each worker post
 `board swarm post` writes to the swarm's shared channel. It does **not** take a `--to` flag. Ordinary posts and thread replies in an active swarm channel use the same addressing rules, including replies from the desktop task thread.
 
 - **No `@mention`:** An ordinary progress post is visible in Rune but notifies nobody. Structured handoffs, verification and decision records notify their addressed participant as described below.
-- **With `@name`:** Posts publicly **and** sends a notification to `@name` (waking them if they are waiting, or queuing in their unread notifications if they are currently working).
+- **With `@name`:** Addresses the teammate publicly. If the peer notification limit allows it, Board signals their inbox. A signal is not proof the teammate read the post.
 
 If an agent is only talking *about* a teammate and doesn't want to wake them, it uses their plain name without `@`. Workers can also attach git diffs (`--diff`) or structured `verdict@1` cards so commits and pass/fail checks render cleanly in Rune.
 
@@ -65,8 +65,8 @@ If an agent is only talking *about* a teammate and doesn't want to wake them, it
 
 `board swarm dm --to <name>` requires `--to`. A successful DM and its notification commit together. A stopped recipient or exhausted peer notification limit returns an error instead of silently dropping the wakeup.
 
-- Keeps side questions and back-and-forth chatter out of the main public thread.
-- Still stored in SQLite and **visible in Rune** so you never lose sight of intermediate agent-to-agent conversations.
+- Reserve DMs for matters that should not be on the shared thread. Keep findings that affect the work, revisions and rechecks together in the task thread; do not copy private DMs there.
+- Stored in SQLite and visible in Rune to authorized participants and operators, not the rest of the worker roster.
 - Humans can also DM any worker directly from Rune or the CLI.
 
 ### Waiting and live status (`board swarm wait`)
@@ -95,7 +95,7 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 - **Coordinator control:** The coordinator actor, its owning person, or the trusted local board owner can register workers, change the notification limit (`board swarm set-limit N --run RUN`), or stop the run. A local owner inspecting someone else's run does not consume its coordinator inbox. Workers can mark themselves done and ask `@coordinator` for help. A peer notification or DM never launches a process. There is no `@all` wakeup. When the peer budget is exhausted, a public post still lands and reports suppressed recipients; a peer DM fails rather than pretending it notified someone. Coordinator exchanges remain available.
 - **When the coordinator disconnects:** SQLite cannot detect whether a chat is connected or distinguish two trusted processes using the same actor. The harness owns its sessions and decides their shutdown policy. An already-running independent worker can still communicate within the active run's limits; nothing in Board spawns a replacement. Explicitly stop the run before disconnecting when workers must exit: blocked waits return `stopped`, but Board cannot kill unrelated in-flight tools. Do not give untrusted executables direct access to the owner's SQLite file.
 - **Rune never starts work automatically:** Opening a board or viewing a swarm in Rune is always passive. Explicit user actions (posting a message, sending a DM, clicking **Stop**) take effect normally.
-- **Backlogs and tickets:** Day-to-day `@impl ↔ @verifier` iteration stays in messages and DMs. For batch work (like draining a list of Linear or GitHub issues pulled with `board sync pull ... --as-tasks`), workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket.
+- **Backlogs and tickets:** Workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket. Review happens in the task thread, without a coordinator relaying messages.
 
 For new parallel work, the coordinator can submit an ordinary task plan to the swarm channel, launch a small worker pool in the chat, and inspect counts and exceptions with `swarm observe` instead of relaying each handoff. The [pool workflow](MCP.md#pool-workflow) covers dependency fan-in, queue waits, renewal, and coordinator reconnects. Schema v19 removes the separate swarm plan ledger without changing existing tasks, batch receipts, assignments, run policy or role attachments. Back up with the old binary before upgrading.
 
@@ -107,7 +107,7 @@ Schema v20 adds optional worker runtime reports and viewer-specific public-feed 
 
 **Needs attention** separates actions assigned to your actor from **Agent follow-up**. Explicit decision requests, observed launch failures and blocked/failed tasks carry who is waiting, who should act, and a source thread. Tasks assigned to agents and failing or unrun verification checks remain visible as follow-up without becoming human alerts. Use `board swarm attention` (MCP: `board_attention`) for the same read model.
 
-For an implementer/verifier exchange, post one of these built-in schemas using `board swarm post --schema NAME@1 --schema-data JSON` or the existing `swarm_post` MCP tool. Posting or replying through the ordinary composer/CLI in that run's `swarms/RUN` channel records the same evidence. Posting these records outside a run is rejected rather than silently losing the requested action. The records are validated and saved atomically with the post; retries using a CLI idempotency key do not create another handoff. Editing an existing message does not create or rewrite a coordination record.
+For a task in `swarms/RUN`, use `board_reply(id: TASK, text, schema, schema_data)` or `board reply TASK --schema NAME@1 'JSON'`. Both workers reply to the same task ID. A plain reply is enough for a question or finding; use the records below for an independently checkable result. For a task outside the run channel, keep structured swarm evidence in the run channel and link the task rather than moving its discussion. Records are validated and saved atomically with the post. A stable idempotency key makes a retry safe; editing the post cannot rewrite its evidence.
 
 | Schema | Required fields |
 | --- | --- |
@@ -118,13 +118,7 @@ For an implementer/verifier exchange, post one of these built-in schemas using `
 
 Handoffs notify the named verifier; verification notifies the author, using the existing notification budget. Missing or suppressed notifications do not lose the evidence. Decisions directed at a run participant notify that participant. These notifications only wake existing waits, never launch agents.
 
-For example, with the returned implementer worker environment selected and a verifier named `verify`:
-
-```sh
-board swarm check-in
-revision=$(git rev-parse HEAD)
-handoff=$(board swarm post --schema handoff@1 --schema-data "{\"revision\":{\"kind\":\"git-commit\",\"value\":\"$revision\"},\"summary\":\"Fix Unicode splitting\",\"changes\":[\"src/fields.rs\"],\"to\":\"verify\"}")
-```
+For example, on task #42 the author replies with a handoff for revision A addressed to `verify`. The verifier replies to #42 with the failing command and references A's handoff. The author replies with a new handoff for revision B, still naming task #42. The verifier replies with B's check. A returning participant can open #42 to see what failed, what changed and what actually passed.
 
 The verifier uses the returned handoff ID and that exact revision. A result against another hash is rejected. Mixed passing and unrun checks produce **not-run**, not a green pass; any failed check produces **fail**. `verdict@1` remains available for older evidence, but its optional artifact string is not promoted into a revision-bound receipt. Board validates identity and consistency, not whether the submitted commands actually ran: the verifier remains responsible for truthful evidence.
 

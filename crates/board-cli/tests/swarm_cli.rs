@@ -64,12 +64,19 @@ fn cli_checkin_handoff_verification_and_operator_decision_form_one_receipt() {
         )
     };
     let revision = json!({"kind":"git-commit","value":"a".repeat(40)});
+    let task = b.get("", &["tasks", "create", "swarms/sample", "Fix split"])["id"].clone();
     let h = post(
         "impl",
         "handoff@1",
-        json!({"revision":revision,"summary":"Fix split","changes":["src/lib.rs"],"to":"verify"}),
+        json!({"revision":revision,"task":task,"summary":"Fix split","changes":["src/lib.rs"],"to":"verify"}),
     );
     let id = h["message"]["id"].as_i64().unwrap();
+    let why = b.get(
+        "",
+        &["swarm", "observe", "--explain-task", &task.to_string()],
+    );
+    assert_eq!(why["steps"][0]["handoff"]["id"], id);
+    assert_eq!(why["steps"][0]["state"], "ready");
     post(
         "verify",
         "verification@1",

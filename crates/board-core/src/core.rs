@@ -82,6 +82,12 @@ pub struct Message {
     pub edited_at: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<crate::MentionResolution>,
+    /// Swarm notifications recorded on publication, not read receipts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notified: Vec<String>,
+    /// Otherwise eligible recipients not notified because the run reached its limit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suppressed: Vec<String>,
     pub revision: i64,
     pub deleted: bool,
     /// This message (and, for a root, its entire thread) never leaves through a connector.
@@ -555,6 +561,8 @@ impl Board {
             created_at,
             edited_at,
             mentions: vec![],
+            notified: vec![],
+            suppressed: vec![],
             revision,
             deleted,
             no_sync,

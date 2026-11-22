@@ -475,6 +475,15 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     assert_eq!(obs["available_capacity"], 1);
     assert_eq!(obs["policy"]["retry_budget"], 1);
     assert_eq!(obs["actions"][0]["blocked_dependents"], 1);
+    let focused = boss.call(
+        "swarm_observe",
+        json!({"explain_task":made["tasks"][0]["id"],"limit":2}),
+    );
+    assert_eq!(focused["task_id"], made["tasks"][0]["id"]);
+    assert_eq!(focused["steps"][0]["waits_on"], json!([a, b]));
+    assert_eq!(focused["steps"][1]["reason"], "awaiting fixture");
+    assert_eq!(focused["truncated"], true);
+    assert!(focused.get("changes").is_none());
     let page = boss.call(
         "swarm_observe",
         json!({"limit":1,"action_after":obs["next_action_after"],"after":obs["cursor"]}),
@@ -578,15 +587,22 @@ fn ordinary_public_replies_record_evidence_once_on_retry() {
         json!({"slug":"release","goal":"verify one change"}),
     );
     boss.call("swarm_add", json!({"name":"check","brief":"verify"}));
+    boss.call("swarm_add", json!({"name":"build","brief":"build"}));
+    boss.call("swarm_set_limit", json!({"max_notifications":0}));
     let mut verifier = Client::start_session(&path, None, None, Some("release/check"));
     verifier.initialize();
     let args = json!({"channel":run["channel"],"text":"Review @check","idempotency_key":"mcp-public-root"});
     let root = boss.call("board_post", args.clone());
+    assert_eq!(root["notified"], json!(["check"]));
     assert_eq!(boss.call("board_post", args)["id"], root["id"]);
-    let args = json!({"id":root["id"],"text":"Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
+    let args = json!({"id":root["id"],"text":"@build Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
     let reply = verifier.call("board_reply", args.clone());
     assert_eq!(reply["re"], root["id"]);
-    assert_eq!(verifier.call("board_reply", args)["id"], reply["id"]);
+    assert_eq!(reply["notified"], json!(["coordinator"]));
+    assert_eq!(reply["suppressed"], json!(["build"]));
+    let replay = verifier.call("board_reply", args);
+    assert_eq!(replay["id"], reply["id"]);
+    assert_eq!(replay["suppressed"], reply["suppressed"]);
     let receipt = boss.call("swarm_receipt", json!({}));
     assert_eq!(receipt["decisions"].as_array().unwrap().len(), 1);
     assert_eq!(receipt["decisions"][0]["id"], reply["id"]);

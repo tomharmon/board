@@ -37,6 +37,18 @@ pub struct Task {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold_kind: Option<String>,
     pub needs: Vec<i64>,
+    /// Expanded only when opening the task or receiving its lease, never in event snapshots.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<TaskInput>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskInput {
+    /// The prerequisite's ordinary task thread is the source of its state and result.
+    pub id: i64,
+    pub state: String,
+    pub result: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff: Option<crate::swarm::TaskHandoff>,
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TaskReply {
@@ -84,6 +96,7 @@ pub(crate) fn task_optional(conn: &Connection, id: i64) -> Result<Option<Task>> 
                     result: r.get(8)?,
                     hold_kind: r.get(9)?,
                     needs,
+                    inputs: vec![],
                 })
             },
         )
@@ -109,7 +122,38 @@ fn visible(a: &Access, c: &Connection, mut t: Task) -> Result<Task> {
         }
         t.needs = needs;
     }
+    if t.claim_token.is_some() {
+        t.load_inputs(c, a)?;
+    }
     Ok(t)
+}
+
+impl Task {
+    pub(crate) fn load_inputs(&mut self, c: &Connection, a: &Access) -> Result<()> {
+        self.inputs.clear();
+        if self.needs.is_empty() {
+            return Ok(());
+        }
+        let mut stmt = c.prepare_cached(
+            "SELECT m.channel,
+             CASE WHEN t.state='claimed' AND t.lease_until<=unixepoch() THEN 'expired' ELSE t.state END,
+             CASE WHEN NOT m.deleted THEN t.result END
+             FROM tasks t JOIN messages m USING(id) WHERE t.id=?",
+        )?;
+        for &id in &self.needs {
+            let (channel, state, result): (String, String, Option<String>) =
+                stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            if a.allows(Action::Read, &channel) {
+                self.inputs.push(TaskInput {
+                    id,
+                    state,
+                    result,
+                    handoff: crate::swarm::task_handoff_on(c, a, id, None)?,
+                });
+            }
+        }
+        Ok(())
+    }
 }
 fn visible_needs(a: &Access, c: &Connection, needs: &[i64]) -> Result<()> {
     for &id in needs {
@@ -155,7 +199,8 @@ pub fn get_task(board: &Board, id: i64) -> Result<Task> {
     let a = board.access_on(&tx)?;
     a.message(&tx, id, Action::Read)?;
     expire_one(&tx, id, now())?;
-    let current = visible(&a, &tx, task(&tx, id)?)?;
+    let mut current = visible(&a, &tx, task(&tx, id)?)?;
+    current.load_inputs(&tx, &a)?;
     tx.commit()?;
     Ok(current)
 }
@@ -1520,7 +1565,7 @@ pub fn change_task(
             "needs_changed"
         }
     };
-    let t = publish_queue_state(&tx, id, actor, name)?;
+    let mut t = publish_queue_state(&tx, id, actor, name)?;
     if t.state == "completed" {
         for dep in ids(
             &tx,
@@ -1533,11 +1578,11 @@ pub fn change_task(
             }
         }
     }
-    let mut t = visible(&access, &tx, t)?;
-    tx.commit()?;
     if name == "renewed" {
         t.claim_token = token.map(str::to_owned);
     }
+    let t = visible(&access, &tx, t)?;
+    tx.commit()?;
     Ok(t)
 }
 

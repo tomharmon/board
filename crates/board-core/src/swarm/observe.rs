@@ -31,6 +31,33 @@ pub struct RunThread {
     pub latest_check: Option<i64>,
 }
 #[derive(Debug, Serialize)]
+pub struct TaskExplanation {
+    pub task_id: i64,
+    pub steps: Vec<WaitStep>,
+    pub truncated: bool,
+}
+#[derive(Debug, Serialize)]
+pub struct WaitStep {
+    pub id: i64,
+    pub title: String,
+    pub state: String,
+    pub reason: String,
+    pub waits_on: Vec<i64>,
+    pub handoff: Option<TaskHandoff>,
+}
+impl WaitStep {
+    pub fn review_link(&self) -> Option<(i64, String)> {
+        let h = self.handoff.as_ref()?;
+        Some(match &h.verification {
+            Some(v) => (v.id, format!("Verification #{}: {}", v.id, v.status)),
+            None => (
+                h.id,
+                format!("Handoff #{} awaits verification by @{}", h.id, h.to),
+            ),
+        })
+    }
+}
+#[derive(Debug, Serialize)]
 pub struct SwarmObservation {
     pub run: String,
     pub goal: String,
@@ -60,6 +87,95 @@ fn counts(
 }
 
 impl Board {
+    /// Start in this run and follow explicit, readable, unfinished prerequisites.
+    /// Only this run's evidence is relevant; review never creates a dependency.
+    pub fn swarm_explain_task(
+        &self,
+        actor: &str,
+        run: &str,
+        task_id: i64,
+        limit: usize,
+    ) -> Result<TaskExplanation> {
+        ensure!(
+            (1..=100).contains(&limit),
+            Invalid.error("invalid_page", "limit must be 1..100")
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        let (access, r) = self.swarm_record(&tx, actor, run, Action::Read)?;
+        let mut pending = vec![(task_id, r.channel.clone())];
+        let mut seen = BTreeSet::from([task_id]);
+        let mut steps = Vec::new();
+        let mut task = tx.prepare("SELECT substr(m.text,1,160),
+            CASE WHEN t.state='claimed' AND t.lease_until<=unixepoch() THEN 'expired' ELSE t.state END,
+            t.holder, substr(t.result,1,400)
+            FROM tasks t JOIN messages m USING(id) WHERE t.id=? AND m.channel=? AND NOT m.deleted")?;
+        let mut needs = tx.prepare(
+            "SELECT n.need,m.channel FROM task_needs n JOIN tasks t ON t.id=n.need
+            JOIN messages m ON m.id=n.need WHERE n.task=? AND t.state!='completed'
+            AND NOT m.deleted ORDER BY n.need",
+        )?;
+        while steps.len() < pending.len().min(limit) {
+            let (id, channel) = &pending[steps.len()];
+            let id = *id;
+            let (title, state, holder, result): (String, String, Option<String>, Option<String>) =
+                task.query_row(params![id, channel], |s| {
+                    Ok((s.get(0)?, s.get(1)?, s.get(2)?, s.get(3)?))
+                })
+                .optional()?
+                .context(Missing.error("not_found", "task not found in this run"))?;
+            let mut waits_on = Vec::new();
+            if state == "waiting" {
+                let mut links = needs.query([id])?;
+                while let Some(link) = links.next()? {
+                    let channel = link.get_ref(1)?.as_str()?;
+                    if access.allows(Action::Read, channel) {
+                        let need = link.get(0)?;
+                        waits_on.push(need);
+                        if seen.insert(need) {
+                            pending.push((need, channel.to_owned()));
+                        }
+                    }
+                }
+            }
+            let reason = match state.as_str() {
+                "waiting" if waits_on.is_empty() => "No unfinished prerequisite is visible.".into(),
+                "waiting" => format!(
+                    "Visible unfinished prerequisites: {}",
+                    waits_on
+                        .iter()
+                        .map(|n| format!("#{n}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                "blocked" | "failed" | "canceled" => {
+                    result.unwrap_or_else(|| "No reason recorded.".into())
+                }
+                "ready" => "Ready to claim; no reason for inactivity is recorded.".into(),
+                "claimed" => format!(
+                    "Claimed by {}; activity inside the harness is unknown.",
+                    holder.as_deref().unwrap_or("unknown")
+                ),
+                "expired" => "Claim lease expired; worker activity is unknown.".into(),
+                "completed" => "Task completed.".into(),
+                _ => "No reason recorded.".into(),
+            };
+            steps.push(WaitStep {
+                id,
+                title: title.lines().next().unwrap_or_default().into(),
+                state,
+                reason,
+                waits_on,
+                handoff: task_handoff_on(&tx, &access, id, Some(r.id))?,
+            });
+        }
+        drop((task, needs));
+        tx.commit()?;
+        Ok(TaskExplanation {
+            task_id,
+            truncated: steps.len() < pending.len(),
+            steps,
+        })
+    }
     /// A viewer's public feed bookmark is independent of any participant's addressed inbox.
     pub fn swarm_public_seen(&self, actor: &str, run: &str) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;

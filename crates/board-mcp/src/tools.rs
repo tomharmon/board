@@ -120,6 +120,20 @@ pub(crate) fn execute(
                 },
             )?,
         ),
+        "swarm_observe" if p["explain_task"].is_i64() => {
+            ensure!(
+                ["after", "action_after", "task_after"]
+                    .iter()
+                    .all(|k| p.get(*k).is_none()),
+                "explain_task cannot be combined with page cursors"
+            );
+            value(b.swarm_explain_task(
+                actor,
+                &run()?,
+                p["explain_task"].as_i64().unwrap(),
+                p["limit"].as_u64().unwrap_or(20) as usize,
+            )?)
+        }
         "swarm_observe" => value(b.swarm_observe_page(
             actor,
             &run()?,

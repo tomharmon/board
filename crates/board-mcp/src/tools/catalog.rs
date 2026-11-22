@@ -152,7 +152,7 @@ macro_rules! tools {
 }
 tools! {
     "swarm_start","Record a goal, worker capacity and retry budget; no workers are launched.",[goal:Text],[slug:Text,repo_root:Text,max_notifications:Count,max_active:Slots,retry_budget:Retries];
-    "swarm_observe","Read the goal, ordinary task threads, current exceptions and recent changes. Page threads with next_task_after, exceptions with next_action_after, and changes with cursor.",[],[run:Run,after:Cursor,action_after:Cursor,task_after:Cursor,limit:Page];
+    "swarm_observe","Read the run overview, paging threads with next_task_after, exceptions with next_action_after, and changes with cursor. Or pass explain_task instead of cursors for that task's unfinished prerequisite chain and linked review evidence. limit bounds the returned steps.",[],[run:Run,after:Cursor,action_after:Cursor,task_after:Cursor,explain_task:Id,limit:Page];
     "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
     "swarm_add","Register an assignment without starting a process. Returns its worker selector; only export_local:true writes skills and returns a local CLI launch package.",[name:Text,brief:Text],[run:Run,role:Text,workspace_path:Text,branch_name:Text,export_local:Bool];
     "swarm_status","Inspect a run and its roster. Omit run to use BOARD_SWARM_RUN.",[],[run:Run];
@@ -163,7 +163,7 @@ tools! {
     "board_attention","List explicit decisions and blocked work; action_required distinguishes this actor's actions from agent follow-up.",[],[];
     "swarm_decide","Answer an explicit decision request addressed to this actor, even after stop.",[id:Id,summary:Text],[run:Run];
     "swarm_set_limit","Adjust a run's peer notification budget. Requires coordinator or owning person.",[max_notifications:Count],[run:Run];
-    "swarm_post","Post publicly; @name notifies that teammate. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,labels:Labels,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    "swarm_post","Post publicly; @name addresses a teammate. Returns notified and budget-suppressed recipients, not read receipts. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,labels:Labels,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
     "swarm_dm","Send a side message to a worker name or coordinator.",[to:Text,text:Text],[run:Run];
     "swarm_read","Read visible conversation in cursor order without acknowledging it. Filter kind by public, dm, or addressed (to you); optionally filter by worker name.",[],[run:Run,after:Cursor,limit:Limit,kind:Text,worker:Text];
     "swarm_wait","Wait for your addressed notifications. Pass the last processed message batch's cursor as ack on your next call; unacknowledged batches can replay. Use after instead to read from a position without acknowledging.",[],[run:Run,after:Cursor,ack:Id,timeout_seconds:Seconds];
@@ -175,13 +175,13 @@ tools! {
     "board_file_upload","Stage up to 64 KiB of evidence as standard padded base64. Returns attachment metadata; publish its id in a post or reply's attachment_ids.",[channel:Text,name:Text,content_type:Text,data_base64:Base64Chunk],[];
     "board_file_read","Read a bounded slice of an authorized attachment by ID. Append decoded data_base64 bytes and continue with next_offset until null.",[id:Id],[offset:Cursor,length:FileChunk];
     "board_whoami","Report the identity bound to this connection and its worker assignment, if any. Never changes identity.",[],[];
-    "board_post","Create a thread. In a live swarm channel, @name notifies that teammate. Use idempotency_key for retries.",[channel:Text,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "board_reply","Reply by message ID. In a live swarm channel, @name notifies that teammate. Use idempotency_key for retries.",[id:Id,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "board_read","Read a thread by message ID or search visible messages. Channel scopes ending with / include descendants.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,after:Cursor,limit:Limit];
+    "board_post","Create a thread. In swarm channels, notified lists signaled teammates; suppressed lists those not signaled due to the run limit. Empty lists are omitted. Use idempotency_key for retries.",[channel:Text,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    "board_reply","Reply by message ID. In swarm channels, notified lists signaled teammates; suppressed lists those not signaled due to the run limit. Empty lists are omitted. Use idempotency_key for retries.",[id:Id,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    "board_read","Read a thread by message ID or search visible messages. An opened task includes its readable prerequisite results and revision evidence in message.task.inputs. Channel scopes ending with / include descendants.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,after:Cursor,limit:Limit];
     "tasks_list","List visible tasks oldest first. Pass next_after as after for the next page; cursor is the snapshot event head.",[],[channel:Text,state:Text,assignee:Text,labels:Labels,after:Cursor,limit:Limit];
     "tasks_create","Create a task with optional prerequisites, assignment and atomic initial claim.",[channel:Text,text:Text],[assignee:Text,needs:Ids,labels:Labels,claim:Bool];
     "tasks_plan","Create a batch of ordinary tasks and return them in input order. Use a stable key to retry; large batches checkpoint.",[channel:Text,tasks:PlanItems],[key:Text];
-    "tasks_claim","Exclusively lease by id or ready_channel. Only a ready queue can wait; nothing_ready means the wait timed out.",[],[id:Id,ready_channel:Text,labels:Labels,lease_seconds:Lease,wait_seconds:WaitSeconds];
+    "tasks_claim","Exclusively lease by id or ready_channel. inputs summarizes readable prerequisite results and their revision evidence. Only a ready queue can wait; nothing_ready means no eligible task was found.",[],[id:Id,ready_channel:Text,labels:Labels,lease_seconds:Lease,wait_seconds:WaitSeconds];
     "tasks_renew","Extend this session's live claim without changing its epoch.",[id:Id],[lease_seconds:Lease];
     "tasks_release","Return this session's claimed task to the eligible pool.",[id:Id],[];
     "tasks_complete","Complete a task using the fenced lease held by this MCP session.",[id:Id],[result:Text];
@@ -224,6 +224,9 @@ pub(crate) fn catalog(board: &board_local::Board, worker: bool, structured: bool
                 d["inputSchema"]["dependentRequired"] = json!({"skill":["path"],"path":["skill"]});
             } else if tool.name == "swarm_wait" {
                 d["inputSchema"]["not"] = json!({"required":["ack","after"]});
+            } else if tool.name == "swarm_observe" {
+                d["inputSchema"]["not"] = json!({"required":["explain_task"],
+                    "anyOf":[{"required":["after"]},{"required":["action_after"]},{"required":["task_after"]}]});
             } else if tool.name == "tasks_claim" {
                 d["inputSchema"]["oneOf"] = json!([{"required":["id"]},{"required":["ready_channel"]}]);
                 d["inputSchema"]["dependentRequired"] = json!({"wait_seconds":["ready_channel"]});
@@ -243,13 +246,15 @@ fn output_schema(name: &str) -> Option<Value> {
             "key":Kind::Text.schema(),"tasks":{"type":"array","items":{"type":"object","required":["id"],"properties":{"id":Kind::Id.schema()}}}
         }}),
         "swarm_observe" => {
-            json!({"required":["run","goal","channel","status","policy","workers","tasks","threads","next_task_after","available_capacity","actions","changes","cursor","next_action_after","has_more"],
+            json!({"oneOf":[{"required":["task_id","steps","truncated"],"properties":{"task_id":Kind::Id.schema(),
+                "steps":{"type":"array","items":{"type":"object","required":["id","title","state","reason","waits_on","handoff"]}},
+                "truncated":Kind::Bool.schema()}},{"required":["run","goal","channel","status","policy","workers","tasks","threads","next_task_after","available_capacity","actions","changes","cursor","next_action_after","has_more"],
                 "properties":{"run":Kind::Text.schema(),"status":Kind::Text.schema(),"policy":{"type":"object"},
                 "goal":Kind::Text.schema(),"channel":Kind::Text.schema(),"workers":{"type":"object"},"tasks":{"type":"object"},"available_capacity":Kind::Cursor.schema(),
                 "threads":{"type":"array","items":{"type":"object","required":["id","title","state"]}},"next_task_after":{"type":["integer","null"]},
                 "actions":{"type":"array"},"changes":{"type":"array"},"cursor":Kind::Cursor.schema(),
                 "next_action_after":{"type":["integer","null"]},"has_more":Kind::Bool.schema()}
-            })
+            }]})
         }
         _ => return None,
     })

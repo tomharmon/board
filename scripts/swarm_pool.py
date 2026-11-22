@@ -120,14 +120,15 @@ def exercise(exe, db, stack):
                     continue
                 tid = task["id"]
                 if task["needs"]:
-                    inputs = [c.call("board_read", target=n)["message"]["task"] for n in task["needs"]]
+                    inputs = task["inputs"]
+                    assert [item["id"] for item in inputs] == task["needs"]
                     assert all(t["state"] == "completed" for t in inputs)
                     value = sum(int(t["result"]) for t in inputs)
                 else:
                     value = int(task["text"].splitlines()[0].split()[1])
                 if tid == ids["synthesis"]:
                     digest = hashlib.sha256(str(value).encode()).hexdigest()
-                    c.call("swarm_post", text="Verify final sum", schema="handoff@1",
+                    c.call("board_reply", id=tid, text="Verify final sum", schema="handoff@1",
                            schema_data={"task": tid, "revision": {"kind": "sha256", "value": digest},
                                         "to": "worker-1", "summary": "Final sum", "changes": ["sum.txt"]})
                 assert c.call("tasks_complete", id=tid, result=str(value))["state"] == "completed"
@@ -165,7 +166,7 @@ def exercise(exe, db, stack):
     handoff, = verifier.call("swarm_receipt")["handoffs"]
     revision = {"kind": "sha256", "value": hashlib.sha256(b"5050").hexdigest()}
     assert handoff["handoff"]["revision"] == revision
-    verifier.call("swarm_post", text="Checked final sum", schema="verification@1",
+    verifier.call("board_reply", id=ids["synthesis"], text="Checked final sum", schema="verification@1",
                   schema_data={"handoff": handoff["id"], "revision": revision, "summary": "Passed",
                                "checks": [{"name": "Independent sum", "command": "sum(range(1, 101))",
                                            "status": "pass", "output": "5050"}]})

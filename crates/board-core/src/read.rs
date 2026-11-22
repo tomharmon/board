@@ -446,7 +446,10 @@ impl Board {
         if latest {
             replies.reverse();
         }
-        let root = a.view(&tx, root)?;
+        let mut root = a.view(&tx, root)?;
+        if let Some(task) = &mut root.task {
+            task.load_inputs(&tx, &a)?;
+        }
         tx.commit()?;
         Ok(Conversation {
             message: root,

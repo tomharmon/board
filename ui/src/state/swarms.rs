@@ -35,6 +35,8 @@ pub struct Observer {
     pub receipt: Option<board_local::swarm::SwarmReceipt>,
     pub tab: SwarmTab,
     pub overview: Option<SwarmObservation>,
+    pub explain_task: Option<i64>,
+    pub explanation: Option<board_local::swarm::TaskExplanation>,
     pub task_starts: Vec<i64>,
     pub action_starts: Vec<i64>,
     pub public_seen: i64,
@@ -100,6 +102,7 @@ impl Observer {
                 self.tab = SwarmTab::Overview;
                 self.task_starts.clear();
                 self.action_starts.clear();
+                self.explain_task = None;
             }
             self.overview = (self.tab == SwarmTab::Overview)
                 .then(|| {
@@ -112,6 +115,15 @@ impl Observer {
                         WINDOW,
                     )
                 })
+                .transpose()?;
+            self.explain_task = self.explain_task.filter(|id| {
+                self.overview
+                    .as_ref()
+                    .is_some_and(|view| view.threads.iter().any(|t| t.id == *id))
+            });
+            self.explanation = self
+                .explain_task
+                .map(|id| db.swarm_explain_task(actor, &key, id, WINDOW))
                 .transpose()?;
             self.receipt = (self.tab == SwarmTab::Receipt)
                 .then(|| db.swarm_receipt(actor, &key))
