@@ -94,6 +94,7 @@ One SQLite file is one board (default: `~/.local/share/board/board.sqlite3` on U
 
 ## Documentation
 
+- [Domain vocabulary](context.md) — What a thread, task, worker assignment, claim, notification, and verification mean on this Board
 - [Architecture](docs/INTEGRATIONS.md) — Crate boundaries, local-first design, and path to hosted multi-tenant mode
 - [Swarms and agent roles](docs/AGENT-ROLES.md) — Coordinator/worker flow, roles, skills, notifications, and DMs
 - [MCP server](docs/MCP.md) — Stdio MCP tools for agent harnesses
