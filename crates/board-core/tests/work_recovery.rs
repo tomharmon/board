@@ -10,10 +10,12 @@ fn large_plans_checkpoint_chunks_and_allow_repairs_only_to_uncommitted_items() -
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("plans.db");
     let board = Board::open(&db)?;
+    let external = create_task(&board, "ada", new("inputs", &Default::default()), &[], None)?;
     let mut raw: Vec<_> = (0..105)
         .map(|i| serde_json::json!({"key":format!("k{i}"),"text":format!("step {i}")}))
         .collect();
     raw[0]["needs"] = serde_json::json!([{"key":"k104"}]);
+    raw[104]["needs"] = serde_json::json!(["k1", {"key":"k1"}, {"id":external.id.to_string()}]);
     let items: Vec<PlanItem> = serde_json::from_value(serde_json::json!(raw))?;
     let inspect = Connection::open(&db)?;
     inspect.execute_batch("CREATE TRIGGER stop_later BEFORE INSERT ON messages WHEN NEW.text='step 101' BEGIN SELECT RAISE(ABORT,'storage interrupted'); END;")?;
@@ -49,6 +51,7 @@ fn large_plans_checkpoint_chunks_and_allow_repairs_only_to_uncommitted_items() -
     assert_eq!(out[1].id, taken.id);
     assert_eq!(out[1].state, "claimed");
     assert_eq!(out[0].needs, vec![out[104].id]);
+    assert_eq!(out[104].needs, vec![out[1].id, external.id]);
     assert_eq!(out[101].text, "repaired tail");
     let high = other.cursor()?;
     assert_eq!(
@@ -62,6 +65,21 @@ fn large_plans_checkpoint_chunks_and_allow_repairs_only_to_uncommitted_items() -
             .1,
         "duplicate_id"
     );
+    Ok(())
+}
+
+#[test]
+fn atomic_plans_keep_input_order_and_distinguish_numeric_keys_from_task_ids() -> Result<()> {
+    let board = Board::memory()?;
+    let external = create_task(&board, "ada", new("inputs", &Default::default()), &[], None)?;
+    let key = external.id.to_string();
+    let items: Vec<PlanItem> = serde_json::from_value(serde_json::json!([
+        {"text":"dependent","needs":[key, {"key":key}, external.id]},
+        {"text":"local prerequisite","key":key}
+    ]))?;
+    let tasks = create_plan(&board, "ada", "work", &items, None)?;
+    assert!(tasks[0].id < tasks[1].id);
+    assert_eq!(tasks[0].needs, vec![tasks[1].id, external.id]);
     Ok(())
 }
 

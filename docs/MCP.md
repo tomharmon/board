@@ -34,7 +34,6 @@ The registered connection is for the coordinator chat, not its subagents. Pass e
 
 ### Swarms & roles
 - `swarm_start` — Record a goal and optional limits: `max_active` (1..128, default 8), `retry_budget` (extra attempts, 0..1000, default 0), and the separate peer notification limit. The chat harness enforces launch and retry policy; Board never launches agents.
-- `swarm_plan` — Coordinator only. Submit a named dependency graph in the run channel; recover the same name-to-task-ID map by replaying the same key and items. See [Pool workflow](#pool-workflow).
 - `swarm_observe` — One run-scoped snapshot: worker and task counts, policy and available slots, paged current exceptions, and compact changes. No roster, private DMs, or transcript.
 - `swarm_list` — List visible swarm runs, newest first.
 - `swarm_add` — Register a named worker with a role preset and brief; returns the resolved prompt and materialized skills directory.
@@ -59,24 +58,26 @@ The registered connection is for the coordinator chat, not its subagents. Pass e
 ### Tasks
 - `tasks_list` — List tasks with channel/label/assignee filters. Pass `next_after` as `after` until it is null. This is an exclusive task ID, **not** the response's snapshot event `cursor`.
 - `tasks_create` — Create a single task. Use `needs` for existing prerequisite task IDs; `claim: true` creates and leases it atomically.
+- `tasks_plan` — Create an ordinary batch in any channel where you can post. Returns the batch key and tasks in input order. Supply a stable `key` to retry; otherwise Board generates one.
 - `tasks_claim` / `tasks_complete` / `tasks_fail` / `tasks_block` — Claim and settle work with fenced leases.
 - `tasks_renew` / `tasks_release` — Extend a live lease (`id`, optional `lease_seconds`) or return it to the queue (`id`), on the same connection that claimed it.
 
 ## Pool workflow
 
-Start a run and register the worker identities your chat will launch. Pass the following arguments to `swarm_plan` (CLI: `board swarm plan --run example --key report --file items.json`, where the file contains just the `items` array):
+Start a run and register the worker identities your chat will launch. Submit an ordinary `tasks_plan` to the channel returned by `swarm_start`. The equivalent CLI is `board tasks create swarms/example --idempotency-key example-report --file plan.json`, where the file contains just the `tasks` array:
 
 ```json
 {
-  "run": "example", "key": "report",
-  "items": [
-    {"key": "inspect", "text": "Investigate caching", "acceptance": "Cite measured hit rates", "output": "Evidence message ID", "labels": {"pool": "research"}},
-    {"key": "report", "text": "Synthesize findings", "needs": ["inspect"], "acceptance": "Trace the conclusion to the measurement", "output": "Report digest", "labels": {"pool": "synthesis"}}
+  "channel": "swarms/example",
+  "key": "example-report",
+  "tasks": [
+    {"key": "inspect", "text": "Investigate caching. Cite measured hit rates and return the evidence message ID.", "labels": {"pool": "research"}, "no_sync": true},
+    {"key": "report", "text": "Synthesize findings. Trace the conclusion to the measurement and return the report digest.", "needs": ["inspect"], "labels": {"pool": "synthesis"}, "no_sync": true}
   ]
 }
 ```
 
-The result maps each key to its ordinary Board task ID under `tasks`. Items can name later items, use an existing readable task ID as a prerequisite, or set `assignee`. There are at most 20 direct prerequisites per item and 4,096 items per submission. Up to 100 items commit together; larger plans validate all items before the first checkpoint and then commit in chunks. Interrupted large plans may already have claimable items: retry the **identical** submission, not a new key. A changed payload under the same key conflicts. After a run stops, you can still replay a finished plan to retrieve its IDs, but you cannot append work. Roots carry `swarm.plan` and `swarm.item` labels; plan items are local-only, not connector publishes.
+The result is `{key, tasks}`: each task's `id` is at the same position as its input item. Items can name later items, use an existing readable task ID as a prerequisite, or assign a profile with `for`. Put acceptance criteria and the expected output in the task text. Use `no_sync: true` for local-only items. A task can have up to 20 direct prerequisites. Up to 100 items commit together; larger plans commit in resumable chunks. Retry the same batch key without changing committed items; an uncommitted suffix can be repaired. Existing v18 swarm batches can still be read through the ordinary REST batch lookup, `GET /v1/task-batches?key=swarm-plan:<run-id>:<old-key>`.
 
 From a bound research worker, call `tasks_claim` with `{"ready_channel":"swarms/example","labels":{"pool":"research"},"wait_seconds":30}`. One eligible worker gets the task, even if several are waiting. Read prerequisite results with `board_read(target: ID)`; renew before `lease_until`. Finish with a durable output reference or release unfinished work. If a lease is lost, stop that attempt. Waiting on the work queue does not consume a mention or DM.
 

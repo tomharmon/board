@@ -17,7 +17,7 @@ enum Kind {
     Labels,
     Ids,
     Data,
-    Items,
+    PlanItems,
     Slots,
     Retries,
     Page,
@@ -44,10 +44,17 @@ impl Kind {
             Slots => json!({"type":"integer","minimum":1,"maximum":128,"default":8}),
             Retries => json!({"type":"integer","minimum":0,"maximum":1000,"default":0}),
             Page => json!({"type":"integer","minimum":1,"maximum":100,"default":20}),
-            Items => {
-                json!({"type":"array","minItems":1,"maxItems":4096,"items":{"type":"object","additionalProperties":false,
-                "required":["key","text","acceptance","output"],"properties":{"key":{"type":"string","pattern":"^[a-z0-9][a-z0-9_-]{0,63}$"},"text":{"type":"string","minLength":1},"acceptance":{"type":"string","minLength":1},"output":{"type":"string","minLength":1},"labels":Labels.schema(),"assignee":Text.schema(),"needs":{"type":"array","items":{"oneOf":[Text.schema(),Id.schema(),{"type":"object","additionalProperties":false,"required":["key"],"properties":{"key":Text.schema()}},{"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":Id.schema()}}]}}}}})
-            }
+            PlanItems => json!({"type":"array","minItems":1,"items":{
+                "type":"object","additionalProperties":false,"required":["text"],"properties":{
+                    "text":Text.schema(),"key":{"type":["string","null"]},
+                    "for":{"type":["string","null"]},"labels":Labels.schema(),
+                    "attachment_ids":Ids.schema(),"no_sync":Bool.schema(),"noSync":Bool.schema(),
+                    "needs":{"type":"array","items":{"oneOf":[Text.schema(),Id.schema(),
+                        {"type":"object","additionalProperties":false,"required":["key"],"properties":{"key":Text.schema()}},
+                        {"type":"object","additionalProperties":false,"required":["id"],"properties":{"id":{"oneOf":[Id.schema(),Text.schema()]}}}
+                    ]}}
+                }
+            }}),
         }
     }
     fn accepts(self, v: &Value) -> bool {
@@ -72,7 +79,7 @@ impl Kind {
             Slots => v.as_i64().is_some_and(|n| (1..=128).contains(&n)),
             Retries => v.as_i64().is_some_and(|n| (0..=1000).contains(&n)),
             Page => v.as_i64().is_some_and(|n| (1..=100).contains(&n)),
-            Items => v.as_array().is_some_and(|a| (1..=4096).contains(&a.len())),
+            PlanItems => v.as_array().is_some_and(|a| !a.is_empty()),
         }
     }
 }
@@ -131,7 +138,6 @@ macro_rules! tools {
 }
 tools! {
     "swarm_start","Record a goal, worker capacity and retry budget; no workers are launched.",[goal:Text],[slug:Text,repo_root:Text,max_notifications:Count,max_active:Slots,retry_budget:Retries];
-    "swarm_plan","Submit a replayable task graph in this run. Resubmit the identical key and items to recover the name-to-task-ID mapping.",[key:Text,items:Items],[run:Run];
     "swarm_observe","Read counts, available slots, current exceptions and a bounded change page. Omit after for recent context; resume changes with cursor and exceptions with next_action_after.",[],[run:Run,after:Cursor,action_after:Cursor,limit:Page];
     "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
     "swarm_add","Register a worker; returns its pinned instructions, skills directory and environment for your harness.",[name:Text,brief:Text],[run:Run,role:Text,workspace_path:Text,branch_name:Text];
@@ -157,6 +163,7 @@ tools! {
     "board_read","Read a thread by message ID or search visible messages. Channel scopes ending with / include descendants.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,after:Cursor,limit:Limit];
     "tasks_list","List visible tasks oldest first. Pass next_after as after for the next page; cursor is the snapshot event head.",[],[channel:Text,state:Text,assignee:Text,labels:Labels,after:Cursor,limit:Limit];
     "tasks_create","Create a task with optional prerequisites, assignment and atomic initial claim.",[channel:Text,text:Text],[assignee:Text,needs:Ids,labels:Labels,claim:Bool];
+    "tasks_plan","Create a batch of ordinary tasks and return them in input order. Use a stable key to retry; large batches checkpoint.",[channel:Text,tasks:PlanItems],[key:Text];
     "tasks_claim","Exclusively lease by id or ready_channel. Only a ready queue can wait; nothing_ready means the wait timed out.",[],[id:Id,ready_channel:Text,labels:Labels,lease_seconds:Lease,wait_seconds:WaitSeconds];
     "tasks_renew","Extend this session's live claim without changing its epoch.",[id:Id],[lease_seconds:Lease];
     "tasks_release","Return this session's claimed task to the eligible pool.",[id:Id],[];
@@ -170,7 +177,6 @@ pub(crate) fn coordinator_tool(name: &str) -> bool {
         "swarm_start"
             | "swarm_list"
             | "swarm_add"
-            | "swarm_plan"
             | "swarm_launch_failed"
             | "swarm_set_limit"
             | "swarm_stop"
@@ -212,8 +218,8 @@ pub(crate) fn catalog(board: &board_local::Board, worker: bool, structured: bool
 }
 fn output_schema(name: &str) -> Option<Value> {
     Some(match name {
-        "swarm_plan" => json!({"required":["run","key","tasks"],"properties":{
-            "run":Kind::Text.schema(),"key":Kind::Text.schema(),"tasks":{"type":"object","additionalProperties":Kind::Id.schema()}
+        "tasks_plan" => json!({"required":["key","tasks"],"properties":{
+            "key":Kind::Text.schema(),"tasks":{"type":"array","items":{"type":"object","required":["id"],"properties":{"id":Kind::Id.schema()}}}
         }}),
         "swarm_observe" => {
             json!({"required":["run","status","policy","workers","tasks","available_capacity","actions","changes","cursor","next_action_after","has_more"],

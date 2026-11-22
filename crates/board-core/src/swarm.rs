@@ -4,9 +4,7 @@ pub use feed::SwarmFilter;
 mod coordination;
 mod materialize;
 mod observe;
-mod plan;
 pub use observe::{RunAction, RunChange, SwarmObservation};
-pub use plan::{PlanReceipt, RunPolicy, SwarmPlanItem};
 mod wait;
 use crate::{
     Board, Message, PostOptions,
@@ -46,6 +44,47 @@ pub struct SwarmStart {
     pub repo_root: Option<String>,
     pub max_notifications: Option<i64>,
 }
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RunPolicy {
+    pub max_active: i64,
+    pub retry_budget: i64,
+}
+impl Default for RunPolicy {
+    fn default() -> Self {
+        Self {
+            max_active: 8,
+            retry_budget: 0,
+        }
+    }
+}
+impl RunPolicy {
+    fn validate(self) -> Result<()> {
+        ensure!(
+            (1..=128).contains(&self.max_active) && (0..=1000).contains(&self.retry_budget),
+            Invalid.error(
+                "invalid_policy",
+                "max_active must be 1..128 and retry_budget 0..1000"
+            )
+        );
+        Ok(())
+    }
+    fn read(c: &Connection, id: i64) -> Result<Self> {
+        Ok(c.query_row(
+            "SELECT max_active,retry_budget FROM swarm_policy WHERE run_id=?",
+            [id],
+            |r| {
+                Ok(Self {
+                    max_active: r.get(0)?,
+                    retry_budget: r.get(1)?,
+                })
+            },
+        )
+        .optional()?
+        .unwrap_or_default())
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SwarmAddWorker {
     pub name: String,

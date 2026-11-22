@@ -1,15 +1,15 @@
 use super::*;
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Serialize)]
 enum Edge {
     Existing(i64),
     Item(usize),
 }
-struct Graph {
+struct Plan<'a> {
+    items: &'a [PlanItem],
     edges: Vec<Vec<Edge>>,
     order: Vec<usize>,
-    digests: Vec<Vec<u8>>,
 }
 fn bad() -> crate::errors::Rejection {
     Invalid.error("invalid_needs", "invalid or cyclic plan prerequisites")
@@ -21,7 +21,7 @@ fn duplicate() -> crate::errors::Rejection {
     )
 }
 
-fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
+fn parse(items: &[PlanItem]) -> Result<Plan<'_>> {
     let mut keys = BTreeMap::new();
     for (i, item) in items.iter().enumerate() {
         if let Some(k) = &item.key {
@@ -31,7 +31,6 @@ fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
     let mut edges = Vec::new();
     let mut counts = vec![0; items.len()];
     let mut dependents = vec![Vec::new(); items.len()];
-    let mut digests = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let mut prior = Vec::new();
         for p in &item.needs {
@@ -54,7 +53,6 @@ fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
             }
             prior.push(edge);
         }
-        digests.push(fingerprint((channel, item, &prior))?);
         edges.push(prior);
     }
     let mut ready: BTreeSet<_> = counts
@@ -73,74 +71,129 @@ fn graph(channel: &str, items: &[PlanItem]) -> Result<Graph> {
         }
     }
     ensure!(order.len() == items.len(), bad());
-    Ok(Graph {
+    Ok(Plan {
+        items,
         edges,
         order,
-        digests,
     })
 }
-pub(super) fn validate(channel: &str, items: &[PlanItem]) -> Result<()> {
-    graph(channel, items).map(|_| ())
+
+fn plan_assignee(actor: &str, assignee: Option<&str>) -> Result<Option<String>> {
+    let who = assignee.map(|p| {
+        if p.contains('/') {
+            p.to_owned()
+        } else {
+            format!("{}/{}", person(actor), p)
+        }
+    });
+    if let Some(who) = who.as_deref() {
+        validate_assignee(actor, who)?;
+    }
+    Ok(who)
 }
 
-/// Immutable, checkpointed swarm submissions cannot correct an invalid suffix
-/// after earlier chunks have become claimable. Check the whole input read-only.
-pub(crate) fn preflight(
+pub(super) fn publish_all(
     tx: &Transaction<'_>,
     access: &Access,
     actor: &str,
     channel: &str,
     items: &[PlanItem],
-) -> Result<()> {
-    let g = graph(channel, items)?;
-    let mut external = BTreeSet::new();
-    for (item, edges) in items.iter().zip(g.edges) {
-        let edges: BTreeSet<_> = edges.into_iter().collect();
-        ensure!(
-            edges.len() <= MAX_DIRECT_NEEDS,
-            Invalid.error("invalid_needs", "at most 20 direct prerequisites")
-        );
-        external.extend(edges.into_iter().filter_map(|e| match e {
-            Edge::Existing(id) => Some(id),
-            Edge::Item(_) => None,
-        }));
-        plan_assignee(actor, item.assignee.as_deref())?;
-        let (text, _) = crate::actors::settle(tx, access, actor, None, &item.text)?;
-        crate::validate_post(
-            channel,
-            actor,
-            &text,
-            &PostOptions {
-                labels: item.labels.clone(),
-                ..Default::default()
-            },
-        )?;
-        Board::blocks_on(tx, &text)?;
-    }
-    for id in external {
-        visible_needs(access, tx, &[id])?;
-        require_prerequisite(tx, id)?;
-    }
-    Ok(())
+) -> Result<Vec<Task>> {
+    // Atomic plans preserve input order, including when a dependency is listed later.
+    let indices = (0..items.len()).collect::<Vec<_>>();
+    parse(items)?.publish(tx, access, actor, channel, &indices, &mut BTreeMap::new())
 }
 
-pub(super) fn create(
+impl Plan<'_> {
+    fn publish(
+        &self,
+        tx: &Transaction<'_>,
+        access: &Access,
+        actor: &str,
+        channel: &str,
+        indices: &[usize],
+        known: &mut BTreeMap<usize, i64>,
+    ) -> Result<Vec<Task>> {
+        let mut posted = Vec::with_capacity(indices.len());
+        for &i in indices {
+            let item = &self.items[i];
+            access.files(tx, actor, &item.attachment_ids)?;
+            let (text, mentions) = crate::actors::settle(tx, access, actor, None, &item.text)?;
+            let id = Board::post_tx(
+                tx,
+                channel,
+                actor,
+                &text,
+                &PostOptions {
+                    labels: item.labels.clone(),
+                    attachment_ids: item.attachment_ids.clone(),
+                    no_sync: item.no_sync,
+                    ..Default::default()
+                },
+            )?
+            .id;
+            let assignee = plan_assignee(actor, item.assignee.as_deref())?;
+            tx.execute(
+                "INSERT INTO tasks(id,owner,assignee,state) VALUES(?,?,?,'ready')",
+                params![id, actor, assignee],
+            )?;
+            known.insert(i, id);
+            posted.push((id, mentions));
+        }
+        let new_ids: BTreeSet<_> = posted.iter().map(|(id, _)| *id).collect();
+        let mut tasks = Vec::with_capacity(indices.len());
+        for (&i, (id, mentions)) in indices.iter().zip(posted) {
+            let mut needs = Vec::new();
+            let mut external = Vec::new();
+            for &edge in &self.edges[i] {
+                needs.push(match edge {
+                    Edge::Item(j) => known[&j],
+                    Edge::Existing(id) => {
+                        ensure!(
+                            !new_ids.contains(&id),
+                            Invalid.error(
+                                "invalid_needs",
+                                "new plan items must be named by their plan keys"
+                            )
+                        );
+                        external.push(id);
+                        id
+                    }
+                });
+            }
+            let needs = distinct_needs(&needs)?;
+            visible_needs(access, tx, &external)?;
+            replace_needs(tx, id, &needs)?;
+            set_state(tx, id, queued(&needs), None)?;
+            let mut task = publish_queue_state(tx, id, actor, "created")?;
+            remember_creation(tx, access, actor, &task)?;
+            task.mentions = mentions;
+            tasks.push(task);
+        }
+        Ok(tasks)
+    }
+}
+
+pub(super) fn create_checkpointed(
     board: &Board,
     actor: &str,
     channel: &str,
     items: &[PlanItem],
     key: &str,
-    guard: &impl Fn(&Transaction<'_>) -> Result<()>,
 ) -> Result<(Vec<Task>, bool)> {
     crate::core::validate_client_key(key)?;
-    let g = graph(channel, items)?;
+    let plan = parse(items)?;
+    let digests = items
+        .iter()
+        .zip(&plan.edges)
+        .map(|(item, edges)| fingerprint((channel, item, edges)))
+        .collect::<Result<Vec<_>>>()?;
     let full = fingerprint(("plan", channel, items))?;
     let partial = fingerprint(("unfinished", channel))?;
     let mut made = false;
     loop {
         // Commit the checkpoint with the messages. A crash cannot leave a chunk unaccounted for.
         let tx = write(&board.conn)?;
-        guard(&tx)?;
         let a = board.access_on(&tx)?;
         a.actor(actor)?;
         crate::automation::authorize_callback_key(&tx, actor, key)?;
@@ -174,44 +227,22 @@ pub(super) fn create(
             })?
         {
             let (i, recorded, id) = row?;
-            ensure!(g.digests.get(i) == Some(&recorded), duplicate());
+            ensure!(digests.get(i) == Some(&recorded), duplicate());
             known.insert(i, id);
         }
-        let indices: Vec<_> = g
+        let indices: Vec<_> = plan
             .order
             .iter()
             .copied()
             .filter(|i| !known.contains_key(i))
-            .take(100)
+            .take(PLAN_CHUNK_SIZE)
             .collect();
-        let chunk = indices
-            .iter()
-            .map(|&i| {
-                let mut item = items[i].clone();
-                item.key = Some(i.to_string());
-                item.needs = g.edges[i]
-                    .iter()
-                    .map(|e| match e {
-                        Edge::Existing(id) => Prerequisite::Number(*id),
-                        Edge::Item(j) => Prerequisite::Key { key: j.to_string() },
-                    })
-                    .collect();
-                item
-            })
-            .collect::<Vec<_>>();
-        for (i, t) in indices.into_iter().zip(plan_chunk(
-            &tx,
-            &a,
-            actor,
-            channel,
-            &chunk,
-            known.iter().map(|(i, id)| (i.to_string(), *id)).collect(),
-        )?) {
+        plan.publish(&tx, &a, actor, channel, &indices, &mut known)?;
+        for i in indices {
             tx.execute(
                 "INSERT INTO plan_progress VALUES(?,?,?,?)",
-                params![key, i as i64, g.digests[i], t.id],
+                params![key, i as i64, digests[i], known[&i]],
             )?;
-            known.insert(i, t.id);
             made = true;
         }
         let ids: Vec<_> = known.values().copied().collect();

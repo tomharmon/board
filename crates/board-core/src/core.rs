@@ -276,7 +276,7 @@ pub(crate) fn validate_client_key(key: &str) -> Result<()> {
 }
 
 const APPLICATION_ID: i64 = 0x424f4152;
-const DB_VERSION: i64 = 18;
+const DB_VERSION: i64 = 19;
 const BUSY_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn enable_wal(conn: &Connection) -> Result<()> {
@@ -420,6 +420,8 @@ impl Board {
             }
         }
         tx.execute_batch(include_str!("swarm/orchestration.sql"))?;
+        // The task IDs and checkpoints already live in the ordinary plan tables.
+        tx.execute_batch("DROP TABLE IF EXISTS swarm_plans;")?;
         tx.pragma_update(None, "application_id", APPLICATION_ID)?;
         tx.pragma_update(None, "user_version", DB_VERSION)?;
         tx.commit()?;

@@ -10,6 +10,10 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("selected board.sqlite3");
     let unused = tmp.path().join("not this one.sqlite3");
+    let items = json!([
+        {"key":"finish","text":"Finish","needs":["prepare"],"no_sync":true},
+        {"key":"prepare","text":"Prepare","no_sync":true}
+    ]);
     let mut server = Command::new(env!("CARGO_BIN_EXE_board"))
         .env_clear()
         .env("BOARD_DB", &unused)
@@ -46,6 +50,11 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
             "tools/call",
             json!({"name":"board_post","arguments":{"channel":"roundtrip","text":"scripted via MCP"}}),
         ),
+        (
+            6,
+            "tools/call",
+            json!({"name":"tasks_plan","arguments":{"channel":"swarms/sample","key":"sample-plan","tasks":items}}),
+        ),
     ] {
         writeln!(
             input,
@@ -66,11 +75,11 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         .lines()
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    assert_eq!(replies.len(), 5);
+    assert_eq!(replies.len(), 6);
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "board-mcp");
     let catalog = replies[1]["result"]["tools"].as_array().unwrap();
     for tool in [
-        "swarm_plan",
+        "tasks_plan",
         "swarm_observe",
         "tasks_renew",
         "tasks_release",
@@ -102,4 +111,31 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
     );
     let read: Value = serde_json::from_slice(&read.stdout).unwrap();
     assert_eq!(read["message"]["text"], "scripted via MCP");
+
+    let file = tmp.path().join("plan.json");
+    std::fs::write(&file, items.to_string()).unwrap();
+    let replay = Command::new(env!("CARGO_BIN_EXE_board"))
+        .env_clear()
+        .env("BOARD_USER", "team")
+        .arg("--db")
+        .arg(&path)
+        .args([
+            "--json",
+            "--as",
+            "architect",
+            "tasks",
+            "create",
+            "swarms/sample",
+        ])
+        .args(["--idempotency-key", "sample-plan", "--file"])
+        .arg(file)
+        .output()
+        .unwrap();
+    assert!(
+        replay.status.success(),
+        "{}",
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let replay: Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay, result(5)["tasks"]);
 }

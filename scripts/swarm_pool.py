@@ -65,8 +65,8 @@ class Client:
 
 def graph():
     def item(key, text, needs=()):
-        return {"key": key, "needs": needs, "text": text,
-                "acceptance": "Return the integer contribution", "output": "Decimal integer"}
+        return {"key": key, "needs": needs,
+                "text": text + "\n\nReturn the integer contribution in decimal.", "no_sync": True}
     leaves = [item(f"leaf-{i}", f"Investigate {i}") for i in range(1, 101)]
     groups = [item(f"group-{i}", "Sum ten investigations",
                    [v["key"] for v in leaves[i*10:(i+1)*10]]) for i in range(10)]
@@ -81,8 +81,13 @@ def exercise(exe, db, stack):
 
     boss = connect()
     boss.call("swarm_start", slug="pool", goal="Sum investigations", max_active=8)
-    plan = {"run": "pool", "key": "investigate", "items": graph()}
-    ids = boss.call("swarm_plan", **plan)["tasks"]
+    tasks = graph()
+
+    def submit_plan():
+        made = boss.call("tasks_plan", channel="swarms/pool", key="investigate", tasks=tasks)
+        return {item["key"]: task["id"] for item, task in zip(tasks, made["tasks"], strict=True)}
+
+    ids = submit_plan()
     workers = []
     for i in range(8):
         name = f"worker-{i}"
@@ -143,7 +148,7 @@ def exercise(exe, db, stack):
             boss = connect()
             view = boss.call("swarm_observe", run="pool", limit=1)
             assert len(view["changes"]) <= 1 and view["actions"][0]["message_id"] == request["message"]["id"]
-            assert boss.call("swarm_plan", **plan)["tasks"] == ids
+            assert submit_plan() == ids
             boss.call("swarm_decide", run="pool", id=request["message"]["id"], summary="Use decimal")
             results = [job.result(timeout=100) for job in jobs]
         finally:

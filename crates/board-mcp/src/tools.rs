@@ -113,12 +113,6 @@ pub(crate) fn execute(
                 },
             )?,
         ),
-        "swarm_plan" => value(b.swarm_plan(
-            actor,
-            &run()?,
-            required("key")?,
-            &serde_json::from_value::<Vec<_>>(p["items"].clone())?,
-        )?),
         "swarm_observe" => value(b.swarm_observe(
             actor,
             &run()?,
@@ -240,6 +234,12 @@ pub(crate) fn execute(
             Ok(
                 json!({"cursor":cursor,"tasks":tasks,"next_after": tasks.last().filter(|_|more).map(|t|t.id)}),
             )
+        }
+        "tasks_plan" => {
+            let key = owned("key").unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            let items: Vec<work::PlanItem> = serde_json::from_value(p["tasks"].clone())?;
+            let tasks = work::create_plan(b, actor, required("channel")?, &items, Some(&key))?;
+            Ok(json!({"key":key,"tasks":tasks}))
         }
         "tasks_create" => {
             let target = work::TaskTarget::New {

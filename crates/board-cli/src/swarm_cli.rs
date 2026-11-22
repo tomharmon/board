@@ -2,7 +2,7 @@ use crate::{attachments, cli::Body, roles_cli::output};
 use anyhow::{Context, Result, ensure};
 use board_local::{
     Board,
-    swarm::{RunPolicy, SwarmAddWorker, SwarmPlanItem, SwarmStart},
+    swarm::{RunPolicy, SwarmAddWorker, SwarmStart},
 };
 use clap::Subcommand;
 use serde_json::{Value, json};
@@ -49,15 +49,6 @@ pub enum Swarm {
     },
     Status {
         run: Option<String>,
-    },
-    /// Submit a replayable dependency graph from a JSON array (use - for stdin).
-    Plan {
-        #[arg(long)]
-        run: Option<String>,
-        #[arg(long)]
-        key: String,
-        #[arg(long)]
-        file: PathBuf,
     },
     /// Read current exceptions, counts and a bounded page of changes.
     Observe {
@@ -188,7 +179,6 @@ impl Swarm {
             && matches!(
                 self,
                 Self::Start { .. }
-                    | Self::Plan { .. }
                     | Self::Add { .. }
                     | Self::SetLimit { .. }
                     | Self::Stop { .. }
@@ -205,7 +195,6 @@ impl Swarm {
             | Self::Wait { run, .. }
             | Self::Done { run, .. }
             | Self::Status { run }
-            | Self::Plan { run, .. }
             | Self::Observe { run, .. }
             | Self::CheckIn { run, .. }
             | Self::LaunchFailed { run, .. }
@@ -461,12 +450,6 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
                 },
             )?;
             output(js, &v, || v.slug.clone())
-        }
-        Swarm::Plan { run, key, file } => {
-            let items: Vec<SwarmPlanItem> = serde_json::from_str(&crate::load_text(&file)?)
-                .context("expected a JSON array of plan items")?;
-            let v = b.swarm_plan(actor, reference(run.as_deref())?, &key, &items)?;
-            output(js, &v, || format!("{}: {} tasks", v.key, v.tasks.len()))
         }
         Swarm::Observe {
             run,

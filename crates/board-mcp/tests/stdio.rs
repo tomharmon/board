@@ -167,7 +167,6 @@ fn protocol_framing_inventory_and_schema_validation() {
             "swarm_launch_failed",
             "swarm_list",
             "swarm_observe",
-            "swarm_plan",
             "swarm_post",
             "swarm_read",
             "swarm_receipt",
@@ -182,6 +181,7 @@ fn protocol_framing_inventory_and_schema_validation() {
             "tasks_create",
             "tasks_fail",
             "tasks_list",
+            "tasks_plan",
             "tasks_release",
             "tasks_renew"
         ]
@@ -354,23 +354,20 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     let compact = worker.call("swarm_check_in", json!({"compact":true}));
     assert_eq!(compact["actor"], "ada/tester");
     assert!(compact.get("workers").is_none());
-    let mut plan = json!({"key":"v1","items":[
-        {"key":"join","text":"Synthesize","output":"sum","acceptance":"includes both leaves","needs":["a","b"]},
-        {"key":"a","text":"Analyze A","acceptance":"cites evidence","output":"one number"},
-        {"key":"b","text":"Analyze B","acceptance":"cites evidence","output":"one number"}]});
-    assert_eq!(
-        worker.denied("swarm_plan", plan.clone())["code"],
-        "swarm_coordinator_required"
-    );
-    let made = boss.call("swarm_plan", plan.clone());
+    let mut plan = json!({"channel":"swarms/release","key":"release-v1","tasks":[
+        {"key":"join","text":"Synthesize both leaves","needs":["a","b"],"no_sync":true},
+        {"key":"a","text":"Analyze A","no_sync":true},
+        {"key":"b","text":"Analyze B","no_sync":true}]});
+    let made = boss.call("tasks_plan", plan.clone());
     let original_plan = plan.clone();
-    assert_eq!(boss.call("swarm_plan", plan.clone()), made);
-    plan["items"][1]["acceptance"] = json!("changed");
-    assert_eq!(boss.denied("swarm_plan", plan)["code"], "duplicate_id");
-    let a = made["tasks"]["a"].clone();
+    assert_eq!(boss.call("tasks_plan", plan.clone()), made);
+    plan["tasks"][1]["text"] = json!("changed");
+    assert_eq!(boss.denied("tasks_plan", plan)["code"], "duplicate_id");
+    let a = made["tasks"][1]["id"].clone();
     boss.call("tasks_block", json!({"id":a,"reason":"awaiting fixture"}));
-    let b = made["tasks"]["b"].clone();
+    let b = made["tasks"][2]["id"].clone();
     boss.call("tasks_block", json!({"id":b,"reason":"awaiting input"}));
+    assert_eq!(made["tasks"][0]["needs"], json!([a, b]));
     let obs = boss.call("swarm_observe", json!({"limit":1}));
     assert_eq!(obs["tasks"], json!({"waiting":1,"blocked":2}));
     assert_eq!(obs["available_capacity"], 1);
@@ -422,7 +419,9 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
         Client::content(worker.read(), false)["code"],
         "swarm_stopped"
     );
-    assert_eq!(boss.call("swarm_plan", original_plan), made);
+    let replay = boss.call("tasks_plan", original_plan);
+    assert_eq!(replay["tasks"][1]["id"], a);
+    assert_eq!(replay["tasks"][1]["state"], "blocked");
     assert_eq!(
         worker.denied(
             "tasks_create",
@@ -463,34 +462,36 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
 }
 
 #[test]
-fn invalid_suffix_of_a_long_plan_does_not_leave_an_irrecoverable_prefix() {
+fn ordinary_mcp_plan_can_repair_an_uncommitted_suffix() {
     let dir = tempfile::tempdir().unwrap();
     let mut boss = Client::start(&dir.path().join("board"), None, None);
     boss.initialize();
-    boss.call(
-        "swarm_start",
-        json!({"slug":"release","goal":"Validate all items"}),
+    let mut tasks = (0..101)
+        .map(|i| json!({"key":format!("i{i}"),"text":"Investigate"}))
+        .collect::<Vec<_>>();
+    tasks[100]["needs"] = json!([999999]);
+    boss.denied(
+        "tasks_plan",
+        json!({"channel":"work","key":"plan","tasks":tasks}),
     );
-    let mut items=(0..101).map(|i|json!({"key":format!("i{i}"),"text":"Investigate","output":"reference","acceptance":"Evidence"})).collect::<Vec<_>>();
-    for (field, bad) in [
-        ("assignee", json!("stranger/profile")),
-        (
-            "needs",
-            json!((0..21).map(|i| format!("i{i}")).collect::<Vec<_>>()),
-        ),
-        ("needs", json!([999999])),
-    ] {
-        items[100][field] = bad;
-        boss.denied("swarm_plan", json!({"key":"plan","items":items}));
-        assert_eq!(boss.call("swarm_observe", json!({}))["tasks"], json!({}));
-        items[100].as_object_mut().unwrap().remove(field);
+    let committed = boss.call("tasks_list", json!({"channel":"work","limit":110}));
+    assert_eq!(committed["tasks"].as_array().unwrap().len(), 100);
+    tasks[100]["needs"] = json!(["i0"]);
+    let retried = boss.call(
+        "tasks_plan",
+        json!({"channel":"work","key":"plan","tasks":tasks}),
+    );
+    let retried_tasks = retried["tasks"].as_array().unwrap();
+    assert_eq!(retried_tasks.len(), 101);
+    for (task, original) in retried_tasks
+        .iter()
+        .zip(committed["tasks"].as_array().unwrap())
+    {
+        assert_eq!(task["id"], original["id"]);
     }
     assert_eq!(
-        boss.call("swarm_plan", json!({"key":"plan","items":items}))["tasks"]
-            .as_object()
-            .unwrap()
-            .len(),
-        101
+        retried["tasks"][100]["needs"],
+        json!([retried["tasks"][0]["id"]])
     );
 }
 
@@ -769,6 +770,10 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
     reader.denied(
         "board_post",
         json!({"channel":"bugs","text":"must not write"}),
+    );
+    reader.denied(
+        "tasks_plan",
+        json!({"channel":"bugs","tasks":[{"text":"must not write"}]}),
     );
     reader.denied("roles_show", json!({"slug":"verifier"}));
     board

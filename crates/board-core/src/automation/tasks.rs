@@ -257,37 +257,32 @@ fn expire_one(tx: &Transaction<'_>, id: i64, at: i64) -> Result<()> {
     Ok(())
 }
 
-const MAX_DIRECT_NEEDS: usize = 20;
 fn distinct_needs(needs: &[i64]) -> Result<Vec<i64>> {
     let mut seen = std::collections::BTreeSet::new();
     let out: Vec<_> = needs.iter().copied().filter(|n| seen.insert(*n)).collect();
     ensure!(
-        out.len() <= MAX_DIRECT_NEEDS,
+        out.len() <= 20,
         Invalid.error("invalid_needs", "at most 20 direct prerequisites")
     );
     Ok(out)
 }
 fn validate_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
     for &need in needs {
-        require_prerequisite(tx, need)?;
+        let state: Option<String> = tx
+            .query_row("SELECT state FROM tasks WHERE id=?", [need], |r| r.get(0))
+            .optional()?;
+        ensure!(
+            state.as_deref().is_some_and(|s| s != "canceled"),
+            Invalid.error(
+                "invalid_needs",
+                format!("invalid prerequisite: task #{need} is missing or canceled")
+            )
+        );
         ensure!(
             need != id,
             Invalid.error("invalid_needs", "task dependency cycle")
         );
     }
-    Ok(())
-}
-fn require_prerequisite(c: &Connection, need: i64) -> Result<()> {
-    let state: Option<String> = c
-        .query_row("SELECT state FROM tasks WHERE id=?", [need], |r| r.get(0))
-        .optional()?;
-    ensure!(
-        state.as_deref().is_some_and(|s| s != "canceled"),
-        Invalid.error(
-            "invalid_needs",
-            format!("invalid prerequisite: task #{need} is missing or canceled")
-        )
-    );
     Ok(())
 }
 fn replace_needs(tx: &Transaction<'_>, id: i64, needs: &[i64]) -> Result<()> {
@@ -682,6 +677,8 @@ pub enum Prerequisite {
     Id { id: serde_json::Value },
 }
 
+const PLAN_CHUNK_SIZE: usize = 100;
+
 /// Up to 100 task roots commit atomically. Larger keyed plans checkpoint whole chunks.
 pub fn create_plan(
     board: &Board,
@@ -700,28 +697,16 @@ pub fn create_plan_with_outcome(
     items: &[PlanItem],
     key: Option<&str>,
 ) -> Result<(Vec<Task>, bool)> {
-    create_plan_guarded(board, actor, channel, items, key, |_| Ok(()))
-}
-
-pub(crate) fn create_plan_guarded(
-    board: &Board,
-    actor: &str,
-    channel: &str,
-    items: &[PlanItem],
-    key: Option<&str>,
-    guard: impl Fn(&Transaction<'_>) -> Result<()>,
-) -> Result<(Vec<Task>, bool)> {
     crate::validate_actor(actor)?;
     ensure!(!items.is_empty(), "plan is empty");
-    if items.len() > 100 {
+    if items.len() > PLAN_CHUNK_SIZE {
         let key = key
             .map(str::to_owned)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        return long_plans::create(board, actor, channel, items, &key, &guard)
+        return plans::create_checkpointed(board, actor, channel, items, &key)
             .with_context(|| format!("plan key {key}; retry with the same key to resume"));
     }
     let tx = write(&board.conn)?;
-    guard(&tx)?;
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
     if let Some(k) = key {
@@ -737,7 +722,7 @@ pub(crate) fn create_plan_guarded(
     {
         if receipt.actor == actor && receipt.fingerprint == fingerprint(("unfinished", channel))? {
             tx.commit()?;
-            return long_plans::create(board, actor, channel, items, key, &guard)
+            return plans::create_checkpointed(board, actor, channel, items, key)
                 .with_context(|| format!("plan key {key}; retry with the same key to resume"));
         }
         ensure!(
@@ -751,8 +736,7 @@ pub(crate) fn create_plan_guarded(
         tx.commit()?;
         return Ok((out, false));
     }
-    long_plans::validate(channel, items)?;
-    let out = plan_chunk(&tx, &access, actor, channel, items, BTreeMap::new())?;
+    let out = plans::publish_all(&tx, &access, actor, channel, items)?;
     if let Some(key) = key {
         let ids: Vec<_> = out.iter().map(|t| t.id).collect();
         tx.execute(
@@ -764,118 +748,7 @@ pub(crate) fn create_plan_guarded(
     Ok((out, true))
 }
 
-mod long_plans;
-pub(crate) use long_plans::preflight as preflight_plan;
-
-fn plan_assignee(actor: &str, assignee: Option<&str>) -> Result<Option<String>> {
-    let who = assignee.map(|p| {
-        if p.contains('/') {
-            p.to_owned()
-        } else {
-            format!("{}/{}", person(actor), p)
-        }
-    });
-    if let Some(who) = who.as_deref() {
-        validate_assignee(actor, who)?;
-    }
-    Ok(who)
-}
-
-fn plan_chunk(
-    tx: &Transaction<'_>,
-    access: &Access,
-    actor: &str,
-    channel: &str,
-    items: &[PlanItem],
-    mut names: BTreeMap<String, i64>,
-) -> Result<Vec<Task>> {
-    let mut ids = Vec::new();
-    let mut mentions = vec![];
-    for item in items {
-        access.files(tx, actor, &item.attachment_ids)?;
-        let (text, resolutions) = crate::actors::settle(tx, access, actor, None, &item.text)?;
-        mentions.push(resolutions);
-        let id = Board::post_tx(
-            tx,
-            channel,
-            actor,
-            &text,
-            &PostOptions {
-                labels: item.labels.clone(),
-                attachment_ids: item.attachment_ids.clone(),
-                no_sync: item.no_sync,
-                ..Default::default()
-            },
-        )?
-        .id;
-        if let Some(k) = &item.key {
-            ensure!(
-                !k.is_empty() && names.insert(k.clone(), id).is_none(),
-                "empty or duplicate task key: {k}"
-            );
-        }
-        let assignee = plan_assignee(actor, item.assignee.as_deref())?;
-        tx.execute(
-            "INSERT INTO tasks(id,owner,assignee,state) VALUES(?,?,?,'ready')",
-            params![id, actor, assignee],
-        )?;
-        ids.push(id);
-    }
-    let mut out = Vec::new();
-    for ((&id, item), resolutions) in ids.iter().zip(items).zip(mentions) {
-        let mut external = Vec::new();
-        let needs = item
-            .needs
-            .iter()
-            .map(|need| {
-                Ok(match need {
-                    Prerequisite::Name(name) => match names.get(name) {
-                        Some(&id) => id,
-                        None => {
-                            let n = name.parse()?;
-                            external.push(n);
-                            n
-                        }
-                    },
-                    Prerequisite::Number(n) => {
-                        external.push(*n);
-                        *n
-                    }
-                    Prerequisite::Key { key } => *names
-                        .get(key)
-                        .ok_or_else(|| anyhow::anyhow!("unknown plan key: {key}"))?,
-                    Prerequisite::Id { id } => {
-                        let id = match id.as_i64() {
-                            Some(n) => n,
-                            None => id
-                                .as_str()
-                                .ok_or_else(|| anyhow::anyhow!("invalid task id"))?
-                                .parse()?,
-                        };
-                        external.push(id);
-                        id
-                    }
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        ensure!(
-            !external.iter().any(|n| ids.contains(n)),
-            Invalid.error(
-                "invalid_needs",
-                "new plan items must be named by their plan keys"
-            )
-        );
-        let needs = distinct_needs(&needs)?;
-        visible_needs(access, tx, &external)?;
-        replace_needs(tx, id, &needs)?;
-        set_state(tx, id, queued(&needs), None)?;
-        let mut t = publish_queue_state(tx, id, actor, "created")?;
-        remember_creation(tx, access, actor, &t)?;
-        t.mentions = resolutions;
-        out.push(t);
-    }
-    Ok(out)
-}
+mod plans;
 
 pub fn list_tasks(board: &Board, channel: Option<&str>, state: Option<&str>) -> Result<Vec<Task>> {
     Ok(tasks_page(board, channel, state, 0, usize::MAX)?.1)
@@ -1193,13 +1066,15 @@ pub fn claim_while(
     other_owners: &[String],
     listening: impl Fn() -> bool,
 ) -> Result<(Task, bool)> {
-    claim_checked(board, actor, target, request, labels, other_owners, |_| {
-        if listening() {
-            Ok(())
-        } else {
-            Err(NothingReady.into())
-        }
-    })
+    claim_checked(
+        board,
+        actor,
+        target,
+        request,
+        (labels, other_owners),
+        None,
+        listening,
+    )
 }
 
 /// Check the selected worker's run in the *claim transaction*. A stopped run
@@ -1213,15 +1088,16 @@ pub fn claim_in_assignment(
     other_owners: &[String],
     worker: Option<&WorkerBinding>,
 ) -> Result<Task> {
-    let Some(w) = worker else {
-        return claim_with_token(board, actor, target, request, labels, other_owners);
-    };
-    Ok(
-        claim_checked(board, actor, target, request, labels, other_owners, |tx| {
-            board.require_active_worker(tx, actor, w)
-        })?
-        .0,
-    )
+    Ok(claim_checked(
+        board,
+        actor,
+        target,
+        request,
+        (labels, other_owners),
+        worker,
+        || true,
+    )?
+    .0)
 }
 
 fn claim_checked(
@@ -1229,10 +1105,11 @@ fn claim_checked(
     actor: &str,
     target: ClaimTarget<'_>,
     request: ClaimRequest<'_>,
-    labels: &BTreeMap<String, String>,
-    other_owners: &[String],
-    check: impl Fn(&Transaction<'_>) -> Result<()>,
+    filters: (&BTreeMap<String, String>, &[String]),
+    worker: Option<&WorkerBinding>,
+    listening: impl Fn() -> bool,
 ) -> Result<(Task, bool)> {
+    let (labels, other_owners) = filters;
     crate::validate_actor(actor)?;
     validate_claim(&request)?;
     match target {
@@ -1243,7 +1120,10 @@ fn claim_checked(
         ClaimTarget::Ready(scope) => validate_queue(scope, labels, other_owners)?,
     }
     let tx = write(&board.conn)?;
-    check(&tx)?;
+    ensure!(listening(), NothingReady);
+    if let Some(worker) = worker {
+        board.require_active_worker(&tx, actor, worker)?;
+    }
     let at = now();
     let access = board.access_on(&tx)?;
     access.actor(actor)?;
@@ -1280,7 +1160,7 @@ fn claim_checked(
         &tx,
         acquire(&tx, actor, &t, &request, &proof_target, at)?,
     )?;
-    check(&tx)?;
+    ensure!(listening(), NothingReady);
     tx.commit()?;
     Ok((t, true))
 }
@@ -1349,9 +1229,8 @@ pub fn try_claim_ready_until(
     deadline: std::time::Instant,
 ) -> Result<Task> {
     board.try_without_lock_wait(|| {
-        if std::time::Instant::now() >= deadline
-            || !ready_for_worker(board, actor, scope, labels, worker)?
-        {
+        let listening = || std::time::Instant::now() < deadline;
+        if !listening() || !ready_for_worker(board, actor, scope, labels, worker)? {
             return Err(NothingReady.into());
         }
         let proof = uuid::Uuid::new_v4().to_string();
@@ -1363,17 +1242,9 @@ pub fn try_claim_ready_until(
                 lease_seconds,
                 token: &proof,
             },
-            labels,
-            &[],
-            |tx| {
-                if std::time::Instant::now() >= deadline {
-                    return Err(NothingReady.into());
-                }
-                if let Some(w) = worker {
-                    board.require_active_worker(tx, actor, w)?;
-                }
-                Ok(())
-            },
+            (labels, &[]),
+            worker,
+            listening,
         )?
         .0)
     })

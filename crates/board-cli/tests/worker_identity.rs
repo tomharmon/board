@@ -229,7 +229,6 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
             "swarm_start",
             "swarm_list",
             "swarm_add",
-            "swarm_plan",
             "swarm_set_limit",
             "swarm_stop",
             "roles_list",
@@ -240,6 +239,7 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
                 "worker MCP should not advertise {hidden}"
             );
         }
+        assert!(advertised.iter().any(|n| n == "tasks_plan"));
         let who = own.tool("board_whoami", json!({}), true);
         assert_eq!(who["actor"], actor);
         assert_eq!(who["worker"]["name"], name);

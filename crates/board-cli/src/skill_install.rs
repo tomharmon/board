@@ -11,6 +11,7 @@ const COORDINATOR: &str = include_str!("../assets/board-swarm-SKILL.md");
 const V15_COORDINATOR: &str = "126e1fc1455726325dfb5b7b3ad822fe5da73d0fb875e828594131181f3a7394";
 const V16_COORDINATOR: &str = "d5c9b58a6134fd9eaf47ff47709425345bf1989810ec2020035a9471312f65de";
 const V17_COORDINATOR: &str = "aeefde429f1a99e6215f088492e5cc82fde51abb27aada00192014a28e46bee7";
+const V18_COORDINATOR: &str = "1f8dc7910259ea679e342a625199892fa2b190c02b5623c251379cd4d6e95304";
 const FILE: &str = "board-swarm/SKILL.md";
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -85,7 +86,7 @@ fn contents(file: &Path) -> Result<Contents> {
         }
         if matches!(
             format!("{:x}", Sha256::digest(text.as_bytes())).as_str(),
-            V15_COORDINATOR | V16_COORDINATOR | V17_COORDINATOR
+            V15_COORDINATOR | V16_COORDINATOR | V17_COORDINATOR | V18_COORDINATOR
         ) {
             return Ok(Contents::Previous);
         }
@@ -337,15 +338,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stock_v17_upgrades_without_replacing_custom_workflows() {
+    fn stock_coordinators_upgrade_without_replacing_custom_workflows() {
         let root = tempfile::tempdir().unwrap();
         let dest = Destination::explicit(Target::Path, root.path().into()).unwrap();
         let file = root.path().join(FILE);
         fs::create_dir(file.parent().unwrap()).unwrap();
-        let previous = include_bytes!("../tests/fixtures/coordinator-v17.md");
-        fs::write(&file, previous).unwrap();
-        assert_eq!(dest.install(false).unwrap().0, "upgraded");
-        assert_eq!(fs::read_to_string(&file).unwrap(), COORDINATOR);
+        for previous in [
+            include_bytes!("../tests/fixtures/coordinator-v17.md").as_slice(),
+            include_bytes!("../tests/fixtures/coordinator-v18.md").as_slice(),
+        ] {
+            fs::write(&file, previous).unwrap();
+            assert_eq!(dest.install(false).unwrap().0, "upgraded");
+            assert_eq!(fs::read_to_string(&file).unwrap(), COORDINATOR);
+        }
         fs::write(&file, b"local instructions").unwrap();
         assert_eq!(dest.install(false).unwrap().0, "customized");
     }

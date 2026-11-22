@@ -387,9 +387,8 @@ fn v17_policy_upgrade_preserves_role_customization_and_uses_defaults_for_existin
     b.role_detach_skill("implementer", "board-implementer")?;
     let head = b.cursor()?;
     drop(b);
-    rusqlite::Connection::open(&path)?.execute_batch(
-        "DROP TABLE swarm_plans; DROP TABLE swarm_policy; PRAGMA user_version=17;",
-    )?;
+    rusqlite::Connection::open(&path)?
+        .execute_batch("DROP TABLE swarm_policy; PRAGMA user_version=17;")?;
     let b = Board::open(&path)?;
     assert!(
         !b.role_show("implementer")?
@@ -403,6 +402,59 @@ fn v17_policy_upgrade_preserves_role_customization_and_uses_defaults_for_existin
         8
     );
     assert_eq!(b.cursor()?, head);
+    Ok(())
+}
+
+#[test]
+fn v18_swarm_plan_tasks_and_batch_receipts_survive_ledger_removal() -> Result<()> {
+    use board_local::automation::{create_plan, lookup_plan};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("previous");
+    let b = Board::open(&path)?;
+    let run = b.swarm_start_with_policy(
+        "ada",
+        &SwarmStart {
+            goal: "Keep existing tasks".into(),
+            ..Default::default()
+        },
+        RunPolicy {
+            max_active: 3,
+            retry_budget: 1,
+        },
+    )?;
+    let key = format!("swarm-plan:{}:original", run.id);
+    let items = serde_json::from_value::<Vec<_>>(json!([
+        {"key":"one","text":"Original task","labels":{"swarm.plan":"original","swarm.item":"one"},"no_sync":true}
+    ]))?;
+    let tasks = create_plan(&b, "ada", &run.channel, &items, Some(&key))?;
+    let head = b.cursor()?;
+    drop(b);
+
+    let previous = rusqlite::Connection::open(&path)?;
+    previous.execute_batch(
+        "CREATE TABLE swarm_plans (run_id INTEGER NOT NULL REFERENCES swarm_runs(id),
+          key TEXT NOT NULL, actor TEXT NOT NULL, digest BLOB NOT NULL, PRIMARY KEY (run_id,key));
+          PRAGMA user_version=18;",
+    )?;
+    previous.execute(
+        "INSERT INTO swarm_plans VALUES (?,'original','ada',zeroblob(32))",
+        [run.id],
+    )?;
+    let upgraded = Board::open(&path)?;
+    assert_eq!(lookup_plan(&upgraded, "ada", &key)?, tasks);
+    assert_eq!(
+        upgraded
+            .swarm_observe("ada", &run.slug, None, 0, 1)?
+            .policy
+            .max_active,
+        3
+    );
+    assert_eq!(upgraded.cursor()?, head);
+    assert!(!previous.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='swarm_plans')",
+        [],
+        |row| row.get::<_, bool>(0)
+    )?);
     Ok(())
 }
 
