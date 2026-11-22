@@ -16,17 +16,27 @@ struct Client {
     id: u64,
 }
 impl Client {
-    fn start(path: &Path, profile: Option<&str>, token: Option<&str>) -> Self {
-        Self::start_session(path, profile, token, None)
+    fn full(path: &Path, profile: Option<&str>, token: Option<&str>) -> Self {
+        Self::full_session(path, profile, token, None)
     }
-    fn start_session(
+    fn full_session(
         path: &Path,
         profile: Option<&str>,
         token: Option<&str>,
         worker: Option<&str>,
     ) -> Self {
+        Self::start_mode(path, profile, token, worker, Some("--full"))
+    }
+    fn start_mode(
+        path: &Path,
+        profile: Option<&str>,
+        token: Option<&str>,
+        worker: Option<&str>,
+        flag: Option<&str>,
+    ) -> Self {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_board-mcp-stdio"));
-        cmd.env_clear()
+        cmd.args(flag)
+            .env_clear()
             .env("BOARD_DB", path)
             .env("BOARD_USER", "ada")
             .env("BOARD_SWARM_RUN", "release");
@@ -116,9 +126,95 @@ impl Drop for Client {
 }
 
 #[test]
+fn board_and_queue_catalogs_match_what_each_connection_can_actually_call() {
+    use std::collections::BTreeSet;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("board");
+    let mut boss = Client::start_mode(&path, None, None, None, None);
+    boss.initialize();
+    boss.call(
+        "swarm_start",
+        json!({"slug":"release","goal":"Check the published catalogs"}),
+    );
+    boss.call(
+        "swarm_add",
+        json!({"name":"review","brief":"Review the catalog"}),
+    );
+    let plan = boss.call(
+        "tasks_plan",
+        json!({"channel":"swarms/release","tasks":[{"key":"review","text":"Review catalogs"}]}),
+    );
+    let id = &plan["tasks"][0]["id"];
+    for bound in [None, Some("release/review")] {
+        for flag in [None, Some("--queue")] {
+            let mut c = Client::start_mode(&path, None, None, bound, flag);
+            c.initialize();
+            let list = c.request("tools/list", json!({}));
+            let names: BTreeSet<_> = list["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect();
+            let mut expected =
+                BTreeSet::from(["board_post", "board_read", "swarm_observe", "swarm_wait"]);
+            if bound.is_some() {
+                expected.insert("worker_assignment");
+            } else {
+                expected.extend(["swarm_start", "swarm_add", "swarm_stop", "tasks_plan"]);
+            }
+            if flag.is_some() {
+                expected.extend([
+                    "tasks_claim",
+                    "tasks_renew",
+                    "tasks_release",
+                    "tasks_complete",
+                    "tasks_fail",
+                    "tasks_block",
+                ]);
+            }
+            assert_eq!(names, expected, "{bound:?} {flag:?}");
+            let before = Board::open(&path).unwrap().cursor().unwrap();
+            for (hidden, args) in [
+                ("swarm_post", json!({"text":"No hidden shortcut"})),
+                (
+                    "tasks_create",
+                    json!({"channel":"swarms/release","text":"Blind lease","claim":true}),
+                ),
+                ("board_reply", json!({"id":id,"text":"Wrong tool"})),
+            ] {
+                assert_eq!(
+                    c.request("tools/call", json!({"name":hidden,"arguments":args}))["error"]["code"],
+                    -32602
+                );
+            }
+            if flag.is_none() {
+                assert_eq!(c.request("tools/call", json!({"name":"tasks_claim","arguments":{"ready_channel":"swarms/release","wait_seconds":300}}))["error"]["code"], -32602);
+                assert_eq!(c.request("ping", json!({}))["result"], json!({}));
+            }
+            assert_eq!(Board::open(&path).unwrap().cursor().unwrap(), before);
+        }
+    }
+    let mut worker = Client::start_mode(&path, None, None, Some("release/review"), Some("--queue"));
+    worker.initialize();
+    assert_eq!(
+        worker.call("tasks_claim", json!({"ready_channel":"swarms/release"}))["id"],
+        *id
+    );
+    assert_eq!(
+        worker.call("tasks_complete", json!({"id":id,"result":"Reviewed"}))["state"],
+        "completed"
+    );
+    assert_eq!(
+        boss.call("swarm_observe", json!({}))["tasks"]["completed"],
+        1
+    );
+}
+
+#[test]
 fn protocol_framing_inventory_and_schema_validation() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut c = Client::start(&tmp.path().join("board"), None, None);
+    let mut c = Client::full(&tmp.path().join("board"), None, None);
     c.write("not JSON");
     assert_eq!(c.read()["error"]["code"], -32700);
     c.write("[]");
@@ -214,8 +310,8 @@ fn mcp_file_chunks_require_a_live_readable_placement_on_every_read() {
     b.set_grant("ada", None, "guest", &Rules::parse("shared=read").unwrap())
         .unwrap();
     let token = b.issue_credential("ada", "guest", None, None).unwrap();
-    let mut reader = Client::start(&path, None, Some(&token.token));
-    let mut owner = Client::start(&path, None, None);
+    let mut reader = Client::full(&path, None, Some(&token.token));
+    let mut owner = Client::full(&path, None, None);
     reader.initialize();
     owner.initialize();
     let mut upload = json!({"channel":"private","name":"result.bin","content_type":"application/octet-stream","data_base64":""});
@@ -295,8 +391,8 @@ fn mcp_file_chunks_require_a_live_readable_placement_on_every_read() {
 fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("pool");
-    let mut boss = Client::start(&db, None, None);
-    let mut worker = Client::start(&db, Some("pool"), None);
+    let mut boss = Client::full(&db, None, None);
+    let mut worker = Client::full(&db, Some("pool"), None);
     boss.initialize();
     worker.initialize();
     let first = boss.call(
@@ -343,7 +439,7 @@ fn a_parked_worker_can_renew_cancel_and_claim_a_newly_ready_task() {
 fn contended_queue_wait_yields_to_ping_and_never_leases_after_its_deadline() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("contention");
-    let mut c = Client::start(&path, None, None);
+    let mut c = Client::full(&path, None, None);
     c.initialize();
     let task = c.call("tasks_create", json!({"channel":"pool","text":"ready"}));
     let writer = rusqlite::Connection::open(&path).unwrap();
@@ -367,7 +463,7 @@ fn contended_queue_wait_yields_to_ping_and_never_leases_after_its_deadline() {
 fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("inbox");
-    let mut boss = Client::start(&path, None, None);
+    let mut boss = Client::full(&path, None, None);
     boss.initialize();
     boss.call(
         "swarm_start",
@@ -377,7 +473,7 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
         "swarm_add",
         json!({"name":"review","brief":"Wait for notifications"}),
     );
-    let mut worker = Client::start_session(&path, None, None, Some("release/review"));
+    let mut worker = Client::full_session(&path, None, None, Some("release/review"));
     worker.initialize();
     let pending = worker.send(
         "tools/call",
@@ -441,7 +537,7 @@ fn registered_inbox_cancellation_and_timeout_survive_writer_contention() {
 fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("board");
-    let mut boss = Client::start(&db, None, None);
+    let mut boss = Client::full(&db, None, None);
     boss.initialize();
     boss.call(
         "swarm_start",
@@ -451,7 +547,7 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
         "swarm_add",
         json!({"name":"tester","brief":"own ready work"}),
     );
-    let mut worker = Client::start_session(&db, None, None, Some("release/tester"));
+    let mut worker = Client::full_session(&db, None, None, Some("release/tester"));
     worker.initialize();
     let compact = worker.call("swarm_check_in", json!({"compact":true}));
     assert_eq!(compact["actor"], "ada/tester");
@@ -475,6 +571,15 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
     assert_eq!(obs["available_capacity"], 1);
     assert_eq!(obs["policy"]["retry_budget"], 1);
     assert_eq!(obs["actions"][0]["blocked_dependents"], 1);
+    let focused = boss.call(
+        "swarm_observe",
+        json!({"explain_task":made["tasks"][0]["id"],"limit":2}),
+    );
+    assert_eq!(focused["task_id"], made["tasks"][0]["id"]);
+    assert_eq!(focused["steps"][0]["waits_on"], json!([a, b]));
+    assert_eq!(focused["steps"][1]["reason"], "awaiting fixture");
+    assert_eq!(focused["truncated"], true);
+    assert!(focused.get("changes").is_none());
     let page = boss.call(
         "swarm_observe",
         json!({"limit":1,"action_after":obs["next_action_after"],"after":obs["cursor"]}),
@@ -543,7 +648,7 @@ fn plans_pages_and_observations_resume_without_replaying_the_roster() {
 fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("board");
-    let mut modern = Client::start(&db, None, None);
+    let mut modern = Client::full(&db, None, None);
     modern.initialize();
     let response = modern.request("tools/list", json!({}));
     let defs = response["result"]["tools"].as_array().unwrap();
@@ -560,7 +665,7 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
             );
         }
     }
-    let mut old = Client::start(&db, None, None);
+    let mut old = Client::full(&db, None, None);
     old.request("initialize", json!({"protocolVersion":"2025-03-26"}));
     let reply = old.request("tools/call", json!({"name":"roles_list","arguments":{}}));
     assert!(reply["result"].get("structuredContent").is_none());
@@ -568,25 +673,100 @@ fn typed_results_and_evidence_inputs_preserve_the_legacy_text_protocol() {
 }
 
 #[test]
+fn unified_posts_and_run_reads_keep_routing_and_private_history_separate() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("board");
+    let mut boss = Client::start_mode(&path, None, None, None, None);
+    boss.initialize();
+    let run = boss.call("swarm_start", json!({"slug":"release","goal":"Review"}));
+    for name in ["verify", "peer"] {
+        boss.call("swarm_add", json!({"name":name,"brief":"Check a revision"}));
+    }
+    let mut verifier = Client::start_mode(&path, None, None, Some("release/verify"), None);
+    let mut peer = Client::start_mode(&path, None, None, Some("release/peer"), None);
+    verifier.initialize();
+    peer.initialize();
+    let root = boss.call(
+        "board_post",
+        json!({"channel":run["channel"],"text":"Release candidate"}),
+    );
+    let reply = json!({"reply_to":root["id"],"text":"@verify Check the candidate","idempotency_key":"review"});
+    let sent = boss.call("board_post", reply.clone());
+    assert_eq!(sent["re"], root["id"]);
+    assert_eq!(sent["notified"], json!(["verify"]));
+    assert_eq!(boss.call("board_post", reply)["id"], sent["id"]);
+    let thread = verifier.call("board_read", json!({"target":sent["id"]}));
+    assert_eq!(thread["message"]["id"], root["id"]);
+    assert_eq!(thread["replies"].as_array().unwrap().len(), 1);
+    for invalid in [
+        json!({"text":"missing destination"}),
+        json!({"text":"ambiguous destination","channel":run["channel"],"reply_to":root["id"]}),
+    ] {
+        boss.denied("board_post", invalid);
+    }
+    let db = Board::open(&path).unwrap();
+    let secret = db
+        .swarm_dm("ada", "release", "verify", "Private follow-up")
+        .unwrap();
+    let before = (db.cursor().unwrap(), db.data_version().unwrap());
+    let public = verifier.call("board_read", json!({"run":run["id"],"after":root["id"]}));
+    assert_eq!(public["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(public["entries"][0]["message"]["id"], sent["id"]);
+    assert!(public["entries"][0]["dm"].is_null());
+    let private_filter = json!({"run":"release","kind":"dm","worker":"verify"});
+    let scoped = verifier.call("board_read", private_filter.clone());
+    assert_eq!(scoped["entries"][0]["dm"]["id"], secret.id);
+    assert!(
+        peer.call("board_read", private_filter)["entries"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        verifier.denied("board_read", json!({"run":"other"}))["code"],
+        "worker_run_mismatch"
+    );
+    for invalid in [
+        json!({"run":"release","target":root["id"]}),
+        json!({"run":"release","text":"candidate"}),
+        json!({"worker":"verify"}),
+        json!({"kind":"dm"}),
+    ] {
+        verifier.denied("board_read", invalid);
+    }
+    assert_eq!((db.cursor().unwrap(), db.data_version().unwrap()), before);
+    let inbox = verifier.call("swarm_wait", json!({"timeout_seconds":0}));
+    assert_eq!(inbox["messages"][0]["id"], sent["id"]);
+    assert_eq!(inbox["dms"][0]["id"], secret.id);
+}
+
+#[test]
 fn ordinary_public_replies_record_evidence_once_on_retry() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("board");
-    let mut boss = Client::start(&path, None, None);
+    let mut boss = Client::full(&path, None, None);
     boss.initialize();
     let run = boss.call(
         "swarm_start",
         json!({"slug":"release","goal":"verify one change"}),
     );
     boss.call("swarm_add", json!({"name":"check","brief":"verify"}));
-    let mut verifier = Client::start_session(&path, None, None, Some("release/check"));
+    boss.call("swarm_add", json!({"name":"build","brief":"build"}));
+    boss.call("swarm_set_limit", json!({"max_notifications":0}));
+    let mut verifier = Client::full_session(&path, None, None, Some("release/check"));
     verifier.initialize();
     let args = json!({"channel":run["channel"],"text":"Review @check","idempotency_key":"mcp-public-root"});
     let root = boss.call("board_post", args.clone());
+    assert_eq!(root["notified"], json!(["check"]));
     assert_eq!(boss.call("board_post", args)["id"], root["id"]);
-    let args = json!({"id":root["id"],"text":"Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
+    let args = json!({"id":root["id"],"text":"@build Only 90% coverage: accept?","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept coverage?"},"idempotency_key":"mcp-public-reply"});
     let reply = verifier.call("board_reply", args.clone());
     assert_eq!(reply["re"], root["id"]);
-    assert_eq!(verifier.call("board_reply", args)["id"], reply["id"]);
+    assert_eq!(reply["notified"], json!(["coordinator"]));
+    assert_eq!(reply["suppressed"], json!(["build"]));
+    let replay = verifier.call("board_reply", args);
+    assert_eq!(replay["id"], reply["id"]);
+    assert_eq!(replay["suppressed"], reply["suppressed"]);
     let receipt = boss.call("swarm_receipt", json!({}));
     assert_eq!(receipt["decisions"].as_array().unwrap().len(), 1);
     assert_eq!(receipt["decisions"][0]["id"], reply["id"]);
@@ -595,7 +775,7 @@ fn ordinary_public_replies_record_evidence_once_on_retry() {
 #[test]
 fn ordinary_mcp_plan_can_repair_an_uncommitted_suffix() {
     let dir = tempfile::tempdir().unwrap();
-    let mut boss = Client::start(&dir.path().join("board"), None, None);
+    let mut boss = Client::full(&dir.path().join("board"), None, None);
     boss.initialize();
     let mut tasks = (0..101)
         .map(|i| json!({"key":format!("i{i}"),"text":"Investigate"}))
@@ -629,7 +809,7 @@ fn ordinary_mcp_plan_can_repair_an_uncommitted_suffix() {
 #[test]
 fn integer_run_reference_cannot_stop_a_different_numeric_slug() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut c = Client::start(&tmp.path().join("board"), None, None);
+    let mut c = Client::full(&tmp.path().join("board"), None, None);
     c.initialize();
     let first = c.call("swarm_start", json!({"goal":"first", "slug":"audit"}));
     let slug = first["id"].to_string();
@@ -646,7 +826,7 @@ fn integer_run_reference_cannot_stop_a_different_numeric_slug() {
 #[test]
 fn an_open_markdown_example_cannot_swallow_a_requested_schema() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut c = Client::start(&tmp.path().join("board"), None, None);
+    let mut c = Client::full(&tmp.path().join("board"), None, None);
     c.initialize();
     c.call("swarm_start", json!({"goal":"test", "slug":"markdown"}));
     let input = |data: Value| json!({"run":"markdown","text":"My example:\n```rust\nlet x = 1;", "schema":"verdict@1", "schema_data":data});
@@ -668,7 +848,7 @@ fn an_open_markdown_example_cannot_swallow_a_requested_schema() {
 fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launching_workers() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("board");
-    let mut coordinator = Client::start(&path, None, None);
+    let mut coordinator = Client::full(&path, None, None);
     coordinator.initialize();
     let roles = coordinator.call("roles_list", json!({}));
     assert!(roles.as_array().unwrap().len() >= 6);
@@ -697,7 +877,7 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
             .unwrap()
             .contains("Verify the receipt")
     );
-    let mut checker = Client::start(&path, Some("checker"), None);
+    let mut checker = Client::full(&path, Some("checker"), None);
     checker.initialize();
     let observer = board_local::Board::open(&path).unwrap();
     let before = (observer.cursor().unwrap(), observer.data_version().unwrap());
@@ -768,7 +948,7 @@ fn processes_exchange_public_posts_private_dms_and_live_wakeups_without_launchin
 fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_response() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("board");
-    let mut boss = Client::start(&path, None, None);
+    let mut boss = Client::full(&path, None, None);
     boss.initialize();
     boss.call(
         "swarm_start",
@@ -778,7 +958,7 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
         "swarm_add",
         json!({"name":"checker","brief":"Verify offline"}),
     );
-    let mut first = Client::start(&path, Some("checker"), None);
+    let mut first = Client::full(&path, Some("checker"), None);
     first.initialize();
     first.send(
         "tools/call",
@@ -805,7 +985,7 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
     }
     first.child.kill().unwrap();
     first.child.wait().unwrap();
-    let mut replacement = Client::start(&path, Some("checker"), None);
+    let mut replacement = Client::full(&path, Some("checker"), None);
     replacement.initialize();
     let result = replacement.call("swarm_wait", json!({"timeout_seconds":0}));
     assert_eq!(result["status"], "messages");
@@ -827,7 +1007,7 @@ fn a_restarted_stdio_waiter_recovers_a_mention_after_losing_the_delivery_respons
 fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
     let tmp = tempfile::tempdir().unwrap();
     let path = tmp.path().join("board");
-    let mut owner = Client::start(&path, None, None);
+    let mut owner = Client::full(&path, None, None);
     owner.initialize();
     let root = owner.call(
         "board_post",
@@ -861,7 +1041,7 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
         )["tasks"][0]["id"],
         *id
     );
-    let mut worker = Client::start(&path, Some("dev"), None);
+    let mut worker = Client::full(&path, Some("dev"), None);
     worker.initialize();
     assert_eq!(
         worker.call(
@@ -870,7 +1050,7 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
         )["id"],
         *id
     );
-    let mut other = Client::start(&path, Some("dev"), None);
+    let mut other = Client::full(&path, Some("dev"), None);
     other.initialize();
     assert_eq!(
         other.denied("tasks_complete", json!({"id":id,"result":"not my lease"}))["code"],
@@ -907,7 +1087,7 @@ fn messages_fenced_task_transitions_and_permission_errors_share_the_board() {
         .set_grant("ada", None, "guest", &Rules::parse("bugs=read").unwrap())
         .unwrap();
     let secret = board.issue_credential("ada", "guest", None, None).unwrap();
-    let mut reader = Client::start(&path, None, Some(&secret.token));
+    let mut reader = Client::full(&path, None, Some(&secret.token));
     reader.initialize();
     reader.call("board_read", json!({"target":id}));
     reader.denied(

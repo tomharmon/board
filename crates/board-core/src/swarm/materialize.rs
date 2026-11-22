@@ -181,7 +181,7 @@ impl Board {
                 .to_owned();
             env_vars.insert("BOARD_DB".into(), db.clone());
             let args = vec!["--db".to_owned(), db, "--worker".into(), selector];
-            assembled_prompt.push_str(&format!("\n\nBoard CLI: prepend these literal arguments to each subcommand: {}. Use this assignment's BOARD_USER. Run whoami --json before writing; expect actor {} and run {}. Never use the chat's shared Board MCP connection. A dedicated worker MCP is usable only after board_whoami confirms this exact worker and run. If neither transport is available, report the blocker rather than speaking as the coordinator.",serde_json::to_string(&args)?,worker.actor,run.slug));
+            assembled_prompt.push_str(&format!("\n\nBoard CLI: prepend these literal arguments to each subcommand: {}. Use this assignment's BOARD_USER. Run whoami --json before writing; expect actor {} and run {}. Never use the chat's shared Board MCP connection. On a dedicated worker MCP confirm this exact actor and run with worker_assignment. If neither transport is available, report the blocker rather than speaking as the coordinator.",serde_json::to_string(&args)?,worker.actor,run.slug));
             Some(args)
         } else {
             None

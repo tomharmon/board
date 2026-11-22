@@ -10,8 +10,26 @@ pub struct SwarmFilter {
 pub(super) fn dm_on(c: &Connection, id: i64) -> Result<SwarmDm> {
     Ok(c.query_row("SELECT id,run_id,from_actor,to_worker,text,event_cursor,created_at FROM swarm_dms WHERE id=?",[id],|r|Ok(SwarmDm{id:r.get(0)?,run_id:r.get(1)?,from_actor:r.get(2)?,to_worker:r.get(3)?,text:r.get(4)?,event_cursor:r.get(5)?,created_at:r.get(6)?}))?)
 }
-fn notified_on(c: &Connection, id: i64) -> Result<Vec<String>> {
-    rows(c.prepare("SELECT target_worker FROM swarm_notifications WHERE message_id=? AND source_kind='mention' ORDER BY target_worker")?.query_map([id],|r|r.get(0))?)
+pub(crate) fn read_mention_routing(c: &Connection, m: &mut Message) -> Result<()> {
+    let mut stmt = c.prepare_cached(
+        "SELECT target_worker AS target, 1 FROM swarm_notifications
+            WHERE message_id=?1 AND source_kind='mention'
+         UNION ALL SELECT json_extract(payload,'$.target'), 0 FROM events
+            WHERE message_id=?1 AND kind='swarm.notification_suppressed'
+         ORDER BY target",
+    )?;
+    let mut rows = stmt.query([m.id])?;
+    m.notified.clear();
+    m.suppressed.clear();
+    while let Some(row) = rows.next()? {
+        let targets = if row.get::<_, bool>(1)? {
+            &mut m.notified
+        } else {
+            &mut m.suppressed
+        };
+        targets.push(row.get(0)?);
+    }
+    Ok(())
 }
 pub(super) fn notify(
     tx: &Transaction,
@@ -57,12 +75,11 @@ fn route_public(
     run: &SwarmRun,
     m: &Message,
     targets: BTreeSet<String>,
-) -> Result<Vec<String>> {
+) -> Result<()> {
     tx.execute(
         "UPDATE swarm_workers SET last_activity_at=? WHERE run_id=? AND actor=?",
         params![crate::now(), run.id, m.actor],
     )?;
-    let mut suppressed = Vec::new();
     let mut used = 0;
     for who in targets {
         let peer = who != "coordinator" && !run.can_control;
@@ -74,14 +91,12 @@ fn route_public(
                 Some(m.id),
                 serde_json::json!({"run":run.slug,"target":who}),
             )?;
-            suppressed.push(who);
         } else {
             notify(tx, run, &m.actor, &who, "mention", m.id, Some(m.id))?;
             used += i64::from(peer);
         }
     }
-    spend(tx, run, &m.actor, used)?;
-    Ok(suppressed)
+    spend(tx, run, &m.actor, used)
 }
 fn resolve(run: &SwarmRun, actor: &str, text: &str) -> (String, BTreeSet<String>) {
     let mut out = String::new();
@@ -238,7 +253,6 @@ impl Board {
             Some(id) => Board::reply_tx_with_outcome(tx, id, actor, &body, opts)?,
             None => Board::post_tx_with_outcome(tx, channel, actor, &body, opts)?,
         };
-        let mut suppressed = vec![];
         if created {
             let target = super::coordination::record_on(tx, a, run, &m)?;
             if let Some(r) = run {
@@ -256,14 +270,9 @@ impl Board {
                         }
                     }
                 }
-                suppressed = route_public(tx, r, &m, hits)?;
+                route_public(tx, r, &m, hits)?;
             }
         }
-        let notified = if run.is_some() {
-            notified_on(tx, m.id)?
-        } else {
-            vec![]
-        };
         let message = if blind {
             if created {
                 tx.execute("INSERT INTO blind_posts VALUES(?)", [m.id])?;
@@ -278,9 +287,9 @@ impl Board {
         };
         Ok((
             SwarmPostResult {
+                notified: message.notified.clone(),
+                suppressed: message.suppressed.clone(),
                 message: crate::actors::write_view(message, &body, resolutions, blind),
-                notified,
-                suppressed,
             },
             created,
         ))
@@ -458,21 +467,24 @@ impl Board {
         }
         let mut entries = Vec::with_capacity(batch.len());
         for (cursor, is_dm, id) in batch {
-            let (message, dm, notified) = if is_dm {
-                (None, Some(dm_on(&tx, id)?), vec![])
+            let (message, dm) = if is_dm {
+                (None, Some(dm_on(&tx, id)?))
             } else {
-                (
-                    Some(a.view(&tx, Board::get_on(&tx, id)?)?),
-                    None,
-                    notified_on(&tx, id)?,
-                )
+                (Some(a.view(&tx, Board::get_on(&tx, id)?)?), None)
             };
             entries.push(SwarmEntry {
                 cursor,
                 kind: if is_dm { "dm" } else { "public" }.into(),
+                notified: message
+                    .as_ref()
+                    .map(|m| m.notified.clone())
+                    .unwrap_or_default(),
+                suppressed: message
+                    .as_ref()
+                    .map(|m| m.suppressed.clone())
+                    .unwrap_or_default(),
                 message,
                 dm,
-                notified,
             });
         }
         let cursor = entries

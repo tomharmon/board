@@ -36,7 +36,7 @@ struct Mcp {
 }
 
 #[test]
-fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_their_decision() {
+fn named_workers_verify_a_revision_and_resolve_a_decision_without_tasks_or_leases() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("workflow.sqlite");
     let mut chat = Mcp::open(board(&db));
@@ -45,10 +45,16 @@ fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_thei
         json!({"goal":"Verify revision","slug":"audit"}),
         true,
     );
+    let root = chat.tool(
+        "board_post",
+        json!({"channel":"swarms/audit","text":"Review the Unicode fix"}),
+        true,
+    )["id"]
+        .clone();
     for name in ["impl", "verify"] {
         chat.tool(
             "swarm_add",
-            json!({"run":"audit","name":name,"brief":"Own your slice"}),
+            json!({"run":"audit","name":name,"brief":format!("Own your slice on #{root}")}),
             true,
         );
     }
@@ -59,27 +65,29 @@ fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_thei
     };
     let mut implementer = worker("audit/impl");
     let mut verifier = worker("audit/verify");
-    implementer.tool("swarm_check_in", json!({}), true);
+    assert_eq!(
+        implementer.tool("worker_assignment", json!({}), true)["run"],
+        "audit"
+    );
     let revision = json!({"kind":"sha256","value":"a".repeat(64)});
-    let h=implementer.tool("swarm_post",json!({"text":"Ready","schema":"handoff@1","schema_data":{"revision":revision,"summary":"Unicode fix","changes":["fields.rs"],"to":"verify"}}),true);
-    let handoff = h["message"]["id"].as_i64().unwrap();
-    verifier.tool("swarm_post",json!({"text":"Verified","schema":"verification@1","schema_data":{"handoff":handoff,"revision":revision,"summary":"Passed","checks":[{"name":"unit","status":"pass","command":"cargo test"}]}}),true);
-    let d=verifier.tool("swarm_post",json!({"text":"Decision needed","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept this change?","handoff":handoff}}),true);
-    let request = d["message"]["id"].as_i64().unwrap();
-    implementer.tool(
-        "swarm_decide",
-        json!({"id":request,"summary":"Self-approval"}),
-        false,
-    );
-    chat.tool(
-        "swarm_decide",
-        json!({"run":"audit","id":request,"summary":"Accepted"}),
-        true,
-    );
-    let receipt = chat.tool("swarm_receipt", json!({"run":"audit"}), true);
-    assert_eq!(receipt["handoffs"][0]["status"], "pass");
-    assert_eq!(receipt["handoffs"][0]["verified_by"], "ada/verify");
-    assert!(receipt["decisions"].as_array().unwrap().is_empty());
+    let h=implementer.tool("board_post",json!({"reply_to":root,"text":"Ready","schema":"handoff@1","schema_data":{"revision":revision,"summary":"Unicode fix","changes":["fields.rs"],"to":"verify"}}),true);
+    let handoff = h["id"].as_i64().unwrap();
+    let inbox = verifier.tool("swarm_wait", json!({"timeout_seconds":0}), true);
+    assert_eq!(inbox["messages"][0]["id"], handoff);
+    let check = verifier.tool("board_post",json!({"reply_to":root,"text":"Verified","schema":"verification@1","schema_data":{"handoff":handoff,"revision":revision,"summary":"Passed","checks":[{"name":"unit","status":"pass","command":"cargo test"}]}}),true);
+    let d=verifier.tool("board_post",json!({"reply_to":root,"text":"Decision needed","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept this change?","handoff":handoff}}),true);
+    let request = d["id"].as_i64().unwrap();
+    let resolution = |summary| json!({"reply_to":root,"text":summary,"schema":"decision-resolution@1","schema_data":{"request":request,"summary":summary}});
+    implementer.tool("board_post", resolution("Self-approval"), false);
+    chat.tool("board_post", resolution("Accepted"), true);
+    let thread = chat.tool("board_read", json!({"target":root}), true);
+    let verified = &thread["replies"][1];
+    assert_eq!(verified["id"], check["id"]);
+    assert_eq!(verified["actor"], "ada/verify");
+    assert_eq!(verified["blocks"][0]["data"]["revision"], revision);
+    let overview = chat.tool("swarm_observe", json!({"run":"audit"}), true);
+    assert!(overview["actions"].as_array().unwrap().is_empty());
+    assert!(overview["tasks"].as_object().unwrap().is_empty());
     chat.tool("swarm_stop", json!({"run":"audit"}), true);
     let create = board(&db)
         .args([
@@ -97,9 +105,16 @@ fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_thei
     assert!(String::from_utf8_lossy(&create.stderr).contains("swarm_stopped"));
 }
 impl Mcp {
-    fn open(mut cmd: Command) -> Self {
+    fn full(cmd: Command) -> Self {
+        Self::with_args(cmd, &["--full"])
+    }
+    fn open(cmd: Command) -> Self {
+        Self::with_args(cmd, &[])
+    }
+    fn with_args(mut cmd: Command, args: &[&str]) -> Self {
         let mut child = cmd
             .arg("mcp")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -149,7 +164,7 @@ impl Drop for Mcp {
 fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
     let tmp = tempfile::tempdir().unwrap();
     let db = tmp.path().join("portable.sqlite");
-    let mut boss = Mcp::open(board(&db));
+    let mut boss = Mcp::full(board(&db));
     boss.tool(
         "swarm_start",
         json!({"slug":"sample","goal":"Ship a portable brief"}),
@@ -167,7 +182,7 @@ fn dedicated_worker_reads_only_its_pinned_assignment_without_a_local_export() {
     );
     let mut cmd = board(&db);
     cmd.args(["--worker", "sample/check"]);
-    let mut worker = Mcp::open(cmd);
+    let mut worker = Mcp::full(cmd);
     let assignment = worker.tool("worker_assignment", json!({}), true);
     assert_eq!(assignment["goal"], "Ship a portable brief");
     assert_eq!(assignment["worker"]["brief"], "Check only your slice");
@@ -313,17 +328,14 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
                 "worker MCP should not advertise {hidden}"
             );
         }
-        assert!(advertised.iter().any(|n| n == "tasks_plan"));
-        let who = own.tool("board_whoami", json!({}), true);
-        assert_eq!(who["actor"], actor);
-        assert_eq!(who["worker"]["name"], name);
-        own.tool("swarm_start", json!({"goal":"forbidden"}), false);
-        own.tool("swarm_set_limit", json!({"max_notifications":50}), false);
-        own.tool("roles_list", json!({}), false);
-        own.tool("swarm_status", json!({"run":"other"}), false);
+        assert_eq!(advertised.len(), 5);
+        let assignment = own.tool("worker_assignment", json!({}), true);
+        assert_eq!(assignment["worker"]["actor"], actor);
+        assert_eq!(assignment["worker"]["name"], name);
+        own.tool("swarm_observe", json!({"run":"other"}), false);
         own.tool(
-            "swarm_post",
-            json!({"text":"using a dedicated connection"}),
+            "board_post",
+            json!({"channel":"swarms/release","text":"using a dedicated connection"}),
             true,
         );
     }
@@ -356,11 +368,14 @@ fn workers_use_their_assignment_and_never_rebind_the_shared_chat() {
     };
     assert!(scoped("release/build").status.success());
     assert!(!scoped("release/check").status.success());
-    let shared = chat.tool("board_whoami", json!({}), true);
+    let shared = chat.tool(
+        "board_post",
+        json!({"channel":"swarms/release","text":"Still the coordinator"}),
+        true,
+    );
     assert_eq!(shared["actor"], "ada");
-    assert!(shared["worker"].is_null());
     assert_eq!(
-        chat.tool("swarm_status", json!({"run":"release"}), true)["status"],
+        chat.tool("swarm_observe", json!({"run":"release"}), true)["status"],
         "active"
     );
 }

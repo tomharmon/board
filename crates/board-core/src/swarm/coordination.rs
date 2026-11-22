@@ -32,6 +32,76 @@ pub struct Verification {
     pub summary: String,
     pub checks: Vec<VerificationCheck>,
 }
+
+/// Source posts for the latest visible handoff of a task and its exact revision.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskHandoff {
+    pub id: i64,
+    pub revision: Revision,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verification: Option<TaskVerification>,
+}
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaskVerification {
+    pub id: i64,
+    pub status: String,
+}
+
+pub(crate) fn task_handoff_on(
+    c: &Connection,
+    access: &Access,
+    task: i64,
+    run: Option<i64>,
+) -> Result<Option<TaskHandoff>> {
+    // A run can hand off a task from another channel. A grant on the task
+    // alone must never disclose that run's evidence or even its post IDs.
+    let mut stmt = c.prepare_cached(
+        "SELECT r.channel,h.message_id,json_extract(h.payload,'$.revision.kind'),
+            json_extract(h.payload,'$.revision.value'),json_extract(h.payload,'$.to'),
+            v.message_id,v.payload,hm.deleted,coalesce(vm.deleted,0)
+         FROM (SELECT id,channel FROM swarm_runs WHERE id=?2
+               UNION ALL SELECT id,channel FROM swarm_runs WHERE ?2 IS NULL) r
+         JOIN swarm_evidence h ON h.message_id=(
+             SELECT max(message_id) FROM swarm_evidence WHERE run_id=r.id AND kind='handoff'
+             AND json_extract(payload,'$.task')=?1)
+         JOIN messages hm ON hm.id=h.message_id
+         LEFT JOIN swarm_evidence v ON v.message_id=(
+             SELECT max(message_id) FROM swarm_evidence WHERE run_id=r.id AND kind='verification'
+             AND json_extract(payload,'$.handoff')=h.message_id)
+         LEFT JOIN messages vm ON vm.id=v.message_id
+         ORDER BY h.message_id DESC",
+    )?;
+    let mut rows = stmt.query(params![task, run])?;
+    while let Some(row) = rows.next()? {
+        if !access.allows(Action::Read, row.get_ref(0)?.as_str()?) {
+            continue;
+        }
+        if row.get::<_, bool>(7)? {
+            return Ok(None);
+        }
+        let verification = match (row.get::<_, Option<i64>>(5)?, row.get::<_, bool>(8)?) {
+            (Some(id), false) => Some(TaskVerification {
+                id,
+                status: serde_json::from_str::<Verification>(row.get_ref(6)?.as_str()?)?
+                    .status()
+                    .into(),
+            }),
+            _ => None,
+        };
+        return Ok(Some(TaskHandoff {
+            id: row.get(1)?,
+            revision: Revision {
+                kind: row.get(2)?,
+                value: row.get(3)?,
+            },
+            to: row.get(4)?,
+            verification,
+        }));
+    }
+    Ok(None)
+}
+
 impl Verification {
     fn status(&self) -> &str {
         if self.checks.iter().any(|c| c.status == "fail") {

@@ -1,12 +1,13 @@
 //! Local coordination records. The calling harness, never Board, launches agents.
 mod feed;
 pub use feed::SwarmFilter;
+pub(crate) use feed::read_mention_routing;
 mod assignment;
 mod coordination;
 pub use assignment::{Assignment, AssignmentFile};
 mod materialize;
 mod observe;
-pub use observe::{RunAction, RunChange, RunThread, SwarmObservation};
+pub use observe::{RunAction, RunChange, RunThread, SwarmObservation, TaskExplanation};
 mod wait;
 use crate::{
     Board, Message, PostOptions,
@@ -264,6 +265,8 @@ pub struct SwarmEntry {
     pub message: Option<Message>,
     pub dm: Option<SwarmDm>,
     pub notified: Vec<String>,
+    #[serde(default)]
+    pub suppressed: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmFeed {

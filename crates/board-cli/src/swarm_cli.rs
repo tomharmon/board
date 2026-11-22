@@ -63,6 +63,9 @@ pub enum Swarm {
         action_after: i64,
         #[arg(long, default_value_t = 0)]
         task_after: i64,
+        /// Explain one task's unfinished prerequisite chain instead of paging the overview.
+        #[arg(long, conflicts_with_all = ["after", "action_after", "task_after"])]
+        explain_task: Option<i64>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -486,8 +489,28 @@ pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
             after,
             action_after,
             task_after,
+            explain_task,
             limit,
         } => {
+            if let Some(id) = explain_task {
+                let why = b.swarm_explain_task(actor, reference(run.as_deref())?, id, limit)?;
+                return output(js, &why, || {
+                    let mut lines = Vec::new();
+                    for step in &why.steps {
+                        lines.push(format!(
+                            "#{} {} [{}]: {}",
+                            step.id, step.title, step.state, step.reason
+                        ));
+                        if let Some((_, title)) = step.review_link() {
+                            lines.push(format!("  {title}"));
+                        }
+                    }
+                    if why.truncated {
+                        lines.push("Further prerequisites omitted.".into());
+                    }
+                    lines.join("\n")
+                });
+            }
             let v = b.swarm_observe_page(
                 actor,
                 reference(run.as_deref())?,

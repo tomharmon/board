@@ -396,6 +396,10 @@ impl Access {
         if !self.allows(Action::Read, &m.channel) {
             m.links.clear();
             m.file_notices.clear();
+            m.notified.clear();
+            m.suppressed.clear();
+        } else if m.channel.starts_with("swarms/") && !m.deleted {
+            crate::swarm::read_mention_routing(c, &mut m)?;
         }
         if !self.is_trusted()
             && let Some(origin) = &m.origin
@@ -451,6 +455,8 @@ impl Access {
         let mut m: crate::Message = serde_json::from_str(&raw)?;
         m.links.clear();
         m.file_notices.clear();
+        m.notified.clear();
+        m.suppressed.clear();
         m.text = crate::prose::redact_exact(&m.text, &m.actor);
         m.origin = None;
         Ok(m)

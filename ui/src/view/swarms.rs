@@ -334,23 +334,6 @@ fn entry(s: &State, e: &SwarmEntry) -> El {
                     ),
             )
             .child(rich::scoped_body(s, m, "swarm-"));
-        if !e.notified.is_empty() {
-            out = out.child(
-                mono(
-                    format!(
-                        "Notified {}",
-                        e.notified
-                            .iter()
-                            .map(|n| format!("@{n}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    MUTED,
-                )
-                .w_full()
-                .wrap_anywhere(),
-            );
-        }
     }
     out
 }
@@ -530,6 +513,8 @@ fn overview(s: &State) -> El {
     for (group, tasks) in groups {
         body = body.child(label(group, 13., 600., DIM).py(3.).wrap_anywhere());
         for t in tasks {
+            let id = t.id;
+            let expanded = o.explain_task == Some(id);
             let owner = t
                 .claimant
                 .as_deref()
@@ -541,7 +526,50 @@ fn overview(s: &State) -> El {
                     format!("#{}  {}", t.id, t.title),
                     t.id,
                 ))
-                .child(mono(format!("{} · {owner}", t.state), MUTED).wrap_anywhere());
+                .child(
+                    row()
+                        .center_y()
+                        .gap(6.)
+                        .child(mono(format!("{} · {owner}", t.state), MUTED).wrap_anywhere())
+                        .child(
+                            tool(
+                                &format!("swarm-explain-{id}"),
+                                "Explain task status",
+                                if expanded {
+                                    &glyphs::CHEVRON_UP
+                                } else {
+                                    &glyphs::CHEVRON_DOWN
+                                },
+                            )
+                            .expanded(expanded)
+                            .on_press(move |s: &mut State| {
+                                s.desk.swarm.explain_task = (!expanded).then_some(id);
+                                s.refresh();
+                            }),
+                        ),
+                );
+            if let Some(why) = o.explanation.as_ref().filter(|e| e.task_id == id) {
+                for step in &why.steps {
+                    body = body.child(link(
+                        format!("swarm-explain-step-{}", step.id),
+                        format!(
+                            "#{} {} · {}: {}",
+                            step.id, step.title, step.state, step.reason
+                        ),
+                        step.id,
+                    ));
+                    if let Some((source, title)) = step.review_link() {
+                        body = body.child(link(
+                            format!("swarm-explain-review-{source}"),
+                            title,
+                            source,
+                        ));
+                    }
+                }
+                if why.truncated {
+                    body = body.child(mono("Further prerequisites omitted.", MUTED));
+                }
+            }
             for (name, id) in [
                 ("Handoff", t.latest_handoff),
                 ("Verification", t.latest_check),

@@ -87,6 +87,17 @@ fn dependencies_leases_and_stale_epochs() -> Result<()> {
     );
     b.conn
         .execute("UPDATE tasks SET lease_until=0 WHERE id=?", [c.id])?;
+    let head = b.cursor()?;
+    assert_eq!(
+        b.conversation(second.id, &Filter::default())?
+            .message
+            .task
+            .unwrap()
+            .inputs[0]
+            .state,
+        "expired"
+    );
+    assert_eq!(head, b.cursor()?);
     let c2 = claim(&b, "ann/fix", ClaimTarget::Id(c.id), 60, &BTreeMap::new())?;
     assert!(
         change_task(
@@ -109,6 +120,24 @@ fn dependencies_leases_and_stale_epochs() -> Result<()> {
     )?;
     assert_eq!(b.get(second.id)?.labels["board.task"], "ready");
     assert_eq!(list_tasks(&b, None, None)?.len(), 1);
+    let granted = claim(
+        &b,
+        "ann/fix",
+        ClaimTarget::Id(second.id),
+        60,
+        &BTreeMap::new(),
+    )?;
+    let proof = granted.claim_token.as_deref().unwrap();
+    assert_eq!(recover_claim(&b, "ann/fix", proof)?.inputs, granted.inputs);
+    let renewed = change_task(
+        &b,
+        second.id,
+        "ann/fix",
+        Some(granted.epoch),
+        Some(proof),
+        TaskAction::Renew(90),
+    )?;
+    assert_eq!(renewed.inputs, granted.inputs);
     Ok(())
 }
 

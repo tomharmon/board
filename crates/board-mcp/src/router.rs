@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::tools::wait::Parked;
+use crate::{Toolset, tools::wait::Parked};
 use board_local::Board;
 use serde_json::{Value, json};
 
@@ -11,6 +11,7 @@ pub struct ActorContext {
     pub(crate) default_run: Option<String>,
     pub(crate) worker: Option<board_local::swarm::WorkerBinding>,
     pub(crate) leases: HashMap<i64, (i64, String)>,
+    pub(crate) toolset: Toolset,
     initialized: bool,
     structured: bool,
 }
@@ -22,9 +23,28 @@ impl ActorContext {
             default_run,
             worker: None,
             leases: HashMap::new(),
+            toolset: Toolset::Board,
             initialized: false,
             structured: false,
         }
+    }
+
+    pub fn with_toolset(mut self, toolset: Toolset) -> Self {
+        self.toolset = toolset;
+        self
+    }
+
+    fn instructions(&self) -> String {
+        let mut hint = if self.worker.is_some() {
+            "Start with worker_assignment for your brief. "
+        } else {
+            "Use swarm_start, swarm_add and swarm_stop to coordinate named workers; Board never starts or stops their processes. Use tasks_plan for ordinary tasks and dependencies. "
+        }.to_owned();
+        hint.push_str("Use board_post to post or reply to a task, board_read for the feed or a thread, swarm_wait for addressed messages, and swarm_observe for progress and blockers. Reading does not acknowledge a message.");
+        if self.toolset != Toolset::Board {
+            hint.push_str(" For shared queues, tasks_claim leases ready work. Renew, release or settle it on this connection.");
+        }
+        hint
     }
 }
 
@@ -115,6 +135,7 @@ pub(crate) fn route<'a>(
             session.initialized = true;
             session.structured = version >= "2025-06-18";
             json!({"protocolVersion":version,"capabilities":{"tools":{}},
+                "instructions":session.instructions(),
                 "serverInfo":{"name":"board-mcp","version":env!("CARGO_PKG_VERSION")}})
         }
         "initialize" => return Some(error(id, -32600, "Session already initialized")),
@@ -126,7 +147,7 @@ pub(crate) fn route<'a>(
             if params.and_then(|p| p.get("cursor")).is_some() {
                 return Some(error(id, -32602, "This catalog fits on one page"));
             }
-            json!({"tools":crate::tools::catalog(board,session.worker.is_some(),session.structured)})
+            json!({"tools":crate::tools::catalog(board,session.toolset,session.worker.is_some(),session.structured)})
         }
         "tools/call" => {
             let Some(tool) = params
@@ -136,6 +157,17 @@ pub(crate) fn route<'a>(
             else {
                 return Some(error(id, -32602, "Unknown or missing Board tool name"));
             };
+            // The compatibility catalog retains the old domain errors for a
+            // wrong-role call. In lean catalogs, hidden tools aren't routable.
+            if session.toolset != Toolset::Full
+                && !tool.offered(session.toolset, session.worker.is_some())
+            {
+                return Some(error(
+                    id,
+                    -32602,
+                    "Tool not available in this catalog; use tools/list",
+                ));
+            }
             let empty = json!({});
             let args = params.and_then(|p| p.get("arguments")).unwrap_or(&empty);
             let result = match Parked::prepare(board, session, tool, args, id.clone()) {

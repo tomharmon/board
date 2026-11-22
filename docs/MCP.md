@@ -28,41 +28,27 @@ For other clients, use the absolute executable path and stdio arguments printed 
 
 Each MCP server process inherits the standard Board environment variables (`BOARD_DB`, `BOARD_NAME`, `BOARD_USER`, `BOARD_PROFILE`, `BOARD_SWARM_RUN`, and optional `BOARD_TOKEN` for restricted actors), and uses the exact same `board-core` domain and permission rules as the CLI and REST API.
 
-The registered connection is for the coordinator chat, not its subagents. For a dedicated worker use `board --db PATH --worker RUN/NAME mcp`; check `board_whoami`, then call `worker_assignment` for that worker's pinned instructions. No shared skill directory is required. A worker selector is not a credential. For a shared harness that uses the CLI, call `swarm_add` with `export_local: true` and pass its literal worker arguments. Never share the coordinator token. Dedicated worker connections do not advertise coordinator lifecycle tools.
+The registered connection belongs to the coordinator chat. Give each independently working agent its own `board --db PATH --worker RUN/NAME mcp` connection. Its `worker_assignment` returns the bound actor and run, brief, pinned prompt and skill file index; supply `skill` and `path` to read a pinned file. A selector is not a credential. Never pass the coordinator token. If a harness shares one connection between agents, use `swarm_add(export_local: true)` and give the worker its literal CLI arguments instead.
 
-## Tool groups
+## Default tools
 
-### Swarms & roles
-- `swarm_start` — Record a goal and optional limits: `max_active` (1..128, default 8), `retry_budget` (extra attempts, 0..1000, default 0), and the separate peer notification limit. The chat harness enforces launch and retry policy; Board never launches agents.
-- `swarm_observe` — One run-scoped snapshot: goal and channel, worker and task counts, ordinary task threads with owner and evidence links, paged current exceptions, and compact changes. No private DMs or transcript.
-- `swarm_list` — List visible swarm runs, newest first.
-- `swarm_add` — Register a named worker with its public brief and optional role. The default returns its run, channel, selector and roster entry. Local skill export is opt-in and can be retried without registering a second worker.
-- `worker_assignment` — On a worker-bound connection, returns its own goal, brief, protocol, pinned role prompt and skill file index. Supply `skill` and `path` to read a pinned file. The connection cannot select a different worker.
-- `swarm_status` — Inspect the run state, roster, and visible activity count. Use `swarm_read` for the actual conversation.
-- `swarm_check_in` — A worker reports starting. Optional `model`, `workspace_mode` and `session_ref` are self-reported display metadata, not credentials or process controls. Omit all three to preserve the previous report; supplying any of them replaces the whole report, clearing fields not supplied. Pass `compact: true` for a short acknowledgment.
-- `swarm_launch_failed` — Record a launch failure the harness actually observed. Silence is not a launch failure.
-- `swarm_receipt` / `swarm_decide` / `board_attention` — Inspect evidence tied to exact revisions, answer an explicit decision request, or inspect board-wide operator attention.
-- `swarm_set_limit` — Adjust a run's peer notification budget (coordinator or owner only).
-- `swarm_post` — Post a public message to the swarm channel (`@name` notifies that teammate; no `--to` field).
-- `swarm_dm` — Send a direct message to a specific worker (`to` required) and notify them.
-- `swarm_read` — Read visible messages and DMs after a cursor. Optional `kind`: `public`, `dm` or `addressed` (to the calling actor). Optional `worker` filters by roster name. Reading history never acknowledges the inbox.
-- `swarm_wait` — Block until a notification or DM arrives for this actor (updating status to `waiting` in SQLite while blocked).
-- `swarm_done` / `swarm_stop` — Mark the calling worker finished, or stop the run as coordinator, its owning person, or the trusted local owner.
-- `roles_list` / `roles_show` — Inspect the owner-side library of built-in and custom roles and their attached skills. Dedicated worker connections do not advertise these tools, and scoped credentials cannot read the library.
+| What the agent needs | Tool |
+| --- | --- |
+| Start a public conversation or reply to one | `board_post` with exactly one of `channel` or `reply_to`, plus `text`. |
+| Read the source | `board_read(target: ID)` opens a thread; `board_read(run: RUN)` reads the public swarm feed. For a run feed use `after`, `limit`, and optionally `kind` (`public`, `addressed`, or permitted `dm`) and `worker`. Channel and filtered message search are separate forms. Reading never acknowledges the inbox. |
+| Wait for a teammate | `swarm_wait` waits for addressed notifications, with replay and explicit acknowledgment. It does not claim work. |
+| See what needs attention | `swarm_observe` shows the run goal, task threads, actions, counts and changes. Use `explain_task` for one task's dependencies and review evidence. |
 
-### Messaging & search
-- `board_whoami`: Inspect the actual actor and optional bound worker on this connection. No tool accepts an actor override.
-- `board_post` / `board_reply` — Post a thread or reply in any permitted channel. In an active run a task reply to `@verify` notifies the verifier through the same path as `swarm_post`. Ordinary prose is sufficient. Optional `schema` plus `schema_data` records evidence; use `idempotency_key` for retryable writes and `attachment_ids` for selected files.
-- `board_file_upload(channel, name, content_type, data_base64)` / `board_file_read(id, offset?, length?)` — Upload up to 64 KiB of selected bytes, not a machine path. Attach the returned ID to a post or reply. Each read authorizes access and returns base64 plus `next_offset` (null at EOF); the default and maximum read is 64 KiB. Larger files can be published with the CLI or REST.
-- `board_read` — Read channels, threads, or filtered message history.
-- `board_channels` — List channels.
+A worker sees these four tools plus `worker_assignment`. A coordinator sees the four plus `swarm_start`, `swarm_add`, `swarm_stop`, and `tasks_plan`. Registration records a named brief; the harness launches the agent. Stop releases waits but cannot interrupt a process. Use `tasks_plan` when tracked tasks or prerequisites are useful; an ordinary conversation needs no lease or plan.
 
-### Tasks
-- `tasks_list` — List tasks with channel/label/assignee filters. Pass `next_after` as `after` until it is null. This is an exclusive task ID, **not** the response's snapshot event `cursor`.
-- `tasks_create` — Create a single task. Use `needs` for existing prerequisite task IDs; `claim: true` creates and leases it atomically.
-- `tasks_plan` — Create an ordinary batch in any channel where you can post. Returns the batch key and tasks in input order. Supply a stable `key` to retry; otherwise Board generates one.
-- `tasks_claim` / `tasks_complete` / `tasks_fail` / `tasks_block` — Claim and settle work with fenced leases.
-- `tasks_renew` / `tasks_release` — Extend a live lease (`id`, optional `lease_seconds`) or return it to the queue (`id`), on the same connection that claimed it.
+For example, in an existing task thread, a worker can call `board_post` with `{"reply_to":42,"text":"@parser The empty input check still fails on revision A."}`. The response is the posted message, including `notified` and/or `suppressed` when nonempty; neither implies the recipient read it. Both workers use the same tool to post [revision-bound handoffs and checks](AGENT-ROLES.md#attention-and-revision-bound-receipts). A corrected revision needs its own handoff and verification. A successful review is not a task state transition.
+
+## Optional toolsets
+
+- **Shared queue:** Start only participating connections with `board --db PATH --worker RUN/NAME mcp --queue` (or `board mcp --queue` for an unbound client). This adds `tasks_claim`, `tasks_renew`, `tasks_release`, `tasks_complete`, `tasks_fail`, and `tasks_block`. Useful when interchangeable workers pull from a backlog, not when the brief already identifies who should do the work. See the pool example below.
+- **Full compatibility:** For an existing integration that calls the previous catalog, use `board mcp --full` (client config: `"args":["mcp","--full"]`). This retains `board_reply(id: ...)`, `swarm_post` and `swarm_read` with their existing reply shapes and defaults, plus the previous role-appropriate tools for files, DMs, worker status, run receipts, task administration, etc. The ordinary CLI and desktop features are unchanged. For example, upload evidence bytes with `board_file_upload` and read them with `board_file_read` in full mode; this does not belong on every worker's tool list.
+
+Choose the toolset when starting the MCP server; reconnect after changing arguments. A tool absent from the catalog cannot be invoked on that connection. The toolset controls discovery and dispatch, not authorization: actor identity, worker binding, channel grants, and lease checks still apply.
 
 ## Pool workflow
 
@@ -81,7 +67,9 @@ Start a run and register the worker identities your chat will launch. Submit an 
 
 The result is `{key, tasks}`: each task's `id` is at the same position as its input item. Items can name later items, use an existing readable task ID as a prerequisite, or assign a profile with `for`. Put acceptance criteria and the expected output in the task text. Use `no_sync: true` for local-only items. A task can have up to 20 direct prerequisites. Up to 100 items commit together; larger plans commit in resumable chunks. Retry the same batch key without changing committed items; an uncommitted suffix can be repaired. Existing v18 swarm batches can still be read through the ordinary REST batch lookup, `GET /v1/task-batches?key=swarm-plan:<run-id>:<old-key>`.
 
-From a bound research worker, call `tasks_claim` with `{"ready_channel":"swarms/example","labels":{"pool":"research"},"wait_seconds":30}`. One eligible worker gets the task, even if several are waiting. Read prerequisite results with `board_read(target: ID)`; renew before `lease_until`. Finish with a durable output reference or release unfinished work. If a lease is lost, stop that attempt. Waiting on the work queue does not consume a mention or DM.
+From a worker connected with `--queue`, call `tasks_claim` with `{"ready_channel":"swarms/example","labels":{"pool":"research"},"wait_seconds":30}`. One eligible worker gets the task, even if several are waiting. Renew before `lease_until`; if the lease is lost, stop that attempt. Finish with a durable output reference or release unfinished work. Waiting on the queue does not consume a mention or DM.
+
+For a dependent task, the claim's `inputs` and the opened thread's `message.task.inputs` summarize its readable direct prerequisites. Each input gives the source task `id`, `state`, and `result`. When visible, `handoff` identifies the latest revision and source post; its optional `verification` gives the check's post ID and status. A completed input may have no handoff or no check for its current revision. Use `board_read(target: ID)` on a source for the conversation, not once per input just to collect results.
 
 Call `swarm_observe(run)` when starting or resuming the coordinator. The default page size is 20; `limit` (1..100) independently bounds the threads, actions and changes:
 
@@ -91,11 +79,13 @@ Call `swarm_observe(run)` when starting or resuming the coordinator. The default
 - `changes` initially shows recent events in chronological order. With explicit `after`, it pages forward from that cursor without skipping. To read the entire run use `after: 0`; use `has_more` and the last delivered `cursor` to continue. Empty pages leave the cursor unchanged. Keep the cursor only after processing the page.
 - Counts cover tasks in the run channel; an expired, not-yet-reclaimed lease is `expired`, not evidence of a crashed worker. Other queues and their dependent counts remain separate. Available capacity subtracts checked-in working/waiting workers, not unknown harness processes. Account for in-flight launches in the chat. Policy is guidance for the coordinator, not OS process enforcement.
 
+To answer "why is Publish waiting?", call `swarm_observe` with `{"run":"example","explain_task":42}` (CLI: `board swarm observe --run example --explain-task 42`). Instead of the paged overview, this returns `{task_id, steps, truncated}`; `limit` bounds the number of distinct tasks. Start with a task in the run. Each step gives the recorded state and reason, links to readable unfinished prerequisites (which may be in another channel), and any handoff and verification from this run. For example, Packaging can be ready to claim **and** have a handoff awaiting verification; the handoff itself does not block Publish. This read does not inspect private messages or infer why a process is quiet.
+
 ## Arguments and sessions
 
 Initialize the session, then call `tools/list` for the argument schemas. Unknown arguments are rejected. Labels are JSON objects mapping strings to strings. A structured swarm post takes both `schema` and `schema_data`; the catalog describes the installed built-in handoff, verification and decision shapes. Use `idempotency_key` for retryable evidence. Invalid blocks never post. `board_read.target` accepts a message ID for a whole thread or a channel name for filtered history. Domain errors include a JSON `code` and `message`. For negotiated protocol versions from 2025-06-18, results also have `structuredContent`; list-only results use an `items` object wrapper there. The original JSON text (including bare lists) remains available.
 
-For tools accepting `run`, a JSON integer always means a run ID. A string selects a slug first; `"#1"` explicitly selects ID 1 even when a different run has the slug `"1"`. Without the argument the server uses `BOARD_SWARM_RUN`.
+For tools accepting `run`, a JSON integer always means a run ID. A string selects a slug first; `"#1"` explicitly selects ID 1 even when a different run has the slug `"1"`. Run-specific tools such as `swarm_observe` can use the connection's bound run. For `board_read`, supply `run` explicitly to select the run feed rather than general message search.
 
 Task claims are fenced and exclusive. `tasks_claim` takes exactly one of `id` or `ready_channel`; its lease lasts 30 to 3600 seconds (default 300). Only a queue can specify `wait_seconds` (0..300, default 0); timeout is the ordinary `nothing_ready` tool error, not run completion. A winning MCP session keeps the proof in memory, never in tool output, including renewal. Renew or settle **in the same server session** before expiry. After a process dies another session must wait for expiry and claim again, even with the same profile. A bound worker cannot acquire new claims after its run stops.
 
@@ -103,4 +93,4 @@ A connection may park one inbox wait and one ready-queue wait concurrently. Ping
 
 `swarm_wait` accepts `timeout_seconds` from 0 to 300 (default 90), returning `messages`, `still_waiting`, or `stopped` plus a cursor. Reading does not acknowledge a batch. After processing it, pass its cursor as `ack` on the next wait; after a lost response, reconnect and omit both `ack` and `after` to replay from the saved acknowledgment. Use a stable write key for any reply that may be retried. `after` is an explicit replay/seek override, not an acknowledgment; do not combine it with `ack` or substitute a board head or task cursor. Upgrading keeps existing inbox positions.
 
-Use one local MCP session per independently working actor. A public post does not take a `to` argument; mention a teammate or send an explicit DM. A notification can release a waiting call; it never starts a process. The MCP transport uses standard input/output; it starts no listener. Any optional REST service is separate.
+Use one local MCP session per independently working actor. A public post does not take a `to` argument; mention a teammate to request their attention. DMs are separate (CLI, desktop or full MCP). A notification can release a waiting call; it never starts a process.

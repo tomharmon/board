@@ -2,11 +2,15 @@
 
 ## Desktop to MCP handoff
 
-Run `cargo build --locked -p board-cli -p board-ui`, then `python3 -B scripts/swarm_handoff.py --bin-dir target/debug`. The fixture uses an actual desktop task reply, separately bound stdio clients and a disposable SQLite database. A verifier reconnects after losing an inbox response, reads the same addressed reply and published evidence bytes, and retries a revision-bound verification. Only one verification and notification are recorded; the result opens in the original desktop thread. No vendor executable or model is involved.
+Run `cargo build --locked -p board-cli -p board-ui`, then `python3 -B scripts/swarm_handoff.py --bin-dir target/debug`. A desktop user replies to the task. A verifier reconnects after losing that inbox response, checks the uploaded bytes, and reports a missing version header. The coordinator then disconnects. Two independently bound **default** MCP clients exchange the corrected handoff and passing check in the same task thread, with no claims. The fixture opts into `--full` only for binary file operations and the final receipt audit. It checks that retries duplicate neither evidence nor notifications, and that a returning reader can see both revisions in the original thread. It uses a disposable board and no vendor executable or model.
 
 ## Restartable worker pool
 
-Run `cargo build --locked --offline -p board-cli`, then `python3 scripts/swarm_pool.py --bin target/debug/board`. This disposable, model-free stdio exercise uses eight worker identities and real 30-second leases. It submits 100 investigations, ten dependent summaries and a final synthesis, kills a worker, leaves a second worker holding a stale proof, and restarts the coordinator during execution. It checks identical plan IDs on replay, a pending decision in a one-entry observation, 111 unique accepted settlements, takeover at higher epochs, rejection of the stale proof, and independent verification of the final sum (5050). Board itself starts no worker processes.
+Run `cargo build --locked --offline -p board-cli`, then `python3 scripts/swarm_pool.py --bin target/debug/board`. This disposable, model-free stdio exercise uses eight worker identities with `--queue` and real 30-second leases. The coordinator uses its default tools to plan 100 investigations, ten dependent summaries and a final synthesis. The fixture kills a worker, leaves a second worker holding a stale proof, and restarts the coordinator. It checks identical plan IDs on replay, a pending decision in a one-entry observation, 111 unique accepted settlements, takeover at higher epochs, rejection of the stale proof, and independent verification of the final sum (5050). Board itself starts no worker processes.
+
+### Engineering pilot
+
+Two independently connected workers used `--queue` on a disposable board to verify this MCP change. Three unassigned tickets covered the default/queue catalogs and rejected calls (#6), full compatibility and access checks (#7), and the docs and worker skill (#8). One worker pulled a second ticket without the coordinator assigning it by name. The final task list showed all three completed on their first lease (epoch 1). This tested a real engineering use of the queue, not production adoption or a benefit for named assignments.
 
 ## Two native agents, one local board
 

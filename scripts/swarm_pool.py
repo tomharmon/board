@@ -14,12 +14,13 @@ import time
 
 
 class Client:
-    def __init__(self, exe, db, worker=None):
+    def __init__(self, exe, db, worker=None, *, mode=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith("BOARD_")}
         args = [exe, "--db", db]
         if worker:
             args += ["--worker", f"pool/{worker}"]
-        self.p = subprocess.Popen(args + ["mcp"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        args += ["mcp"] + ([mode] if mode else [])
+        self.p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   env={**env, "BOARD_USER": "fixture"}, text=True, encoding="utf-8")
         self.lines = Queue()
         self.reader = Thread(target=self.read_lines, daemon=True)
@@ -74,8 +75,8 @@ def graph():
 
 
 def exercise(exe, db, stack):
-    def connect(worker=None):
-        client = Client(exe, db, worker)
+    def connect(worker=None, *, mode=None):
+        client = Client(exe, db, worker, mode=mode)
         stack.callback(client.close)
         return client
 
@@ -92,17 +93,22 @@ def exercise(exe, db, stack):
     for i in range(8):
         name = f"worker-{i}"
         boss.call("swarm_add", run="pool", name=name, brief="Claim and sum fixture items")
-        worker = connect(name)
-        assert worker.call("board_whoami")["worker"]["name"] == name
-        assert "workers" not in worker.call("swarm_check_in", compact=True)
+        worker = connect(name, mode="--queue")
+        assert worker.call("worker_assignment")["worker"]["name"] == name
         workers.append(worker)
+    kickoff = boss.call("board_post", channel="swarms/pool",
+                        text="Queue is ready: " + " ".join(f"@worker-{i}" for i in range(8)))
+    for c in workers:
+        batch = c.call("swarm_wait", timeout_seconds=0)
+        assert [m["id"] for m in batch["messages"]] == [kickoff["id"]]
+        assert c.call("swarm_wait", ack=batch["cursor"], timeout_seconds=0)["status"] == "still_waiting"
     assert boss.call("swarm_observe", run="pool")["available_capacity"] == 0
     queue = {"ready_channel": "swarms/pool", "lease_seconds": 30}
     lost, stale = [c.call("tasks_claim", **queue) for c in workers[:2]]
     workers[0].close()  # abrupt loss, including its private proof
-    workers[0] = connect("worker-0")
-    workers[0].call("swarm_check_in", compact=True)
-    request = workers[1].call("swarm_post", text="Confirm synthesis format",
+    workers[0] = connect("worker-0", mode="--queue")
+    assert workers[0].call("worker_assignment")["worker"]["name"] == "worker-0"
+    request = workers[1].call("board_post", channel="swarms/pool", text="Confirm synthesis format",
                               schema="decision-request@1",
                               schema_data={"to": "fixture", "summary": "Use decimal output?"})
     first_settlement, abort = Event(), Event()
@@ -115,19 +121,19 @@ def exercise(exe, db, stack):
                 task = c.call("tasks_claim", **queue, wait_seconds=2, allow=("nothing_ready",))
                 if task.get("code") == "nothing_ready":
                     if c.call("swarm_observe", limit=1)["tasks"].get("completed") == 111:
-                        c.call("swarm_done")
                         return finished
                     continue
                 tid = task["id"]
                 if task["needs"]:
-                    inputs = [c.call("board_read", target=n)["message"]["task"] for n in task["needs"]]
+                    inputs = task["inputs"]
+                    assert [item["id"] for item in inputs] == task["needs"]
                     assert all(t["state"] == "completed" for t in inputs)
                     value = sum(int(t["result"]) for t in inputs)
                 else:
                     value = int(task["text"].splitlines()[0].split()[1])
                 if tid == ids["synthesis"]:
                     digest = hashlib.sha256(str(value).encode()).hexdigest()
-                    c.call("swarm_post", text="Verify final sum", schema="handoff@1",
+                    c.call("board_post", reply_to=tid, text="Verify final sum", schema="handoff@1",
                            schema_data={"task": tid, "revision": {"kind": "sha256", "value": digest},
                                         "to": "worker-1", "summary": "Final sum", "changes": ["sum.txt"]})
                 assert c.call("tasks_complete", id=tid, result=str(value))["state"] == "completed"
@@ -147,9 +153,10 @@ def exercise(exe, db, stack):
             boss.close()  # workers keep working, no new agent is launched by Board
             boss = connect()
             view = boss.call("swarm_observe", run="pool", limit=1)
-            assert len(view["changes"]) <= 1 and view["actions"][0]["message_id"] == request["message"]["id"]
+            assert len(view["changes"]) <= 1 and view["actions"][0]["message_id"] == request["id"]
             assert submit_plan() == ids
-            boss.call("swarm_decide", run="pool", id=request["message"]["id"], summary="Use decimal")
+            boss.call("board_post", reply_to=request["id"], text="Use decimal", schema="decision-resolution@1",
+                      schema_data={"request": request["id"], "summary": "Use decimal"})
             results = [job.result(timeout=100) for job in jobs]
         finally:
             abort.set()
@@ -162,15 +169,14 @@ def exercise(exe, db, stack):
     assert verifier.call("tasks_complete", id=stale["id"], allow=("claim_lost",))["code"] == "claim_lost"
     final = verifier.call("board_read", target=ids["synthesis"])["message"]["task"]
     assert final["result"] == str(sum(range(1, 101))) == "5050"
-    handoff, = verifier.call("swarm_receipt")["handoffs"]
+    handoff = verifier.call("swarm_observe", explain_task=ids["synthesis"])["steps"][0]["handoff"]
     revision = {"kind": "sha256", "value": hashlib.sha256(b"5050").hexdigest()}
-    assert handoff["handoff"]["revision"] == revision
-    verifier.call("swarm_post", text="Checked final sum", schema="verification@1",
+    assert handoff["revision"] == revision
+    verifier.call("board_post", reply_to=ids["synthesis"], text="Checked final sum", schema="verification@1",
                   schema_data={"handoff": handoff["id"], "revision": revision, "summary": "Passed",
                                "checks": [{"name": "Independent sum", "command": "sum(range(1, 101))",
                                            "status": "pass", "output": "5050"}]})
-    verifier.call("swarm_done")
-    receipt = boss.call("swarm_receipt", run="pool")
+    receipt = connect(mode="--full").call("swarm_receipt", run="pool")
     assert not receipt["open_tasks"] and not receipt["decisions"] and receipt["handoffs"][0]["status"] == "pass"
     assert boss.call("swarm_observe", run="pool")["actions"] == []
     boss.call("swarm_stop", run="pool")

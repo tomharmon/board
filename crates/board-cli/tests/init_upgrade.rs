@@ -108,6 +108,31 @@ fn backups(file: &Path) -> Vec<Vec<u8>> {
 }
 
 #[test]
+fn init_preserves_an_explicit_queue_or_full_catalog() {
+    let h = Home::new();
+    write(
+        &h.codex.join("config.toml"),
+        format!(
+            "[mcp_servers.board]\ncommand={}\nargs=['mcp','--queue']\n",
+            json!(BOARD)
+        )
+        .as_bytes(),
+    );
+    let path = h.claude.join(".claude.json");
+    let full =
+        json!({"mcpServers":{"board":{"command":BOARD,"args":["mcp","--full"]}}}).to_string();
+    write(&path, full.as_bytes());
+    success(h.init("codex", false));
+    success(h.init("claude", false));
+    assert_eq!(fs::read_to_string(path).unwrap(), full);
+    assert!(
+        fs::read_to_string(h.codex.join("config.toml"))
+            .unwrap()
+            .contains("--queue")
+    );
+}
+
+#[test]
 fn init_upgrades_exact_stock_in_place_and_retains_old_bytes() {
     let h = Home::new();
     let slot = h.claude.join("skills/board-swarm/SKILL.md");

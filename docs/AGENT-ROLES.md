@@ -57,7 +57,7 @@ Every swarm run gets a Board channel (`swarms/<run-slug>`), and each worker post
 `board swarm post` writes to the swarm's shared channel. It does **not** take a `--to` flag. Ordinary posts and thread replies in an active swarm channel use the same addressing rules, including replies from the desktop task thread.
 
 - **No `@mention`:** An ordinary progress post is visible in Rune but notifies nobody. Structured handoffs, verification and decision records notify their addressed participant as described below.
-- **With `@name`:** Posts publicly **and** sends a notification to `@name` (waking them if they are waiting, or queuing in their unread notifications if they are currently working).
+- **With `@name`:** Addresses the teammate publicly. If the peer notification limit allows it, Board signals their inbox. A signal is not proof the teammate read the post.
 
 If an agent is only talking *about* a teammate and doesn't want to wake them, it uses their plain name without `@`. Workers can also attach git diffs (`--diff`) or structured `verdict@1` cards so commits and pass/fail checks render cleanly in Rune.
 
@@ -65,13 +65,13 @@ If an agent is only talking *about* a teammate and doesn't want to wake them, it
 
 `board swarm dm --to <name>` requires `--to`. A successful DM and its notification commit together. A stopped recipient or exhausted peer notification limit returns an error instead of silently dropping the wakeup.
 
-- Keeps side questions and back-and-forth chatter out of the main public thread.
-- Still stored in SQLite and **visible in Rune** so you never lose sight of intermediate agent-to-agent conversations.
+- Reserve DMs for matters that should not be on the shared thread. Keep findings that affect the work, revisions and rechecks together in the task thread; do not copy private DMs there.
+- Stored in SQLite and visible in Rune to authorized participants and operators, not the rest of the worker roster.
 - Humans can also DM any worker directly from Rune or the CLI.
 
 ### Waiting and live status (`board swarm wait`)
 
-Workers begin as **Registered**, not Working. After checking its assigned identity, a worker explicitly runs `board swarm check-in` (MCP: `swarm_check_in`). Entering `swarm wait` also records an explicit worker check-in. The roster shows the last recorded swarm activity separately from status: a quiet worker is not automatically marked failed. The coordinator reports an actual harness launch error with `board swarm launch-failed NAME "reason" --run RUN`; only a worker that has not checked in can have a launch failure recorded. A later successful check-in clears that error.
+Workers begin as **Registered**, not Working. Reading `worker_assignment` is passive. Parking in an inbox wait or receiving a batch records activity; an empty zero-time probe does not check a worker in. The CLI and full MCP catalog also offer explicit check-in and done (`board swarm check-in`, `board swarm done`). The roster records what Board knows, not whether a harness is running. The coordinator can record an observed launch failure with `board swarm launch-failed NAME "reason" --run RUN`; silence is not evidence of failure.
 
 Schema v17 preserves existing assignments and history. Old Working records return to Registered because the old registration never proved execution; old Waiting records retain the explicit wait registration. Take a backup with the old binary before upgrading. This is not an assertion that an existing harness process stopped.
 
@@ -86,7 +86,7 @@ When a worker finishes a chunk of work and needs a reply (e.g. `@impl` waiting o
 
 The user-scoped MCP is the chat's connection. Sharing that connection does not give subagents independent identities. A dedicated worker uses `worker_assignment` to discover its brief and pinned instructions. For a harness that shares the chat connection, request a local package with MCP `swarm_add(export_local: true)` or CLI `board swarm add` and give the worker the returned prompt, files, environment and literal CLI arguments. Use `board swarm add --portable` for registration without local files. On a shared harness, **use the CLI**, for example `board --db /absolute/board.sqlite3 --worker release/check --json whoami`. The selector must match a roster entry and cannot override a credential.
 
-For a harness that genuinely supports a separate stdio process, start `board <cli_args> mcp` with that worker's environment and verify its `board_whoami` result. Never copy the coordinator's token. A worker selector prevents accidental misuse, not arbitrary local file access: use separate OS permissions and scoped credentials to contain untrusted code. When a harness offers neither shell access nor a dedicated worker MCP, report the limitation instead of falling back to the coordinator's identity.
+For a harness that supports a separate stdio process, start `board <cli_args> mcp` with that worker's environment and verify its actor and run with `worker_assignment`. Never copy the coordinator's token. A worker selector prevents accidental misuse, not arbitrary local file access: use separate OS permissions and scoped credentials to contain untrusted code. When a harness offers neither shell access nor a dedicated worker MCP, report the limitation instead of falling back to the coordinator's identity.
 
 ---
 
@@ -95,7 +95,7 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 - **Coordinator control:** The coordinator actor, its owning person, or the trusted local board owner can register workers, change the notification limit (`board swarm set-limit N --run RUN`), or stop the run. A local owner inspecting someone else's run does not consume its coordinator inbox. Workers can mark themselves done and ask `@coordinator` for help. A peer notification or DM never launches a process. There is no `@all` wakeup. When the peer budget is exhausted, a public post still lands and reports suppressed recipients; a peer DM fails rather than pretending it notified someone. Coordinator exchanges remain available.
 - **When the coordinator disconnects:** SQLite cannot detect whether a chat is connected or distinguish two trusted processes using the same actor. The harness owns its sessions and decides their shutdown policy. An already-running independent worker can still communicate within the active run's limits; nothing in Board spawns a replacement. Explicitly stop the run before disconnecting when workers must exit: blocked waits return `stopped`, but Board cannot kill unrelated in-flight tools. Do not give untrusted executables direct access to the owner's SQLite file.
 - **Rune never starts work automatically:** Opening a board or viewing a swarm in Rune is always passive. Explicit user actions (posting a message, sending a DM, clicking **Stop**) take effect normally.
-- **Backlogs and tickets:** Day-to-day `@impl ↔ @verifier` iteration stays in messages and DMs. For batch work (like draining a list of Linear or GitHub issues pulled with `board sync pull ... --as-tasks`), workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket.
+- **Backlogs and tickets:** Named workers do not need leases for their brief. Interchangeable workers pulling from a shared backlog can opt in to [fenced tasks](AUTOMATION.md) with `board mcp --queue`. A lease governs Board settlement, not filesystem access or external side effects.
 
 For new parallel work, the coordinator can submit an ordinary task plan to the swarm channel, launch a small worker pool in the chat, and inspect counts and exceptions with `swarm observe` instead of relaying each handoff. The [pool workflow](MCP.md#pool-workflow) covers dependency fan-in, queue waits, renewal, and coordinator reconnects. Schema v19 removes the separate swarm plan ledger without changing existing tasks, batch receipts, assignments, run policy or role attachments. Back up with the old binary before upgrading.
 
@@ -105,9 +105,9 @@ Schema v20 adds optional worker runtime reports and viewer-specific public-feed 
 
 ## Attention and revision-bound receipts
 
-**Needs attention** separates actions assigned to your actor from **Agent follow-up**. Explicit decision requests, observed launch failures and blocked/failed tasks carry who is waiting, who should act, and a source thread. Tasks assigned to agents and failing or unrun verification checks remain visible as follow-up without becoming human alerts. Use `board swarm attention` (MCP: `board_attention`) for the same read model.
+**Needs attention** separates actions assigned to your actor from **Agent follow-up**. Explicit decision requests, observed launch failures and blocked/failed tasks carry who is waiting, who should act, and a source thread. Tasks assigned to agents and failing or unrun verification checks remain visible as follow-up without becoming human alerts. Use `board swarm attention` (full MCP: `board_attention`) for the same read model.
 
-For an implementer/verifier exchange, post one of these built-in schemas using `board swarm post --schema NAME@1 --schema-data JSON` or the existing `swarm_post` MCP tool. Posting or replying through the ordinary composer/CLI in that run's `swarms/RUN` channel records the same evidence. Posting these records outside a run is rejected rather than silently losing the requested action. The records are validated and saved atomically with the post; retries using a CLI idempotency key do not create another handoff. Editing an existing message does not create or rewrite a coordination record.
+For a task in `swarms/RUN`, use `board_post(reply_to: TASK, text, schema, schema_data)` or `board reply TASK --schema NAME@1 'JSON'`. Both workers reply to the same task ID. A plain reply is enough for a question or finding; use the records below for an independently checkable result. For a task outside the run channel, keep structured swarm evidence in the run channel and link the task rather than moving its discussion. Records are validated and saved atomically with the post. A stable idempotency key makes a retry safe; editing the post cannot rewrite its evidence.
 
 | Schema | Required fields |
 | --- | --- |
@@ -118,19 +118,13 @@ For an implementer/verifier exchange, post one of these built-in schemas using `
 
 Handoffs notify the named verifier; verification notifies the author, using the existing notification budget. Missing or suppressed notifications do not lose the evidence. Decisions directed at a run participant notify that participant. These notifications only wake existing waits, never launch agents.
 
-For example, with the returned implementer worker environment selected and a verifier named `verify`:
-
-```sh
-board swarm check-in
-revision=$(git rev-parse HEAD)
-handoff=$(board swarm post --schema handoff@1 --schema-data "{\"revision\":{\"kind\":\"git-commit\",\"value\":\"$revision\"},\"summary\":\"Fix Unicode splitting\",\"changes\":[\"src/fields.rs\"],\"to\":\"verify\"}")
-```
+For example, on task #42 the author replies with a handoff for revision A addressed to `verify`. The verifier replies to #42 with the failing command and references A's handoff. The author replies with a new handoff for revision B, still naming task #42. The verifier replies with B's check. A returning participant can open #42 to see what failed, what changed and what actually passed.
 
 The verifier uses the returned handoff ID and that exact revision. A result against another hash is rejected. Mixed passing and unrun checks produce **not-run**, not a green pass; any failed check produces **fail**. `verdict@1` remains available for older evidence, but its optional artifact string is not promoted into a revision-bound receipt. Board validates identity and consistency, not whether the submitted commands actually ran: the verifier remains responsible for truthful evidence.
 
-Read `board swarm receipt --run RUN` (MCP: `swarm_receipt`) or the run's **Receipt** tab to see changes, full revisions, verifier identity, commands/results, linked unfinished tasks and unresolved decisions. A new handoff by the same author for the same task supersedes the previous one; without a task ID, it supersedes that author's previous unlinked handoff. Historical evidence remains visible, and a newer revision starts **unverified**. Evidence snapshots remain unchanged by edits to their conversation posts.
+Follow the evidence IDs from `swarm_observe` into `board_read(target: ID)` for the public thread. For the immutable run receipt, use `board swarm receipt --run RUN`, the desktop **Receipt** tab or full MCP's `swarm_receipt`. A new handoff by the same author for the same task supersedes the previous one; without a task ID, it supersedes that author's previous unlinked handoff. Historical evidence remains visible, and a newer revision starts **unverified**. Evidence snapshots remain unchanged by edits to their conversation posts.
 
-Answer a decision in Needs attention, or run `board swarm decide REQUEST_ID "answer" --run RUN` (MCP: `swarm_decide`). This records a resolution and clears the request, including after a run stops. An ordinary reply or DM does not silently resolve it. **Stopped**, **worker done**, **task completed** and **verified revision** are distinct facts; none implies the others.
+Answer a decision in an active run by posting a `decision-resolution@1` reply naming its request. Needs attention and `board swarm decide REQUEST_ID "answer" --run RUN` (full MCP: `swarm_decide`) can also answer, including after stop. An ordinary reply or DM does not silently resolve it. **Stopped**, **worker done**, **task completed** and **verified revision** are distinct facts; none implies the others.
 
 ---
 

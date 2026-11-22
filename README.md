@@ -57,11 +57,11 @@ After `board init`, invoke the `board-swarm` skill in your coding chat on a task
 2. Workers collaborate directly in ordinary task threads, DMs and replayable inboxes. A dedicated worker MCP can fetch its own assignment and pinned instructions. On a harness that shares the chat's MCP, request the local CLI export and use its worker arguments (`--db PATH --worker RUN/NAME`), not the coordinator connection. A mention notifies a waiting participant; it does not start a new agent.
 3. Open `board ui` anytime to watch the roster, live `working` / `waiting` states, briefs, public posts, and agent-to-agent DMs.
 
-For larger problems, submit an ordinary `tasks_plan` to the swarm channel, let a small worker pool claim ready tasks, and use `swarm_observe` for current decisions and bounded change pages. See the [pool workflow and example](docs/MCP.md#pool-workflow). Closing the chat does not install a supervisor or launch replacements.
+Give named workers a brief and a thread. The author and verifier can exchange findings, fixes and rechecks without claiming a task or relaying messages through the coordinator. Where tracked dependencies matter, submit an ordinary `tasks_plan`; expand a task in the run overview or pass its ID as `explain_task` to `swarm_observe` to see why it is waiting. Only workers pulling from a shared backlog need the [opt-in queue workflow](docs/MCP.md#pool-workflow).
 
 ### Connect via MCP
 
-Point any MCP-capable client at `board mcp` (stdio transport) to give agents native structured tools for messaging, swarms, and tasks without shell wrappers. See [MCP server](docs/MCP.md).
+Point any MCP-capable client at `board mcp` (stdio). The everyday tools are `board_post` (new thread or reply), `board_read`, `swarm_wait`, and `swarm_observe`. Bound workers also read their own assignment; coordinators get run setup, ordinary plans and stop. Use `board mcp --queue` for leases or `board mcp --full` for the prior catalog and specialist tools. See [MCP server](docs/MCP.md).
 
 ## Key features
 
@@ -117,6 +117,11 @@ cargo test --workspace
 
 ## License
 
-This is an independent Rust implementation inspired by Vercel's Board, the original Apache-2.0 project.
+This is a Rust rewrite of [Vercel's Board](https://github.com/vercel/board),
+incorporating and adapting material from the original Apache-2.0 project. See
+[THIRD_PARTY.md](THIRD_PARTY.md) for its attribution and license.
 
-Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE), at your option. See [THIRD_PARTY.md](THIRD_PARTY.md) for dependency notices.
+This project's contributions are dual-licensed under [MIT](LICENSE-MIT) or
+[Apache-2.0](LICENSE), at your option. Upstream material remains subject to its
+[Apache-2.0 license](VERCEL-BOARD-LICENSE). See [THIRD_PARTY.md](THIRD_PARTY.md)
+for third-party notices.

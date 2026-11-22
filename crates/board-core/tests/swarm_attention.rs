@@ -115,7 +115,7 @@ fn completed_input_does_not_block_dependents_while_its_handoff_awaits_review() -
         }),
     )?;
     let other = create_task(&b, "ada/impl", target("Other input"), &[], None)?;
-    create_task(
+    let dependent = create_task(
         &b,
         "ada/impl",
         target("Combine both"),
@@ -143,6 +143,16 @@ fn completed_input_does_not_block_dependents_while_its_handoff_awaits_review() -
     let obs = b.swarm_observe("ada", "audit", None, 0, 1)?;
     assert_eq!(obs.tasks["waiting"], 1);
     assert_eq!(obs.actions[0].blocked_dependents, 0);
+    let why = b.swarm_explain_task("ada", "audit", dependent.id, 10)?;
+    assert_eq!(
+        why.steps[0].waits_on,
+        [other.id],
+        "pending review is not a queue dependency"
+    );
+    assert!(why.steps.iter().all(|s| s.id != a.id));
+    let completed = b.swarm_explain_task("ada", "audit", a.id, 1)?;
+    assert_eq!(completed.steps[0].state, "completed");
+    assert_eq!(completed.steps[0].handoff.as_ref().unwrap().to, "verify");
     Ok(())
 }
 
@@ -155,6 +165,230 @@ fn post(b: &Board, who: &str, schema: &str, data: Value) -> Result<i64> {
     )?
     .message
     .id)
+}
+
+#[test]
+fn task_explanation_follows_only_visible_unfinished_edges_and_current_revision() -> Result<()> {
+    use board_local::access::Rules;
+    use board_local::automation::{TaskTarget, create_task};
+    let mut b = board()?;
+    let opts = PostOptions::default();
+    let task = |ch, text, needs: &[i64]| {
+        create_task(
+            &b,
+            "ada",
+            TaskTarget::New {
+                channel: ch,
+                text,
+                options: &opts,
+            },
+            needs,
+            None,
+        )
+    };
+    let run = "swarms/audit";
+    let behind_hidden = task("shared", "Reachable only through a private task", &[])?;
+    let hidden = task("private", "Private gate", &[behind_hidden.id])?;
+    let outside = task("shared", "Shared input", &[hidden.id])?;
+    let leaf = task(run, "Package", &[])?;
+    let middle = task(run, "Release", &[leaf.id])?;
+    let root = task(run, "Publish", &[middle.id, outside.id])?;
+    let revision = json!({"kind":"sha256","value":"a".repeat(64)});
+    let handoff = |r: &Value| {
+        post(
+            &b,
+            "ada/impl",
+            "handoff",
+            json!({"task":leaf.id,
+        "revision":r, "summary":"Packaged","changes":["archive"],"to":"verify"}),
+        )
+    };
+    let old = handoff(&revision)?;
+    post(
+        &b,
+        "ada/verify",
+        "verification",
+        json!({"handoff":old,"revision":revision,
+        "summary":"Checked","checks":[{"name":"unit","status":"pass","command":"test"}]}),
+    )?;
+    let current = handoff(&json!({"kind":"sha256","value":"b".repeat(64)}))?;
+    let other = b.swarm_start(
+        "ada",
+        &SwarmStart {
+            slug: Some("other-run".into()),
+            goal: "Independent review".into(),
+            ..Default::default()
+        },
+    )?;
+    b.swarm_add_worker(
+        "ada",
+        &other.slug,
+        &SwarmAddWorker {
+            name: "guard".into(),
+            brief: "Own review".into(),
+            ..Default::default()
+        },
+    )?;
+    b.swarm_post("ada", &other.slug, &append_block("", "handoff", 1, &json!({
+        "task":outside.id,"revision":revision,"summary":"Other run only","changes":["note"],"to":"guard"
+    }))?, &Default::default())?;
+    b.set_grant(
+        "ada",
+        None,
+        "guest",
+        &Rules::parse("swarms/=read;shared=read")?,
+    )?;
+    let token = b.issue_credential("ada", "guest", None, None)?.token;
+    b.bind_token(&token)?;
+    let cursor = b.cursor()?;
+    let why = b.swarm_explain_task("guest", "audit", root.id, 4)?;
+    assert_eq!(
+        why.steps.iter().map(|s| s.id).collect::<Vec<_>>(),
+        [root.id, outside.id, middle.id, leaf.id]
+    );
+    assert_eq!(why.steps[0].waits_on, [outside.id, middle.id]);
+    assert!(why.steps[1].waits_on.is_empty());
+    assert_eq!(
+        why.steps[1].reason,
+        "No unfinished prerequisite is visible."
+    );
+    assert!(
+        why.steps[1].handoff.is_none(),
+        "do not import other runs' evidence"
+    );
+    assert_eq!(why.steps[2].waits_on, [leaf.id]);
+    let last = &why.steps[3];
+    assert_eq!(last.state, "ready");
+    assert!(last.reason.contains("no reason for inactivity"));
+    let evidence = last.handoff.as_ref().unwrap();
+    assert_eq!((evidence.id, evidence.to.as_str()), (current, "verify"));
+    assert!(evidence.verification.is_none());
+    assert!(!why.truncated);
+    let short = b.swarm_explain_task("guest", "audit", root.id, 1)?;
+    assert!(short.truncated);
+    assert_eq!(short.steps[0].waits_on, [outside.id, middle.id]);
+    assert!(
+        b.swarm_explain_task("guest", "audit", outside.id, 5)
+            .is_err()
+    );
+    assert_eq!(b.cursor()?, cursor);
+    Ok(())
+}
+
+#[test]
+fn task_inputs_follow_the_latest_readable_revision_at_open_and_claim() -> Result<()> {
+    use board_local::access::Rules;
+    use board_local::automation::{
+        ClaimTarget, TaskAction, TaskTarget, change_task, claim, create_task,
+    };
+    let mut b = board()?;
+    let opts = PostOptions::default();
+    let task = |channel, text, needs: &[i64]| {
+        create_task(
+            &b,
+            "ada",
+            TaskTarget::New {
+                channel,
+                text,
+                options: &opts,
+            },
+            needs,
+            None,
+        )
+    };
+    let input = task("public", "Produce artifact", &[])?;
+    let private = task("internal", "Independent private check", &[])?;
+    let dependent = task("public", "Use both results", &[input.id, private.id])?;
+    let acquire = |id| claim(&b, "ada", ClaimTarget::Id(id), 120, &Default::default());
+    for (id, result) in [
+        (input.id, "artifact output"),
+        (private.id, "sensitive output"),
+    ] {
+        let t = acquire(id)?;
+        change_task(
+            &b,
+            id,
+            "ada",
+            Some(t.epoch),
+            t.claim_token.as_deref(),
+            TaskAction::Complete(Some(result)),
+        )?;
+    }
+    let publish = |value: &str| {
+        post(
+            &b,
+            "ada/impl",
+            "handoff",
+            json!({
+                "task":input.id,"to":"verify","summary":"Ready","changes":["artifact"],
+                "revision":{"kind":"sha256","value":value.repeat(64)}
+            }),
+        )
+    };
+    let check = |handoff, value: &str, status| {
+        post(
+            &b,
+            "ada/verify",
+            "verification",
+            json!({
+                "handoff":handoff,"revision":{"kind":"sha256","value":value.repeat(64)},"summary":"Checked",
+                "checks":[{"name":"artifact","command":"test artifact","status":status}]
+            }),
+        )
+    };
+    let open = |b: &Board| -> Result<_> {
+        Ok(b.conversation(dependent.id, &Default::default())?
+            .message
+            .task
+            .unwrap())
+    };
+    let first = publish("a")?;
+    let failed = check(first, "a", "fail")?;
+    let claimed = acquire(dependent.id)?;
+    assert_eq!(claimed.inputs, open(&b)?.inputs);
+    assert_eq!(claimed.inputs.len(), 2);
+    assert_eq!(claimed.inputs[0].id, input.id);
+    assert_eq!(claimed.inputs[0].state, "completed");
+    assert_eq!(claimed.inputs[0].result.as_deref(), Some("artifact output"));
+    let verification = claimed.inputs[0]
+        .handoff
+        .as_ref()
+        .unwrap()
+        .verification
+        .as_ref()
+        .unwrap();
+    assert_eq!(
+        (verification.id, verification.status.as_str()),
+        (failed, "fail")
+    );
+    assert!(claimed.inputs[1].handoff.is_none());
+    let next = publish("b")?;
+    // Even a late pass on A cannot verify B.
+    check(first, "a", "pass")?;
+    let latest = open(&b)?.inputs.remove(0).handoff.unwrap();
+    assert_eq!((latest.id, latest.revision.value), (next, "b".repeat(64)));
+    assert!(latest.verification.is_none());
+    let not_run = check(next, "b", "not-run")?;
+    let check = open(&b)?
+        .inputs
+        .remove(0)
+        .handoff
+        .unwrap()
+        .verification
+        .unwrap();
+    assert_eq!((check.id, check.status.as_str()), (not_run, "not-run"));
+    b.set_grant("ada", None, "guest", &Rules::parse("public=read")?)?;
+    let token = b.issue_credential("ada", "guest", None, None)?.token;
+    b.bind_token(&token)?;
+    let scoped = open(&b)?;
+    assert_eq!(scoped.needs, [input.id]);
+    assert_eq!(scoped.inputs.len(), 1);
+    assert_eq!(scoped.inputs[0].result.as_deref(), Some("artifact output"));
+    assert!(
+        scoped.inputs[0].handoff.is_none(),
+        "a readable task does not grant access to its verifier's channel"
+    );
+    Ok(())
 }
 
 #[test]

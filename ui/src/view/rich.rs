@@ -268,11 +268,44 @@ pub(super) fn scoped_body(s: &State, m: &Message, prefix: &'static str) -> El {
         })
     };
     // No URL opener or image resolver: message content cannot make network or file requests.
-    md.tasks_read_only()
+    let body = md
+        .tasks_read_only()
         .selectable(true)
         .wrap_code(true)
         .scroll_wide(true)
         .render(&style)
         .w_full()
-        .min_w(0.0)
+        .min_w(0.0);
+    if m.notified.is_empty() && m.suppressed.is_empty() {
+        return body;
+    }
+    let names = |workers: &[String]| {
+        workers
+            .iter()
+            .map(|w| format!("@{w}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut out = col().w_full().min_w(0.).gap(5.).child(body);
+    if !m.notified.is_empty() {
+        out = out.child(
+            mono(format!("Notified {}", names(&m.notified)), MUTED)
+                .w_full()
+                .wrap_anywhere(),
+        );
+    }
+    if !m.suppressed.is_empty() {
+        out = out.child(
+            mono(
+                format!(
+                    "Addressed {} but not notified: run limit reached",
+                    names(&m.suppressed)
+                ),
+                DIM,
+            )
+            .w_full()
+            .wrap_anywhere(),
+        );
+    }
+    out
 }

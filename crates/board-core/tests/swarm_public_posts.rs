@@ -39,16 +39,35 @@ fn public_roots_replies_and_desktop_composer_share_one_delivery_budget() -> Resu
         "@verify @verify please check",
         &key,
     )?;
+    assert_eq!(first.notified, ["verify"]);
     let replay = db.swarm_post("ada/impl", "test", "@impl changed on replay", &key)?;
     assert_eq!(replay.message.id, first.id);
     assert_eq!(replay.notified, ["verify"]);
     // The single peer delivery has spent the budget. A reply still lands, but does not wake.
+    let reply_key = PostOptions {
+        key: Some("public-reply".into()),
+        ..Default::default()
+    };
     let quiet = db.reply(
         first.id,
         "ada/impl",
-        "@verify please check again",
-        &Default::default(),
+        "@verify please check again; @coordinator FYI",
+        &reply_key,
     )?;
+    assert_eq!(quiet.notified, ["coordinator"]);
+    assert_eq!(quiet.suppressed, ["verify"]);
+    db.swarm_set_limit("ada", "test", 2)?;
+    let cursor = db.cursor()?;
+    let replay = db.reply(first.id, "ada/impl", "different text", &reply_key)?;
+    assert_eq!(replay.suppressed, quiet.suppressed);
+    assert_eq!(replay.notified, quiet.notified);
+    let entry = db
+        .swarm_read("ada", "test", quiet.id - 1, 1, false)?
+        .entries
+        .remove(0);
+    assert_eq!(entry.notified, quiet.notified);
+    assert_eq!(entry.suppressed, quiet.suppressed);
+    assert_eq!(db.cursor()?, cursor);
     let draft = Draft {
         body: "Human follow-up @verify".into(),
         channel: run.channel.clone(),
@@ -122,6 +141,7 @@ fn blind_writer_does_not_resolve_a_swarm_roster_or_notify_workers() -> Result<()
     guest.bind_token(&owner.issue_credential("ada", "guest", None, None)?.token)?;
     let post = guest.post(&run.channel, "guest", "@verify hello", &Default::default())?;
     assert_eq!(post.text, "@verify hello");
+    assert!(post.notified.is_empty() && post.suppressed.is_empty());
     assert!(
         guest
             .reply(post.id, "guest", "again", &Default::default())
