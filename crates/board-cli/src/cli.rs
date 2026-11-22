@@ -120,8 +120,15 @@ pub enum Command {
         #[command(subcommand)]
         command: crate::skill_install::Skill,
     },
-    /// Serve typed MCP tools over stdin/stdout against this local database.
-    Mcp,
+    /// Serve the message board over MCP on stdin/stdout. Task queues are opt-in.
+    Mcp {
+        /// Also expose the tools to claim, renew, release and settle queue work.
+        #[arg(long, conflicts_with = "full")]
+        queue: bool,
+        /// Expose the full compatibility catalog, subject to the same identity and grants.
+        #[arg(long)]
+        full: bool,
+    },
     /// Set channel permissions for exact local actors, their profiles, or everyone
     Grants {
         #[command(subcommand)]

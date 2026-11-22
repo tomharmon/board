@@ -222,23 +222,16 @@ pub(crate) fn execute(
                 _ => bail!("schema and schema_data must be supplied together"),
             }
             match tool.name {
-                "board_post" => value(b.post(required("channel")?, actor, &text, &opts)?),
+                "board_post" => match (s("channel"), p["reply_to"].as_i64()) {
+                    (Some(channel), None) => value(b.post(channel, actor, &text, &opts)?),
+                    (None, Some(parent)) => value(b.reply(parent, actor, &text, &opts)?),
+                    _ => bail!("supply exactly one of channel or reply_to"),
+                },
                 "board_reply" => value(b.reply(id()?, actor, &text, &opts)?),
                 _ => value(b.swarm_post(actor, &run()?, &text, &opts)?),
             }
         }
         "swarm_dm" => value(b.swarm_dm(actor, &run()?, required("to")?, required("text")?)?),
-        "swarm_read" => value(b.swarm_read_filtered(
-            actor,
-            &run()?,
-            after.unwrap_or(0),
-            size,
-            true,
-            &board_local::swarm::SwarmFilter {
-                kind: owned("kind"),
-                worker: owned("worker"),
-            },
-        )?),
         "swarm_done" => value(b.swarm_done(actor, &run()?, s("summary"))?),
         "swarm_stop" => value(b.swarm_stop(actor, &run()?)?),
         "roles_list" => value(b.roles_list()?),
@@ -278,7 +271,31 @@ pub(crate) fn execute(
                 "next_offset":(end < file.size).then_some(end)}),
             )
         }
-        "board_read" => {
+        "board_read" | "swarm_read" => {
+            if tool.name == "swarm_read" || p.get("run").is_some() {
+                ensure!(
+                    ["target", "channel", "text", "by", "mentions"]
+                        .iter()
+                        .all(|k| p.get(*k).is_none()),
+                    "run feed cannot be combined with ordinary message search or a thread target"
+                );
+                let kind = s("kind").or((tool.name == "board_read").then_some("public"));
+                return value(b.swarm_read_filtered(
+                    actor,
+                    &run()?,
+                    after.unwrap_or(0),
+                    size,
+                    true,
+                    &board_local::swarm::SwarmFilter {
+                        kind: kind.map(str::to_owned),
+                        worker: owned("worker"),
+                    },
+                )?);
+            }
+            ensure!(
+                p.get("kind").is_none() && p.get("worker").is_none(),
+                "kind and worker filters require run"
+            );
             let mut f = Filter {
                 channel: owned("channel"),
                 text: owned("text"),

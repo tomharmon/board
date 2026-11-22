@@ -6,7 +6,7 @@ use board_local::Board;
 use serde_json::Value;
 
 use crate::{
-    ActorContext,
+    ActorContext, Toolset,
     router::{self, error},
     tools::wait::Parked,
 };
@@ -22,7 +22,17 @@ pub fn serve_stdio(board: &Board, actor: &str) -> Result<()> {
 }
 
 pub fn serve_stdio_bound(board: &Board, actor: &str, selector: Option<&str>) -> Result<()> {
-    let mut session = ActorContext::new(actor, std::env::var("BOARD_SWARM_RUN").ok());
+    serve_stdio_with_tools(board, actor, selector, Toolset::Board)
+}
+
+pub fn serve_stdio_with_tools(
+    board: &Board,
+    actor: &str,
+    selector: Option<&str>,
+    toolset: Toolset,
+) -> Result<()> {
+    let mut session =
+        ActorContext::new(actor, std::env::var("BOARD_SWARM_RUN").ok()).with_toolset(toolset);
     if let Some(selector) = selector {
         let binding = board.worker_binding(selector)?;
         session.actor.clone_from(&binding.actor);

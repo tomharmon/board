@@ -22,6 +22,16 @@ fn read(path: &Path) -> Result<Option<String>> {
 fn command_matches(cmd: Option<&str>, exe: &Path) -> bool {
     cmd.map(Path::new) == Some(exe)
 }
+fn mcp_args<'a>(mut args: impl Iterator<Item = Option<&'a str>>) -> bool {
+    matches!(
+        (args.next(), args.next(), args.next()),
+        (
+            Some(Some("mcp")),
+            None | Some(Some("--queue" | "--full")),
+            None
+        )
+    )
+}
 fn codex(path: &Path, exe: &Path) -> Result<Saved> {
     let Some(text) = read(path)? else {
         return Ok(Saved::Missing);
@@ -46,7 +56,7 @@ fn codex(path: &Path, exe: &Path) -> Result<Saved> {
         && command_matches(s.get("command").and_then(|v| v.as_str()), exe)
         && s.get("args")
             .and_then(|v| v.as_array())
-            .is_some_and(|a| a.len() == 1 && a.get(0).and_then(|v| v.as_str()) == Some("mcp"))
+            .is_some_and(|a| mcp_args(a.iter().map(|v| v.as_str())))
         && s.get("enabled").is_none_or(|v| v.as_bool() == Some(true))
         && s.get("env")
             .is_none_or(|v| v.as_table_like().is_some_and(|t| t.is_empty()))
@@ -82,7 +92,9 @@ fn claude(path: &Path, exe: &Path) -> Result<Saved> {
         s.keys()
             .all(|k| matches!(k.as_str(), "command" | "args" | "type" | "env"))
     }) && command_matches(s["command"].as_str(), exe)
-        && s["args"] == serde_json::json!(["mcp"])
+        && s["args"]
+            .as_array()
+            .is_some_and(|a| mcp_args(a.iter().map(Value::as_str)))
         && s.get("type").is_none_or(|t| t == "stdio")
         && s.get("url").is_none()
         && s.get("env")

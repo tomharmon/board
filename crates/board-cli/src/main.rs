@@ -375,7 +375,7 @@ fn accepts_worker(cmd: &Command) -> bool {
     matches!(
         cmd,
         Swarm { .. }
-            | Mcp
+            | Mcp { .. }
             | Whoami
             | Discovery
             | Commands
@@ -442,7 +442,7 @@ fn run(mut args: Args) -> Result<()> {
         .db
         .or_else(|| args.name.as_deref().map(local::named_database_path))
         .unwrap_or_else(local::database_path);
-    let in_swarm = matches!(args.cmd, Command::Swarm { .. } | Command::Mcp)
+    let in_swarm = matches!(args.cmd, Command::Swarm { .. } | Command::Mcp { .. })
         || args.worker.is_some()
         || env::var_os("BOARD_SWARM_RUN").is_some();
     if args.worker.is_none() {
@@ -518,8 +518,20 @@ fn run(mut args: Args) -> Result<()> {
         }
         Command::Roles { command } => roles_cli::roles(&board, &actor, command, js)?,
         Command::Skills { command } => roles_cli::skills(&board, &actor, command, js)?,
-        Command::Mcp => {
-            return board_mcp::serve_stdio_bound(&board, &actor, args.worker.as_deref());
+        Command::Mcp { queue, full } => {
+            let tools = if full {
+                board_mcp::Toolset::Full
+            } else if queue {
+                board_mcp::Toolset::Queue
+            } else {
+                board_mcp::Toolset::Board
+            };
+            return board_mcp::serve_stdio_with_tools(
+                &board,
+                &actor,
+                args.worker.as_deref(),
+                tools,
+            );
         }
         Command::Discovery => println!(
             "{}",

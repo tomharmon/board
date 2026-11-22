@@ -42,8 +42,8 @@ def render(ui, db, run, task, directory, reply=None):
 def exercise(bindir, directory):
     db = directory / "board.sqlite3"
     with ExitStack() as cleanup:
-        def connect(worker=None):
-            client = Client(bindir / "board", db, worker)
+        def connect(worker=None, *, mode=None):
+            client = Client(bindir / "board", db, worker, mode=mode)
             cleanup.callback(client.close)
             return client
 
@@ -54,13 +54,15 @@ def exercise(bindir, directory):
         for name, role in (("author", "implementer"), ("verify", "verifier")):
             boss.call("swarm_add", run="pool", name=name, role=role, brief=f"Own the {name} assignment")
         author, verifier = connect("author"), connect("verify")
+        # The public review uses default sessions; optional binary evidence uses the same identities.
+        author_files, verifier_files = connect("author", mode="--full"), connect("verify", mode="--full")
         assert verifier.call("worker_assignment")["worker"]["name"] == "verify"
 
         def submit(data, summary):
             revision = {"kind": "sha256", "value": hashlib.sha256(data).hexdigest()}
-            file = author.call("board_file_upload", channel=run["channel"], name="release.txt",
+            file = author_files.call("board_file_upload", channel=run["channel"], name="release.txt",
                                content_type="text/plain", data_base64=base64.b64encode(data).decode())
-            handoff = author.call("board_reply", id=task, text=summary,
+            handoff = author.call("board_post", reply_to=task, text=summary,
                                   attachment_ids=[file["id"]], schema="handoff@1",
                                   schema_data={"task": task, "revision": revision, "to": "verify",
                                                "summary": summary, "changes": ["release.txt"]})
@@ -69,17 +71,17 @@ def exercise(bindir, directory):
         def check_release(handoff, revision):
             thread = verifier.call("board_read", target=task)
             evidence = next(r for r in thread["replies"] if r["id"] == handoff["id"])
-            chunk = verifier.call("board_file_read", id=evidence["attachments"][0]["id"])
+            chunk = verifier_files.call("board_file_read", id=evidence["attachments"][0]["id"])
             data = base64.b64decode(chunk["data_base64"])
             assert chunk["next_offset"] is None and hashlib.sha256(data).hexdigest() == revision["value"]
             ok = data.startswith(b"Version: ")
             verdict = "Verified checksum and version header" if ok else "Missing version header in release.txt"
-            result = dict(id=task, text=verdict, idempotency_key=f"verify-{handoff['id']}", schema="verification@1",
+            result = dict(reply_to=task, text=verdict, idempotency_key=f"verify-{handoff['id']}", schema="verification@1",
                           schema_data={"handoff": handoff["id"], "revision": revision, "summary": verdict, "checks": [
                               {"name": "Version header", "status": "pass" if ok else "fail",
                                "command": "data.startswith(b'Version: ')", "output": str(ok)}]})
-            check = verifier.call("board_reply", **result)
-            assert verifier.call("board_reply", **result)["id"] == check["id"]
+            check = verifier.call("board_post", **result)
+            assert verifier.call("board_post", **result)["id"] == check["id"]
             return check, verdict
 
         handoff, revision = submit(b"Release candidate\n", "Candidate ready for review")
@@ -93,8 +95,7 @@ def exercise(bindir, directory):
         def wait_for_status(expected):
             deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
-                workers = boss.call("swarm_status", run="pool")["workers"]
-                if next(w for w in workers if w["name"] == "verify")["status"] == expected:
+                if verifier_files.call("worker_assignment")["worker"]["status"] == expected:
                     return
                 time.sleep(0.05)
             raise AssertionError(f"verifier did not become {expected}")
@@ -121,7 +122,7 @@ def exercise(bindir, directory):
         assert [m["id"] for m in delivered["messages"]] == [check["id"]]
         assert len(delivered["notifications"]) == 1
         boss = connect()
-        receipts = {h["id"]: h for h in boss.call("swarm_receipt", run="pool")["handoffs"]}
+        receipts = {h["id"]: h for h in connect(mode="--full").call("swarm_receipt", run="pool")["handoffs"]}
         assert receipts[handoff["id"]]["verification"]["revision"] == revision
         assert receipts[handoff["id"]]["verification"]["checks"][0]["status"] == "fail"
         assert receipts[fix["id"]]["verification"]["revision"] == new_revision

@@ -14,6 +14,7 @@ const V17_COORDINATOR: &str = "aeefde429f1a99e6215f088492e5cc82fde51abb27aada001
 const V18_COORDINATOR: &str = "1f8dc7910259ea679e342a625199892fa2b190c02b5623c251379cd4d6e95304";
 const V19_COORDINATOR: &str = "dacab208ee6cb4e680a95db03491735e1c2da60cea43cb55301af8ede5cab456";
 const V20_COORDINATOR: &str = "1fffe71de4ffcf6cb698a473f3a54f7fbf0dbab23a52f8d07bfbfa119bf49f87";
+const V21_COORDINATOR: &str = "17d52aa5e9426a1738e392b407627091ebbcf1e7ef12386264c4b74e20167396";
 const FILE: &str = "board-swarm/SKILL.md";
 
 #[derive(Clone, Copy, PartialEq, ValueEnum)]
@@ -94,6 +95,7 @@ fn contents(file: &Path) -> Result<Contents> {
                 | V18_COORDINATOR
                 | V19_COORDINATOR
                 | V20_COORDINATOR
+                | V21_COORDINATOR
         ) {
             return Ok(Contents::Previous);
         }
@@ -355,6 +357,7 @@ mod tests {
             include_bytes!("../tests/fixtures/coordinator-v18.md").as_slice(),
             include_bytes!("../tests/fixtures/coordinator-v19.md").as_slice(),
             include_bytes!("../tests/fixtures/coordinator-v20.md").as_slice(),
+            include_bytes!("../tests/fixtures/coordinator-v21.md").as_slice(),
         ] {
             fs::write(&file, previous).unwrap();
             assert_eq!(dest.install(false).unwrap().0, "upgraded");

@@ -57,11 +57,11 @@ After `board init`, invoke the `board-swarm` skill in your coding chat on a task
 2. Workers collaborate directly in ordinary task threads, DMs and replayable inboxes. A dedicated worker MCP can fetch its own assignment and pinned instructions. On a harness that shares the chat's MCP, request the local CLI export and use its worker arguments (`--db PATH --worker RUN/NAME`), not the coordinator connection. A mention notifies a waiting participant; it does not start a new agent.
 3. Open `board ui` anytime to watch the roster, live `working` / `waiting` states, briefs, public posts, and agent-to-agent DMs.
 
-For larger problems, submit an ordinary `tasks_plan` to the swarm channel. A worker claiming a task gets its prerequisite results; the author and verifier can exchange findings, fixes and rechecks in that task's thread without a coordinator relay. To find out why a task is waiting, expand it in the run overview or pass its ID as `explain_task` to `swarm_observe`. See the [pool workflow and example](docs/MCP.md#pool-workflow). Closing the chat does not install a supervisor or launch replacements.
+Give named workers a brief and a thread. The author and verifier can exchange findings, fixes and rechecks without claiming a task or relaying messages through the coordinator. Where tracked dependencies matter, submit an ordinary `tasks_plan`; expand a task in the run overview or pass its ID as `explain_task` to `swarm_observe` to see why it is waiting. Only workers pulling from a shared backlog need the [opt-in queue workflow](docs/MCP.md#pool-workflow).
 
 ### Connect via MCP
 
-Point any MCP-capable client at `board mcp` (stdio transport) to give agents native structured tools for messaging, swarms, and tasks without shell wrappers. See [MCP server](docs/MCP.md).
+Point any MCP-capable client at `board mcp` (stdio). The everyday tools are `board_post` (new thread or reply), `board_read`, `swarm_wait`, and `swarm_observe`. Bound workers also read their own assignment; coordinators get run setup, ordinary plans and stop. Use `board mcp --queue` for leases or `board mcp --full` for the prior catalog and specialist tools. See [MCP server](docs/MCP.md).
 
 ## Key features
 

@@ -43,7 +43,7 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         (
             4,
             "tools/call",
-            json!({"name":"swarm_status","arguments":{}}),
+            json!({"name":"swarm_observe","arguments":{}}),
         ),
         (
             5,
@@ -78,21 +78,17 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
     assert_eq!(replies.len(), 6);
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "board-mcp");
     let catalog = replies[1]["result"]["tools"].as_array().unwrap();
-    for tool in [
-        "tasks_plan",
-        "swarm_observe",
-        "tasks_renew",
-        "tasks_release",
-    ] {
+    for tool in ["tasks_plan", "swarm_observe", "board_post", "board_read"] {
         assert!(catalog.iter().any(|t| t["name"] == tool), "missing {tool}");
     }
+    assert!(!catalog.iter().any(|t| t["name"] == "tasks_claim"));
     assert!(!unused.exists());
     let result = |i: usize| {
         let r = &replies[i]["result"];
         assert_eq!(r["isError"], false, "{r}");
         serde_json::from_str::<Value>(r["content"][0]["text"].as_str().unwrap()).unwrap()
     };
-    assert_eq!(result(2)["id"], result(3)["id"]);
+    assert_eq!(result(2)["slug"], result(3)["run"]);
     let m = result(4);
     assert_eq!(m["actor"], "team/architect");
     let read = Command::new(env!("CARGO_BIN_EXE_board"))

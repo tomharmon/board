@@ -1,3 +1,4 @@
+use crate::Toolset;
 use anyhow::{Result, ensure};
 use serde_json::{Map, Value, json};
 
@@ -104,6 +105,24 @@ pub(crate) struct Tool {
     fields: &'static [(&'static str, Kind, bool)],
 }
 impl Tool {
+    pub(crate) fn offered(&self, set: Toolset, worker: bool) -> bool {
+        if set == Toolset::Full {
+            return if worker {
+                !coordinator_tool(self.name)
+            } else {
+                self.name != "worker_assignment"
+            };
+        }
+        match self.name {
+            "board_post" | "board_read" | "swarm_wait" | "swarm_observe" => true,
+            "worker_assignment" => worker,
+            "swarm_start" | "swarm_add" | "swarm_stop" | "tasks_plan" => !worker,
+            "tasks_claim" | "tasks_renew" | "tasks_release" | "tasks_complete" | "tasks_fail"
+            | "tasks_block" => set == Toolset::Queue,
+            _ => false,
+        }
+    }
+
     fn definition(&self) -> Value {
         let properties: Map<_, _> = self
             .fields
@@ -175,9 +194,9 @@ tools! {
     "board_file_upload","Stage up to 64 KiB of evidence as standard padded base64. Returns attachment metadata; publish its id in a post or reply's attachment_ids.",[channel:Text,name:Text,content_type:Text,data_base64:Base64Chunk],[];
     "board_file_read","Read a bounded slice of an authorized attachment by ID. Append decoded data_base64 bytes and continue with next_offset until null.",[id:Id],[offset:Cursor,length:FileChunk];
     "board_whoami","Report the identity bound to this connection and its worker assignment, if any. Never changes identity.",[],[];
-    "board_post","Create a thread. In swarm channels, notified lists signaled teammates; suppressed lists those not signaled due to the run limit. Empty lists are omitted. Use idempotency_key for retries.",[channel:Text,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
+    "board_post","Start a thread with channel or reply to a message with reply_to. In swarm channels, notified and suppressed report signals, not reads. Use idempotency_key for retries.",[text:Text],[channel:Text,reply_to:Id,labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
     "board_reply","Reply by message ID. In swarm channels, notified lists signaled teammates; suppressed lists those not signaled due to the run limit. Empty lists are omitted. Use idempotency_key for retries.",[id:Id,text:Text],[labels:Labels,no_sync:Bool,schema:Text,schema_data:Data,idempotency_key:Text,attachment_ids:Ids];
-    "board_read","Read a thread by message ID or search visible messages. An opened task includes its readable prerequisite results and revision evidence in message.task.inputs. Channel scopes ending with / include descendants.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,after:Cursor,limit:Limit];
+    "board_read","Open a thread by message ID (target), search ordinary messages, or read a run feed (run, optional kind and worker). The run feed defaults to public; kind can select dm or addressed instead. Reading never acknowledges the inbox. An opened task includes readable prerequisite results in message.task.inputs.",[],[target:Target,channel:Text,text:Text,by:Text,mentions:Text,run:Run,kind:Text,worker:Text,after:Cursor,limit:Limit];
     "tasks_list","List visible tasks oldest first. Pass next_after as after for the next page; cursor is the snapshot event head.",[],[channel:Text,state:Text,assignee:Text,labels:Labels,after:Cursor,limit:Limit];
     "tasks_create","Create a task with optional prerequisites, assignment and atomic initial claim.",[channel:Text,text:Text],[assignee:Text,needs:Ids,labels:Labels,claim:Bool];
     "tasks_plan","Create a batch of ordinary tasks and return them in input order. Use a stable key to retry; large batches checkpoint.",[channel:Text,tasks:PlanItems],[key:Text];
@@ -201,14 +220,22 @@ pub(crate) fn coordinator_tool(name: &str) -> bool {
             | "roles_show"
     )
 }
-pub(crate) fn catalog(board: &board_local::Board, worker: bool, structured: bool) -> Vec<Value> {
+pub(crate) fn catalog(
+    board: &board_local::Board,
+    set: Toolset,
+    worker: bool,
+    structured: bool,
+) -> Vec<Value> {
     TOOLS
         .iter()
-        .filter(|t| if worker { !coordinator_tool(t.name) } else { t.name != "worker_assignment" })
+        .filter(|t| t.offered(set, worker))
         .map(|tool| {
             let mut d = tool.definition();
             if matches!(tool.name, "swarm_post" | "board_post" | "board_reply") {
                 let input = &mut d["inputSchema"];
+                if tool.name == "board_post" {
+                    input["oneOf"] = json!([{"required":["channel"]},{"required":["reply_to"]}]);
+                }
                 input["dependentRequired"] = json!({"schema":["schema_data"],"schema_data":["schema"]});
                 let variants: Vec<_> = ["handoff","verification","decision-request","decision-resolution"]
                     .into_iter()
@@ -220,6 +247,12 @@ pub(crate) fn catalog(board: &board_local::Board, worker: bool, structured: bool
                 if !variants.is_empty() {
                     input["allOf"] = json!(variants);
                 }
+            } else if tool.name == "board_read" {
+                let input = &mut d["inputSchema"];
+                input["properties"]["kind"]["enum"] = json!(["public","dm","addressed"]);
+                input["dependentRequired"] = json!({"kind":["run"],"worker":["run"]});
+                input["not"] = json!({"required":["run"],"anyOf":[{"required":["target"]},
+                    {"required":["channel"]},{"required":["text"]},{"required":["by"]},{"required":["mentions"]}]});
             } else if tool.name == "worker_assignment" {
                 d["inputSchema"]["dependentRequired"] = json!({"skill":["path"],"path":["skill"]});
             } else if tool.name == "swarm_wait" {
