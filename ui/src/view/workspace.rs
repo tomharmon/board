@@ -16,17 +16,45 @@ fn seg(labels: &[&str], selected: usize, name: &str, key: &str, pick: fn(&mut St
         .flex_wrap()
         .focus_group();
     for (i, title) in labels.iter().enumerate() {
-        // Keep the original four task selectors stable for keyboard and scripted clients.
+        // Preserve established selectors for states that still appear in the task UI.
         let child_key = match (key, *title) {
-            ("task-filter", "open") => "segment0".into(),
             ("task-filter", "ready") => "segment1".into(),
             ("task-filter", "claimed") => "segment2".into(),
             ("task-filter", "all") => "segment3".into(),
             ("task-filter", state) => format!("task-state-{state}"),
             _ => format!("segment{i}"),
         };
-        strip = strip
-            .child(tab(&child_key, title, i == selected).on_press(move |s: &mut State| pick(s, i)));
+        let visible = if key == "task-filter" {
+            match *title {
+                "all" => "all tasks",
+                "canceled" => "cancelled",
+                _ => title,
+            }
+        } else {
+            title
+        };
+        let help = if key == "task-filter" {
+            match *title {
+                "all" => "Every task, including completed, failed and cancelled work",
+                "waiting" => "A prerequisite task has not completed",
+                "ready" => "Dependencies are complete; eligible actors can claim this task",
+                "claimed" => "An actor holds an exclusive, expiring lease",
+                "blocked" => {
+                    "Explicitly held until its blocker is resolved and the task is resumed"
+                }
+                "completed" => "Reported complete; verification evidence is tracked separately",
+                "failed" => "Reported failed; explicitly reopen to retry",
+                "canceled" => "Deliberately closed without completing the work",
+                _ => title,
+            }
+        } else {
+            title
+        };
+        strip = strip.child(
+            tab(&child_key, visible, i == selected)
+                .help(help)
+                .on_press(move |s: &mut State| pick(s, i)),
+        );
     }
     strip
 }
@@ -410,6 +438,8 @@ pub(super) fn task_list_for(s: &State, inset: f32, compact: bool) -> El {
             .w_full()
             .px(inset)
             .py(4.0)
+            .grow(1.)
+            .min_h(0.)
             .child(tasks::list(s, compact)),
     ));
     if !s.desk.filtering {

@@ -116,6 +116,11 @@ tools! {
     "swarm_list","List visible swarm runs, newest first.",[],[before:Id,limit:Limit];
     "swarm_add","Register a worker; returns its pinned instructions, skills directory and environment for your harness.",[name:Text,brief:Text],[run:Run,role:Text,workspace_path:Text,branch_name:Text];
     "swarm_status","Inspect a run and its roster. Omit run to use BOARD_SWARM_RUN.",[],[run:Run];
+    "swarm_check_in","Explicitly report that this worker has started; no process is launched.",[],[run:Run];
+    "swarm_launch_failed","Report a launch failure actually observed by the harness. Coordinator only.",[name:Text,reason:Text],[run:Run];
+    "swarm_receipt","Read immutable handoffs, checks for their exact revisions, and outstanding decisions.",[],[run:Run];
+    "board_attention","List explicit decisions and blocked work; action_required distinguishes this actor's actions from agent follow-up.",[],[];
+    "swarm_decide","Answer an explicit decision request addressed to this actor, even after stop.",[id:Id,summary:Text],[run:Run];
     "swarm_set_limit","Adjust a run's peer notification budget. Requires coordinator or owning person.",[max_notifications:Count],[run:Run];
     "swarm_post","Post publicly; @name notifies that teammate. A schema block needs both NAME@VERSION and schema_data.",[text:Text],[run:Run,labels:Labels,schema:Text,schema_data:Data];
     "swarm_dm","Send a side message to a worker name or coordinator.",[to:Text,text:Text],[run:Run];
@@ -143,6 +148,7 @@ pub(crate) fn coordinator_tool(name: &str) -> bool {
         "swarm_start"
             | "swarm_list"
             | "swarm_add"
+            | "swarm_launch_failed"
             | "swarm_set_limit"
             | "swarm_stop"
             | "roles_list"

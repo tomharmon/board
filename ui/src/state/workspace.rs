@@ -117,6 +117,9 @@ impl Default for Form {
 
 #[derive(Default)]
 pub struct Desk {
+    pub attention: Vec<board_local::swarm::AttentionItem>,
+    pub selected_decision: Option<i64>,
+    pub decision_answer: TextEdit,
     pub mode: ActivityMode,
     pub messages: Vec<Message>,
     pub events: Vec<Event>,
@@ -159,8 +162,8 @@ pub struct TaskRow {
     pub files: String,
 }
 impl Desk {
-    pub const TASK_STATES: [&'static str; 9] = [
-        "open",
+    pub const TASK_STATES: [&'static str; 8] = [
+        "all",
         "waiting",
         "ready",
         "claimed",
@@ -168,9 +171,11 @@ impl Desk {
         "completed",
         "failed",
         "canceled",
-        "all",
     ];
     pub fn clear_data(&mut self) {
+        self.attention.clear();
+        self.selected_decision = None;
+        self.decision_answer.clear();
         self.task_entry.instance = Default::default();
         self.messages.clear();
         self.events.clear();
@@ -235,6 +240,7 @@ impl Desk {
         delegated: bool,
         filter: &Filter,
     ) -> Result<()> {
+        self.attention = db.attention(actor)?;
         self.head = db.cursor()?;
         self.seen = db.activity_seen(actor)?;
         self.unread = db.activity_unread(actor)?;
@@ -242,6 +248,7 @@ impl Desk {
         self.watcher_next = None;
         let after = self.pages.last().copied().unwrap_or(0);
         match page {
+            Page::Attention => (),
             Page::Activity => match self.mode {
                 ActivityMode::Messages => {
                     let window = db.messages_window(filter, self.pages.last().copied(), PAGE)?;

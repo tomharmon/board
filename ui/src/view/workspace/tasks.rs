@@ -235,11 +235,16 @@ fn state_mark(t: &Task) -> El {
     if t.state == "claimed" || t.state == "completed" {
         mark = mark.child(el().size(5.0, 5.0).radius(2.5).fill(c(ink)));
     }
-    row()
-        .center_y()
-        .gap(6.0)
-        .child(mark)
-        .child(label(&t.state, 12.0, 400.0, ink))
+    row().center_y().gap(6.0).child(mark).child(label(
+        if t.state == "canceled" {
+            "cancelled"
+        } else {
+            &t.state
+        },
+        12.0,
+        400.0,
+        ink,
+    ))
 }
 fn task_row(s: &State, t: &Task, compact: bool) -> El {
     let id = t.id;
@@ -482,7 +487,7 @@ pub(super) fn list(s: &State, compact: bool) -> El {
                     ),
             );
     }
-    let mut panel = col().key("task-board").w_full().gap(1.0).child(
+    let mut panel = col().key("task-board").w_full().grow(1.).gap(1.0).child(
         row().w_full().center_y().gap(6.0).pb(6.0).child(seg(
             &crate::state::Desk::TASK_STATES,
             d.task_filter,
@@ -549,17 +554,19 @@ pub(super) fn list(s: &State, compact: bool) -> El {
             col()
                 .key("tasks-empty")
                 .w_full()
-                .py(20.)
-                .gap(6.)
+                .grow(1.)
+                .min_h(150.)
+                .py(32.)
+                .gap(12.)
+                .center()
                 .child(
                     row()
-                        .w_full()
                         .gap(8.)
                         .center_y()
-                        .child(icon(&icons::LIST_TODO, 18.).color(c(MUTED)))
-                        .child(label(title, 15., 600., INK).grow(1.).wrap_anywhere()),
+                        .child(icon(&icons::LIST_TODO, 24.).color(c(MUTED)))
+                        .child(label(title, 16., 550., INK).min_w(0.).wrap_anywhere()),
                 )
-                .child(row().w_full().child(button)),
+                .child(button),
         );
     }
     for task in &d.tasks {

@@ -165,7 +165,7 @@ fn observer_paints_public_evidence_and_dms_without_waking_workers() {
             "Verify offline restores",
             "Own impl checks for restore",
             "Branch: test/impl",
-            "working",
+            "registered",
             "waiting",
             "implementer",
             "verifier",

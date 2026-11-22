@@ -1,6 +1,7 @@
 //! Local coordination records. The calling harness, never Board, launches agents.
 mod feed;
 pub use feed::SwarmFilter;
+mod coordination;
 mod materialize;
 mod wait;
 use crate::{
@@ -9,6 +10,7 @@ use crate::{
     errors::Kind::{Conflict, Forbidden, Invalid, Missing},
 };
 use anyhow::{Context, Result, ensure};
+pub use coordination::*;
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -18,7 +20,19 @@ use std::{
 pub use wait::SwarmWaitOutcome;
 
 pub(crate) fn init(c: &Connection) -> Result<()> {
-    Ok(c.execute_batch(include_str!("swarm/schema.sql"))?)
+    let legacy: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='swarm_workers') AND NOT EXISTS(SELECT 1 FROM pragma_table_info('swarm_workers') WHERE name='checked_in_at')", [], |r| r.get(0))?;
+    if legacy {
+        c.execute_batch("ALTER TABLE swarm_workers RENAME TO swarm_workers_legacy;")?;
+    }
+    c.execute_batch(include_str!("swarm/schema.sql"))?;
+    if legacy {
+        // Old working rows did not prove a worker ever started. Do not invent check-ins.
+        c.execute_batch("INSERT INTO swarm_workers(id,run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at)
+            SELECT id,run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,CASE WHEN status='working' THEN 'registered' ELSE status END,waiter_pid,last_read_cursor,created_at,updated_at,CASE WHEN status='waiting' THEN updated_at END,CASE WHEN status='waiting' THEN updated_at END FROM swarm_workers_legacy;
+            DROP TABLE swarm_workers_legacy;
+            CREATE INDEX IF NOT EXISTS swarm_workers_by_run ON swarm_workers(run_id,id);")?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -111,6 +125,9 @@ pub struct SwarmWorker {
     pub last_read_cursor: i64,
     pub created_at: String,
     pub updated_at: String,
+    pub checked_in_at: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub launch_error: Option<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpawnedWorker {
@@ -230,7 +247,7 @@ fn location(s: Option<&str>) -> Result<()> {
 fn rows<T>(it: impl Iterator<Item = rusqlite::Result<T>>) -> Result<Vec<T>> {
     Ok(it.collect::<rusqlite::Result<_>>()?)
 }
-const WORKERS: &str = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at FROM swarm_workers WHERE run_id=? ORDER BY id";
+const WORKERS: &str = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? ORDER BY id";
 fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
     Ok(SwarmWorker {
         id: r.get(0)?,
@@ -247,6 +264,9 @@ fn worker(r: &rusqlite::Row) -> rusqlite::Result<SwarmWorker> {
         last_read_cursor: r.get(11)?,
         created_at: r.get(12)?,
         updated_at: r.get(13)?,
+        checked_in_at: r.get(14)?,
+        last_activity_at: r.get(15)?,
+        launch_error: r.get(16)?,
     })
 }
 
@@ -417,9 +437,9 @@ impl Board {
             }else{(None,String::new(),vec![])};
             let time=crate::now();let body=format!("Brief for @[{who}]:\n{}",args.brief);
             let m=Self::post_tx(tx,&r.channel,actor,&body,&PostOptions{no_sync:true,..Default::default()})?;
-            tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'working',?,?,?)",
+            tx.execute("INSERT INTO swarm_workers(run_id,name,actor,role_slug,pinned_role_version,pinned_system_prompt,pinned_skills_json,brief,workspace_path,branch_name,status,last_read_cursor,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,'registered',?,?,?)",
                 params![r.id,args.name,who,args.role_slug,version,prompt,serde_json::to_string(&skills)?,args.brief,args.workspace_path,args.branch_name,m.id,time,time])?;
-            let w=tx.query_row("SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at FROM swarm_workers WHERE run_id=? AND name=?",params![r.id,args.name],worker)?;
+            let w=tx.query_row("SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? AND name=?",params![r.id,args.name],worker)?;
             self.materialize_spawn(&r,w,&prompt,&skills)
         })
     }

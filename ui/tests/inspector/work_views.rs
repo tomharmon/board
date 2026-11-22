@@ -107,7 +107,6 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
         let taps = |end: &Value| Value::Array(steps.iter().cloned().chain([end.clone()]).collect());
         let (table, frame) = f.snapshot(taps(&tasks), size, "light", &format!("{prefix}-tasks"));
         for key in [
-            "segment0",
             "task-state-waiting",
             "segment1",
             "segment2",
@@ -187,6 +186,65 @@ fn compact_task_table_and_settings_tabs_stay_usable_at_desktop_and_phone_sizes()
     detail.expect_key("task-options");
     detail.expect_key("reply-composer");
     detail.expect_key(&format!("message-{second}"));
+}
+
+#[test]
+fn task_state_order_has_no_open_filter_and_all_tasks_includes_failures_and_completions() {
+    let f = Fixture::new();
+    let [first, _, last] = examples(&f);
+    let b = Board::open(&f.db).unwrap();
+    for (id, actor, action) in [
+        (first, "lin", TaskAction::Fail("Needs correction")),
+        (last, "mira", TaskAction::Complete(Some("Done"))),
+    ] {
+        let claim = board_local::automation::claim(
+            &b,
+            actor,
+            board_local::automation::ClaimTarget::Id(id),
+            300,
+            &Default::default(),
+        )
+        .unwrap();
+        change_task(
+            &b,
+            id,
+            actor,
+            Some(claim.epoch),
+            claim.claim_token.as_deref(),
+            action,
+        )
+        .unwrap();
+    }
+    let t = f.render(
+        json!([{"t":0.1,"type":"tap","key":"tasks"}]),
+        DESKTOP,
+        "0.8",
+    );
+    assert!(!t.has_key("segment0"));
+    t.expect_text("all tasks");
+    t.expect_key(&format!("task-row-{first}"));
+    t.expect_key(&format!("task-row-{last}"));
+    let states = [
+        "task-state-waiting",
+        "segment1",
+        "segment2",
+        "task-state-blocked",
+        "task-state-completed",
+        "task-state-failed",
+        "task-state-canceled",
+    ];
+    for pair in states.windows(2) {
+        let a = t.bounds(pair[0]);
+        let b = t.bounds(pair[1]);
+        assert!(
+            a.y < b.y || (a.y == b.y && a.x < b.x),
+            "state order changed: {pair:?}"
+        );
+    }
+    assert!(!t.0.iter().any(|e| matches!(
+        e["text"].as_str(),
+        Some("oldest first" | "the latest across every channel")
+    )));
 }
 
 #[test]

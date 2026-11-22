@@ -43,7 +43,7 @@ fn upgrade_fences_even_an_open_v15_worker_and_never_replays_overdue_sends() -> R
         let b = Board::open(&path)?;
         assert_eq!(
             old.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-            16
+            17
         );
         assert!(scan.query_row([], |r| r.get::<_, i64>(0)).is_err());
         assert!(!old.table_exists(None, "schedules")?);

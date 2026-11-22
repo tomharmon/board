@@ -14,6 +14,8 @@ use board_local::{
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+#[path = "inspector/attention.rs"]
+mod attention;
 #[path = "inspector/composing.rs"]
 mod composing;
 #[path = "inspector/picker.rs"]

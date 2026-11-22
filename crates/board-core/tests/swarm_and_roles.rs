@@ -118,7 +118,7 @@ fn real_v14_fixture_upgrades_existing_data_and_retires_executable_tables() -> Re
     let check = rusqlite::Connection::open(&path)?;
     assert_eq!(
         check.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-        16
+        17
     );
     assert_eq!(check.query_row("SELECT count(*) FROM sqlite_schema WHERE name IN ('write_rules','rule_internal','sync_renderers','source_renderers','sync_render_labels')",[],|r|r.get::<_,i64>(0))?,0);
     assert_eq!(
@@ -541,6 +541,7 @@ fn ready_wait_advances_cursor_without_spurious_waiting_status_events() -> Result
     start(&b, "ada", 20)?;
     add(&b, "impl")?;
     add(&b, "verify")?;
+    b.swarm_check_in("ada/verify", "editor", "verify")?;
     let dm = b.swarm_dm("ada/impl", "editor", "verify", "ready before wait")?;
     let before = b.cursor()?;
     let outcome = b.swarm_wait(

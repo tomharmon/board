@@ -14,9 +14,10 @@ CREATE TABLE IF NOT EXISTS swarm_workers (
     name TEXT NOT NULL, actor TEXT NOT NULL, role_slug TEXT, pinned_role_version INTEGER,
     pinned_system_prompt TEXT NOT NULL, pinned_skills_json TEXT NOT NULL,
     brief TEXT NOT NULL, workspace_path TEXT, branch_name TEXT,
-    status TEXT NOT NULL CHECK (status IN ('working','waiting','done','stopped')),
+    status TEXT NOT NULL CHECK (status IN ('registered','working','waiting','done','stopped','launch_failed')),
     waiter_pid INTEGER, last_read_cursor INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+    checked_in_at TEXT, last_activity_at TEXT, launch_error TEXT,
     UNIQUE(run_id,name), UNIQUE(run_id,actor)
 );
 CREATE INDEX IF NOT EXISTS swarm_workers_by_run ON swarm_workers(run_id,id);
@@ -34,3 +35,9 @@ CREATE TABLE IF NOT EXISTS swarm_notifications (
     UNIQUE(run_id,target_worker,event_cursor)
 );
 CREATE INDEX IF NOT EXISTS swarm_notif_message ON swarm_notifications(message_id,target_worker);
+CREATE TABLE IF NOT EXISTS swarm_evidence (
+    message_id INTEGER PRIMARY KEY REFERENCES messages(id),
+    run_id INTEGER NOT NULL REFERENCES swarm_runs(id),
+    kind TEXT NOT NULL, actor TEXT NOT NULL, payload TEXT NOT NULL, created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS swarm_evidence_by_run ON swarm_evidence(run_id,message_id);

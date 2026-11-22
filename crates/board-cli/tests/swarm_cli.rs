@@ -30,6 +30,72 @@ struct TestBoard {
     tmp: TempDir,
     db: PathBuf,
 }
+
+#[test]
+fn cli_checkin_handoff_verification_and_operator_decision_form_one_receipt() {
+    use serde_json::json;
+    let b = TestBoard::new();
+    b.start();
+    let registered = b.get("", &["swarm", "status"]);
+    assert_eq!(registered["workers"][0]["status"], "registered");
+    b.get(
+        "",
+        &[
+            "swarm",
+            "launch-failed",
+            "verify",
+            "Harness rejected launch",
+        ],
+    );
+    let started = b.get("verify", &["swarm", "check-in"]);
+    assert_eq!(started["workers"][1]["status"], "working");
+    assert!(started["workers"][1]["launch_error"].is_null());
+    let post = |who, schema, data: Value| {
+        b.get(
+            who,
+            &[
+                "swarm",
+                "post",
+                "--schema",
+                schema,
+                "--schema-data",
+                &data.to_string(),
+            ],
+        )
+    };
+    let revision = json!({"kind":"git-commit","value":"a".repeat(40)});
+    let h = post(
+        "impl",
+        "handoff@1",
+        json!({"revision":revision,"summary":"Fix split","changes":["src/lib.rs"],"to":"verify"}),
+    );
+    let id = h["message"]["id"].as_i64().unwrap();
+    post(
+        "verify",
+        "verification@1",
+        json!({"handoff":id,"revision":revision,"summary":"All tests passed","checks":[{"name":"unit","status":"pass","command":"cargo test"}]}),
+    );
+    let d = post(
+        "verify",
+        "decision-request@1",
+        json!({"to":"operator","summary":"Ship this revision?","handoff":id}),
+    );
+    let attention = b.get("", &["swarm", "attention"]);
+    assert_eq!(
+        attention
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["action_required"] == true)
+            .count(),
+        1
+    );
+    let request = d["message"]["id"].to_string();
+    b.get("", &["swarm", "decide", &request, "Approved"]);
+    let receipt = b.get("", &["swarm", "receipt"]);
+    assert_eq!(receipt["handoffs"][0]["status"], "pass");
+    assert!(receipt["decisions"].as_array().unwrap().is_empty());
+}
 impl TestBoard {
     fn new() -> Self {
         let tmp = tempdir().unwrap();

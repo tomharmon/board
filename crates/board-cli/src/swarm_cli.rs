@@ -46,6 +46,32 @@ pub enum Swarm {
     Status {
         run: Option<String>,
     },
+    /// Explicitly announce that this worker has started. Does not launch a process.
+    CheckIn {
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Report a launch error observed by the harness, never inferred from silence.
+    LaunchFailed {
+        worker_name: String,
+        reason: String,
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// Show immutable handoffs, revision-bound checks and unresolved decisions.
+    Receipt {
+        #[arg(long)]
+        run: Option<String>,
+    },
+    /// List operator decisions separately from agent follow-up.
+    Attention,
+    /// Answer an explicit decision request, including after a run has stopped.
+    Decide {
+        id: i64,
+        summary: String,
+        #[arg(long)]
+        run: Option<String>,
+    },
     List {
         #[arg(long)]
         before: Option<i64>,
@@ -140,6 +166,7 @@ impl Swarm {
                     | Self::SetLimit { .. }
                     | Self::Stop { .. }
                     | Self::List { .. }
+                    | Self::LaunchFailed { .. }
             )
         {
             return Err(board_local::swarm::WorkerBinding::coordinator_only());
@@ -151,10 +178,14 @@ impl Swarm {
             | Self::Wait { run, .. }
             | Self::Done { run, .. }
             | Self::Status { run }
+            | Self::CheckIn { run }
+            | Self::LaunchFailed { run, .. }
+            | Self::Receipt { run }
+            | Self::Decide { run, .. }
             | Self::Add { run, .. }
             | Self::SetLimit { run, .. }
             | Self::Stop { run } => run,
-            Self::Start { .. } | Self::List { .. } => return Ok(()),
+            Self::Start { .. } | Self::List { .. } | Self::Attention => return Ok(()),
         };
         if let Some(binding) = binding {
             *run = Some(binding.select_run(run.as_deref())?);
@@ -321,6 +352,57 @@ fn wait(
 
 pub fn run(b: &Board, actor: &str, cmd: Swarm, js: bool) -> Result<()> {
     match cmd {
+        Swarm::CheckIn { run } => {
+            let run = reference(run.as_deref())?;
+            let (target, _) = b.swarm_wait_target(actor, run)?;
+            b.swarm_check_in(actor, run, &target)?;
+            let v = b.swarm_status(actor, run)?;
+            output(js, &v, || "Checked in".into())
+        }
+        Swarm::LaunchFailed {
+            worker_name,
+            reason,
+            run,
+        } => {
+            let run = reference(run.as_deref())?;
+            b.swarm_launch_failed(actor, run, &worker_name, &reason)?;
+            let v = b.swarm_status(actor, run)?;
+            output(js, &v, || {
+                format!("@{worker_name}: launch failed: {reason}")
+            })
+        }
+        Swarm::Receipt { run } => {
+            let v = b.swarm_receipt(actor, reference(run.as_deref())?)?;
+            output(js, &v, || {
+                serde_json::to_string_pretty(&v).expect("receipt serializes")
+            })
+        }
+        Swarm::Attention => {
+            let v = b.attention(actor)?;
+            output(js, &v, || {
+                v.iter()
+                    .map(|i| {
+                        format!(
+                            "{}  {} → {}  {}  respond at #{}",
+                            if i.action_required {
+                                "ACTION"
+                            } else {
+                                "FOLLOW-UP"
+                            },
+                            i.waiting,
+                            i.assigned_to,
+                            i.summary,
+                            i.message_id
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Swarm::Decide { id, summary, run } => {
+            let v = b.swarm_resolve_decision(actor, reference(run.as_deref())?, id, &summary)?;
+            output(js, &v, || format!("Decision recorded at #{}", v.message.id))
+        }
         Swarm::Start {
             goal,
             slug,

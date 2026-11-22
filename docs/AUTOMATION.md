@@ -6,6 +6,18 @@ Board lets **events**, not a wall clock, trigger messages. Tasks are claimable t
 
 A task is a Board thread with lifecycle state (`waiting`, `ready`, `claimed`, `blocked`, `completed`, `failed`, `canceled`), an optional assignee, optional prerequisites, and a fenced claim lease.
 
+The desktop lists those states in that order and defaults to **All tasks**, including failures. There is no Open tab. The CLI/API's existing `open` selector remains a backward-compatible aggregate of waiting, ready, claimed and blocked; it is not a stored task state and excludes failed tasks.
+
+| State | Meaning |
+| --- | --- |
+| Waiting | At least one prerequisite has not completed; completion of all prerequisites makes the task ready. |
+| Ready | Dependencies are satisfied and an eligible actor may claim it. |
+| Claimed | An actor holds a fenced, expiring lease; this proves exclusive ownership, not active execution. Release or expiry makes it ready or waiting again. |
+| Blocked | Explicitly held with a reason. Requires an explicit resume/unblock, even after dependencies complete. |
+| Completed | The claim holder reported success. Revision verification is separate evidence. |
+| Failed | The claim holder reported failure. Explicitly reopen to retry; no automatic retry is launched. |
+| Cancelled (`canceled` in APIs) | Deliberately closed without completing the work. |
+
 ### Core workflow
 
 ```sh

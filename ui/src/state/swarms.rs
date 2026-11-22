@@ -24,6 +24,8 @@ pub enum SwarmTarget {
 }
 #[derive(Default)]
 pub struct Observer {
+    pub receipt: Option<board_local::swarm::SwarmReceipt>,
+    pub receipt_open: bool,
     pub runs: Vec<SwarmRun>,
     pub run: Option<SwarmRun>,
     pub entries: Vec<SwarmEntry>,
@@ -81,6 +83,10 @@ impl Observer {
         if let Page::Swarm(id) = page {
             let key = format!("#{id}");
             let run = db.swarm_status(actor, &key)?;
+            if self.run.as_ref().is_none_or(|old| old.id != run.id) {
+                self.receipt_open = run.status != "active";
+            }
+            self.receipt = Some(db.swarm_receipt(actor, &key)?);
             let mut page = db.swarm_latest_filtered(
                 actor,
                 &key,
@@ -132,6 +138,32 @@ impl Observer {
     }
 }
 impl State {
+    pub fn answer_decision(&mut self) {
+        let Some(id) = self.desk.selected_decision else {
+            return;
+        };
+        let Some(run) = self
+            .desk
+            .attention
+            .iter()
+            .find(|i| i.decision_id == Some(id))
+            .and_then(|i| i.run.clone())
+        else {
+            return;
+        };
+        let summary = self.desk.decision_answer.text.clone();
+        if summary.trim().is_empty() {
+            return;
+        }
+        let result = self
+            .db()
+            .and_then(|b| b.swarm_resolve_decision(&self.actor, &run, id, &summary));
+        if self.result(result).is_some() {
+            self.desk.selected_decision = None;
+            self.desk.decision_answer.clear();
+            self.refresh();
+        }
+    }
     pub fn refresh_swarm_filter(&mut self) {
         self.desk.swarm.feed_starts.clear();
         self.refresh();

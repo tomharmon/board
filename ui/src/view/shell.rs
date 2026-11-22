@@ -88,6 +88,23 @@ fn sidebar(s: &State, drawer: bool, width: f32) -> El {
         .pb(12.0)
         .child(
             link(
+                "needs-attention",
+                "needs attention",
+                Some(
+                    s.desk
+                        .attention
+                        .iter()
+                        .filter(|i| i.action_required)
+                        .count() as i64,
+                )
+                .filter(|n| *n > 0),
+                s.page == Page::Attention,
+                false,
+            )
+            .on_press(|s: &mut State| s.go(Page::Attention)),
+        )
+        .child(
+            link(
                 "all-threads",
                 "activity",
                 None,
@@ -100,7 +117,7 @@ fn sidebar(s: &State, drawer: bool, width: f32) -> El {
             link(
                 "tasks",
                 "tasks",
-                (s.open_tasks > 0).then_some(s.open_tasks),
+                None,
                 matches!(s.page, Page::Tasks | Page::Task(_) | Page::NewTask),
                 false,
             )
@@ -484,6 +501,8 @@ fn header(s: &State, narrow: bool, detail: Option<i64>) -> El {
         "tasks".into()
     } else if s.page == Page::Activity {
         "activity history".into()
+    } else if s.page == Page::Attention {
+        "needs attention".into()
     } else if matches!(s.page, Page::Swarms | Page::Swarm(_)) {
         "swarms".into()
     } else {
@@ -497,7 +516,7 @@ fn header(s: &State, narrow: bool, detail: Option<i64>) -> El {
     );
     if browsing {
         let meta = match &s.channel {
-            None => "the latest across every channel".into(),
+            None => String::new(),
             Some(ch) => s
                 .channels
                 .iter()
@@ -530,7 +549,7 @@ fn header(s: &State, narrow: bool, detail: Option<i64>) -> El {
             );
     } else if matches!(s.page, Page::Tasks | Page::Task(_)) {
         bar = bar
-            .child(mono("oldest first", FAINT).grow(1.0).min_w(0.0).truncate())
+            .child(el().grow(1.0))
             .child(
                 tool("task-criteria", "Filter tasks", &icons::LIST_FILTER)
                     .on_press(State::edit_task_filters),
@@ -574,6 +593,8 @@ fn main_pane(s: &State, narrow: bool) -> El {
     let inset = 20.0;
     let mut pane = col()
         .key("feed-pane")
+        .instant_changes()
+        .fill(c(BG))
         .grow(1.0)
         .min_w(0.0)
         .h_full()
@@ -622,11 +643,22 @@ fn main_pane(s: &State, narrow: bool) -> El {
                     ),
             );
         }
-        feed(s, inset)
+        col()
+            .w_full()
+            .grow(1.)
+            .min_h(0.)
+            .child(if s.channel.is_none() {
+                attention::banner(s, None)
+            } else {
+                el().h(0.)
+            })
+            .child(feed(s, inset))
     } else if matches!(s.page, Page::Tasks | Page::Task(_)) {
         workspace::task_list_for(s, inset, narrow || matches!(s.page, Page::Task(_)))
     } else if matches!(s.page, Page::Swarms | Page::Swarm(_)) {
         swarms::view(s, inset, narrow)
+    } else if s.page == Page::Attention {
+        attention::view(s, inset)
     } else {
         workspace::view(s, inset)
     };
@@ -637,6 +669,7 @@ fn thread_pane(s: &State, id: i64) -> El {
     let inset = 20.0;
     let mut pane = col()
         .key("thread-pane")
+        .instant_changes()
         .h_full()
         .min_w(0.0)
         .clip_rounded(0.0)

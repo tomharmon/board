@@ -140,6 +140,7 @@ fn protocol_framing_inventory_and_schema_validation() {
     assert_eq!(
         names,
         [
+            "board_attention",
             "board_channels",
             "board_post",
             "board_read",
@@ -148,11 +149,15 @@ fn protocol_framing_inventory_and_schema_validation() {
             "roles_list",
             "roles_show",
             "swarm_add",
+            "swarm_check_in",
+            "swarm_decide",
             "swarm_dm",
             "swarm_done",
+            "swarm_launch_failed",
             "swarm_list",
             "swarm_post",
             "swarm_read",
+            "swarm_receipt",
             "swarm_set_limit",
             "swarm_start",
             "swarm_status",

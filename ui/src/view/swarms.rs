@@ -196,6 +196,25 @@ fn roster(s: &State, run: &SwarmRun) -> El {
                             .key(format!("swarm-state-{name}")),
                     ),
             );
+        member = member.child(
+            mono(
+                w.last_activity_at
+                    .as_ref()
+                    .map(|at| {
+                        format!(
+                            "Last swarm activity {}",
+                            messages::relative(at, chrono::Utc::now())
+                        )
+                    })
+                    .unwrap_or_else(|| "No worker activity recorded".into()),
+                FAINT,
+            )
+            .w_full()
+            .wrap_anywhere(),
+        );
+        if let Some(error) = &w.launch_error {
+            member = member.child(label(error, 12., 400., ERROR).w_full().wrap_anywhere());
+        }
         if expanded {
             member = member
                 .child(
@@ -538,9 +557,31 @@ pub(super) fn view(s: &State, inset: f32, narrow: bool) -> El {
             meta = meta.child(action("swarm-stop", "Stop run", false).on_press(State::swarm_stop));
         }
     }
-    head = head.child(meta);
-    let mut stream = col().grow(1.).min_w(0.).min_h(0.).h_full().child(feed(s));
-    if o.can_send {
+    head = head.child(meta).child(attention::banner(s, Some(run.id)));
+    let tabs = row()
+        .w_full()
+        .gap(16.)
+        .px(10.)
+        .child(
+            workspace::tab("swarm-conversation", "Conversation", !o.receipt_open)
+                .on_press(|s: &mut State| s.desk.swarm.receipt_open = false),
+        )
+        .child(
+            workspace::tab("swarm-receipt", "Receipt", o.receipt_open)
+                .on_press(|s: &mut State| s.desk.swarm.receipt_open = true),
+        );
+    let mut stream = col()
+        .grow(1.)
+        .min_w(0.)
+        .min_h(0.)
+        .h_full()
+        .child(tabs)
+        .child(if o.receipt_open {
+            attention::receipt(s)
+        } else {
+            feed(s)
+        });
+    if o.can_send && !o.receipt_open {
         stream = stream.child(col().w_full().px(10.).pb(10.).child(composer(
             s,
             run,

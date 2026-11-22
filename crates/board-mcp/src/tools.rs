@@ -87,6 +87,22 @@ pub(crate) fn execute(
             },
         )?),
         "swarm_status" => value(b.swarm_status(actor, &run()?)?),
+        "swarm_check_in" => {
+            let r = run()?;
+            let (target, _) = b.swarm_wait_target(actor, &r)?;
+            b.swarm_check_in(actor, &r, &target)?;
+            value(b.swarm_status(actor, &r)?)
+        }
+        "swarm_launch_failed" => {
+            let r = run()?;
+            b.swarm_launch_failed(actor, &r, required("name")?, required("reason")?)?;
+            value(b.swarm_status(actor, &r)?)
+        }
+        "swarm_receipt" => value(b.swarm_receipt(actor, &run()?)?),
+        "board_attention" => value(b.attention(actor)?),
+        "swarm_decide" => {
+            value(b.swarm_resolve_decision(actor, &run()?, id()?, required("summary")?)?)
+        }
         "swarm_set_limit" => value(
             b.swarm_set_limit(
                 actor,

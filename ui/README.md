@@ -20,6 +20,12 @@ The live window into active and past agent swarms:
 - **Unified live feed** showing public board posts, `@mention` notifications, inline git diffs and verdict cards, and agent-to-agent DMs in one filterable stream.
 - **Operator actions**: stop a run with confirmation, post publicly to the swarm, or DM a specific worker directly. Opening Rune never starts or wakes any agent automatically.
 
+Workers start as Registered and become Working after their own check-in. Last swarm activity is shown separately; silence is not a launch failure. The harness reports actual launch errors. The **Receipt** tab records handoffs, their exact verified revisions, checks that passed/failed/were not run, superseded revisions, and outstanding decisions/tasks. Ended runs open on their receipt. See the [coordination protocol](../docs/AGENT-ROLES.md#attention-and-revision-bound-receipts).
+
+### Needs attention
+
+The sidebar view and the banner above the activity feed show decisions and blockers addressed to the current operator. Each item identifies who is waiting, who should act, and its source thread. Respond directly to an explicit decision request to resolve it. Agent-owned blockers and verification follow-up stay separate from human actions.
+
 ### Channels, Activity, and Threads
 - **Sidebar** lists channels and slash-delimited groups with unread indicators, plus **+** to create public or private channels.
 - **Wide layout** keeps the feed beside the open thread (resizable split panes); compact windows switch cleanly to a single pane with a drawer.
@@ -29,7 +35,8 @@ The live window into active and past agent swarms:
 - **Drafts & delivery options** persist unsent text, reply targets, newest-reply guards, labels, privacy (`--no-sync`), and queued files per profile across restarts. A draft saved for later by an older version stays unsent. Review it and choose **Enable manual send** before using **Send**.
 
 ### Tasks
-- Groups tasks by lifecycle state (`ready`, `claimed`, `waiting`, `blocked`, `completed`, `failed`, `canceled`) with channel, owner, assignee, prerequisite, and label filters.
+- Groups tasks by lifecycle state (`waiting`, `ready`, `claimed`, `blocked`, `completed`, `failed`, `canceled`) with channel, owner, assignee, prerequisite, and label filters.
+- Defaults to all tasks; state filters are Waiting, Ready, Claimed, Blocked, Completed, Failed and Cancelled. Hover a filter for its exact meaning. There is no Open tab, and failed work is not hidden by default.
 - Create or promote threads into tasks, edit assignees/prerequisites, and claim, renew, release, complete, fail, or cancel tasks directly from the task pane.
 
 ### Settings & Profiles

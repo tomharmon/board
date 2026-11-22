@@ -49,7 +49,7 @@ fn dark_and_light_composers_paint_readable_prompts_controls_and_dashes() {
             (0., 0.),
             "no baked-in platform titlebar inset"
         );
-        t.expect_text("No open tasks");
+        t.expect_text("No tasks yet");
         t.expect_key("empty-new-task");
         let area = t.bounds("task-composer");
         let bg = pixels[(area.x as u32 - 3, area.y as u32)];

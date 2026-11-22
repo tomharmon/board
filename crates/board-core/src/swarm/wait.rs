@@ -167,7 +167,7 @@ impl Board {
     ) -> Result<(Access, SwarmRun)> {
         let (a, mut r) = self.swarm_record(c, actor, run, action)?;
         if !r.operator(actor) {
-            let sql = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at FROM swarm_workers WHERE run_id=? AND actor=?";
+            let sql = "SELECT id,run_id,name,actor,role_slug,pinned_role_version,brief,workspace_path,branch_name,status,waiter_pid,last_read_cursor,created_at,updated_at,checked_in_at,last_activity_at,launch_error FROM swarm_workers WHERE run_id=? AND actor=?";
             r.workers
                 .extend(c.query_row(sql, params![r.id, actor], worker).optional()?);
         }
@@ -267,7 +267,7 @@ impl Board {
             if let Some(w)=w {
                 if matches!(w.status.as_str(),"done"|"stopped"){return Ok(());}
                 if w.status!=status || w.waiter_pid!=waiter_pid {
-                    tx.execute("UPDATE swarm_workers SET status=?,waiter_pid=?,updated_at=? WHERE id=?",params![status,waiter_pid,crate::now(),w.id])?;
+                    tx.execute("UPDATE swarm_workers SET status=?,waiter_pid=?,updated_at=?3,checked_in_at=coalesce(checked_in_at,?3),last_activity_at=?3,launch_error=NULL WHERE id=?4",params![status,waiter_pid,crate::now(),w.id])?;
                     status_event(tx,&r,actor,target,status)?;
                 }
             }else{
@@ -297,7 +297,7 @@ impl Board {
                 let was_waiting = w.status != "working";
                 if was_waiting || w.waiter_pid.is_some() || w.last_read_cursor < through {
                     tx.execute(
-                        "UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?,last_read_cursor=max(last_read_cursor,?) WHERE id=?",
+                        "UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL,last_read_cursor=max(last_read_cursor,?2) WHERE id=?3",
                         params![crate::now(), through, w.id],
                     )?;
                 }
@@ -330,7 +330,7 @@ impl Board {
             }
             if let Some(w)=w {
                 if w.status=="waiting" && w.waiter_pid==Some(pid) {
-                    tx.execute("UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?,last_read_cursor=max(last_read_cursor,?) WHERE id=?",params![crate::now(),through.unwrap_or(0),w.id])?;
+                    tx.execute("UPDATE swarm_workers SET status='working',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL,last_read_cursor=max(last_read_cursor,?2) WHERE id=?3",params![crate::now(),through.unwrap_or(0),w.id])?;
                     status_event(tx,&r,actor,target,"working")?;
                 }
             }else{
@@ -366,7 +366,7 @@ impl Board {
                 )?;
             }
             tx.execute(
-                "UPDATE swarm_workers SET status='done',waiter_pid=NULL,updated_at=? WHERE id=?",
+                "UPDATE swarm_workers SET status='done',waiter_pid=NULL,updated_at=?1,last_activity_at=?1,checked_in_at=coalesce(checked_in_at,?1),launch_error=NULL WHERE id=?2",
                 params![crate::now(), w.id],
             )?;
             status_event(tx, &r, actor, &w.name, "done")?;
@@ -378,6 +378,9 @@ impl Board {
                 [w.id],
                 |s| s.get(0),
             )?;
+            result.last_activity_at=Some(result.updated_at.clone());
+            if result.checked_in_at.is_none() {result.checked_in_at=Some(result.updated_at.clone());}
+            result.launch_error=None;
             Ok(result)
         })
     }

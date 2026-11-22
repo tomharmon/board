@@ -37,6 +37,7 @@ pub enum Page {
     Compose,
     Thread(i64),
     Activity,
+    Attention,
     Tasks,
     Task(i64),
     NewTask,

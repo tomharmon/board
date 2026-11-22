@@ -34,6 +34,53 @@ struct Mcp {
     output: BufReader<ChildStdout>,
     seq: u64,
 }
+
+#[test]
+fn mcp_workers_report_revision_bound_evidence_and_only_the_operator_answers_their_decision() {
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("workflow.sqlite");
+    let mut chat = Mcp::open(board(&db));
+    chat.tool(
+        "swarm_start",
+        json!({"goal":"Verify revision","slug":"audit"}),
+        true,
+    );
+    for name in ["impl", "verify"] {
+        chat.tool(
+            "swarm_add",
+            json!({"run":"audit","name":name,"brief":"Own your slice"}),
+            true,
+        );
+    }
+    let worker = |name| {
+        let mut command = board(&db);
+        command.args(["--worker", name]);
+        Mcp::open(command)
+    };
+    let mut implementer = worker("audit/impl");
+    let mut verifier = worker("audit/verify");
+    implementer.tool("swarm_check_in", json!({}), true);
+    let revision = json!({"kind":"sha256","value":"a".repeat(64)});
+    let h=implementer.tool("swarm_post",json!({"text":"Ready","schema":"handoff@1","schema_data":{"revision":revision,"summary":"Unicode fix","changes":["fields.rs"],"to":"verify"}}),true);
+    let handoff = h["message"]["id"].as_i64().unwrap();
+    verifier.tool("swarm_post",json!({"text":"Verified","schema":"verification@1","schema_data":{"handoff":handoff,"revision":revision,"summary":"Passed","checks":[{"name":"unit","status":"pass","command":"cargo test"}]}}),true);
+    let d=verifier.tool("swarm_post",json!({"text":"Decision needed","schema":"decision-request@1","schema_data":{"to":"ada","summary":"Accept this change?","handoff":handoff}}),true);
+    let request = d["message"]["id"].as_i64().unwrap();
+    implementer.tool(
+        "swarm_decide",
+        json!({"id":request,"summary":"Self-approval"}),
+        false,
+    );
+    chat.tool(
+        "swarm_decide",
+        json!({"run":"audit","id":request,"summary":"Accepted"}),
+        true,
+    );
+    let receipt = chat.tool("swarm_receipt", json!({"run":"audit"}), true);
+    assert_eq!(receipt["handoffs"][0]["status"], "pass");
+    assert_eq!(receipt["handoffs"][0]["verified_by"], "ada/verify");
+    assert!(receipt["decisions"].as_array().unwrap().is_empty());
+}
 impl Mcp {
     fn open(mut cmd: Command) -> Self {
         let mut child = cmd

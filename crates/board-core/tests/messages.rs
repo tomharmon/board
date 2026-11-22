@@ -114,18 +114,20 @@ fn local_deployment_schema_validates_without_opening_its_address() -> Result<()>
         schemas.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
         [
             "git-commit@1",
+            "decision-request@1",
+            "decision-resolution@1",
             "deployment@1",
             "diff@1",
+            "handoff@1",
             "verdict@1",
+            "verification@1",
             "aaa@2"
         ]
     );
-    assert!(schemas[1].built_in && schemas[1].by.is_none() && schemas[1].at.is_none());
-    assert!(
-        !schemas[4].built_in
-            && schemas[4].by.as_deref() == Some("editor")
-            && schemas[4].at.is_some()
-    );
+    let builtin = schemas.iter().find(|s| s.id == "deployment@1").unwrap();
+    let custom = schemas.iter().find(|s| s.id == "aaa@2").unwrap();
+    assert!(builtin.built_in && builtin.by.is_none() && builtin.at.is_none());
+    assert!(!custom.built_in && custom.by.as_deref() == Some("editor") && custom.at.is_some());
     assert!(
         b.register_schema("deployment", 2, "", &json!({"type":"object"}))
             .is_err()
@@ -175,7 +177,7 @@ fn a_v1_deployment_schema_keeps_its_meaning_and_registrant_after_upgrade() -> Re
     drop(fixture);
     let db = Board::open(&path)?;
     let rows = db.schemas()?;
-    assert_eq!(rows.len(), 4);
+    assert_eq!(rows.len(), 8);
     let legacy = rows.iter().find(|row| row.id == "deployment@7").unwrap();
     assert_eq!(legacy.schema, schema);
     assert!(!legacy.built_in && legacy.by.as_deref() == Some("old-editor"));

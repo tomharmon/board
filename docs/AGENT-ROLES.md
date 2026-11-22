@@ -57,7 +57,7 @@ Every swarm run gets a Board channel (`swarms/<run-slug>`), and each worker post
 
 `board swarm post` writes to the swarm's shared channel. It does **not** take a `--to` flag.
 
-- **No `@mention`:** Posts an update to the board. Visible to everyone and in Rune, notifies nobody.
+- **No `@mention`:** An ordinary progress post is visible in Rune but notifies nobody. Structured handoffs, verification and decision records notify their addressed participant as described below.
 - **With `@name`:** Posts publicly **and** sends a notification to `@name` (waking them if they are waiting, or queuing in their unread notifications if they are currently working).
 
 If an agent is only talking *about* a teammate and doesn't want to wake them, it uses their plain name without `@`. Workers can also attach git diffs (`--diff`) or structured `verdict@1` cards so commits and pass/fail checks render cleanly in Rune.
@@ -71,6 +71,10 @@ If an agent is only talking *about* a teammate and doesn't want to wake them, it
 - Humans can also DM any worker directly from Rune or the CLI.
 
 ### Waiting and live status (`board swarm wait`)
+
+Workers begin as **Registered**, not Working. After checking its assigned identity, a worker explicitly runs `board swarm check-in` (MCP: `swarm_check_in`). Entering `swarm wait` also records an explicit worker check-in. The roster shows the last recorded swarm activity separately from status: a quiet worker is not automatically marked failed. The coordinator reports an actual harness launch error with `board swarm launch-failed NAME "reason" --run RUN`; only a worker that has not checked in can have a launch failure recorded. A later successful check-in clears that error.
+
+Schema v17 preserves existing assignments and history. Old Working records return to Registered because the old registration never proved execution; old Waiting records retain the explicit wait registration. Take a backup with the old binary before upgrading. This is not an assertion that an existing harness process stopped.
 
 When a worker finishes a chunk of work and needs a reply (e.g. `@impl` waiting on `@verifier`), it runs `board swarm wait --after <seq>`:
 
@@ -93,6 +97,37 @@ For a harness that genuinely supports a separate stdio process, start `board <cl
 - **When the coordinator disconnects:** SQLite cannot detect whether a chat is connected or distinguish two trusted processes using the same actor. The harness owns its sessions and decides their shutdown policy. An already-running independent worker can still communicate within the active run's limits; nothing in Board spawns a replacement. Explicitly stop the run before disconnecting when workers must exit: blocked waits return `stopped`, but Board cannot kill unrelated in-flight tools. Do not give untrusted executables direct access to the owner's SQLite file.
 - **Rune never starts work automatically:** Opening a board or viewing a swarm in Rune is always passive. Explicit user actions (posting a message, sending a DM, clicking **Stop**) take effect normally.
 - **Backlogs and tickets:** Day-to-day `@impl ↔ @verifier` iteration stays in messages and DMs. For batch work (like draining a list of Linear or GitHub issues pulled with `board sync pull ... --as-tasks`), workers use Board's [fenced tasks](AUTOMATION.md) so two workers never grab the same ticket.
+
+---
+
+## Attention and revision-bound receipts
+
+**Needs attention** separates actions assigned to your actor from **Agent follow-up**. Explicit decision requests, observed launch failures and blocked/failed tasks carry who is waiting, who should act, and a source thread. Tasks assigned to agents and failing or unrun verification checks remain visible as follow-up without becoming human alerts. Use `board swarm attention` (MCP: `board_attention`) for the same read model.
+
+For an implementer/verifier exchange, post one of these built-in schemas using `board swarm post --schema NAME@1 --schema-data JSON` or the existing `swarm_post` MCP tool. The records are validated and saved atomically with the post; retries using a CLI idempotency key do not create another handoff.
+
+| Schema | Required fields |
+| --- | --- |
+| `handoff@1` | `revision` (`kind`: `git-commit` or `sha256`, `value`: full lowercase hash), `summary`, `changes` (nonempty list), `to` (another worker's name). Optional `task` ID. |
+| `verification@1` | `handoff` (message ID), identical `revision`, `summary`, nonempty `checks` with `name`, `status` (`pass`, `fail`, `not-run`), `command`, optional `output`. Only the named verifier can report it. |
+| `decision-request@1` | `to` (exact actor, e.g. `ada`, not a worker nickname), `summary`, optional `handoff` ID. |
+| `decision-resolution@1` | `request` (message ID), `summary`. Only the addressed actor or its owning person may answer. |
+
+Handoffs notify the named verifier; verification notifies the author, using the existing notification budget. Missing or suppressed notifications do not lose the evidence. Decisions directed at a run participant notify that participant. These notifications only wake existing waits, never launch agents.
+
+For example, with the returned implementer worker environment selected and a verifier named `verify`:
+
+```sh
+board swarm check-in
+revision=$(git rev-parse HEAD)
+handoff=$(board swarm post --schema handoff@1 --schema-data "{\"revision\":{\"kind\":\"git-commit\",\"value\":\"$revision\"},\"summary\":\"Fix Unicode splitting\",\"changes\":[\"src/fields.rs\"],\"to\":\"verify\"}")
+```
+
+The verifier uses the returned handoff ID and that exact revision. A result against another hash is rejected. Mixed passing and unrun checks produce **not-run**, not a green pass; any failed check produces **fail**. `verdict@1` remains available for older evidence, but its optional artifact string is not promoted into a revision-bound receipt. Board validates identity and consistency, not whether the submitted commands actually ran: the verifier remains responsible for truthful evidence.
+
+Read `board swarm receipt --run RUN` (MCP: `swarm_receipt`) or the run's **Receipt** tab to see changes, full revisions, verifier identity, commands/results, linked unfinished tasks and unresolved decisions. A new handoff by the same author for the same task supersedes the previous one; without a task ID, it supersedes that author's previous unlinked handoff. Historical evidence remains visible, and a newer revision starts **unverified**. Evidence snapshots remain unchanged by edits to their conversation posts.
+
+Answer a decision in Needs attention, or run `board swarm decide REQUEST_ID "answer" --run RUN` (MCP: `swarm_decide`). This records a resolution and clears the request, including after a run stops. An ordinary reply or DM does not silently resolve it. **Stopped**, **worker done**, **task completed** and **verified revision** are distinct facts; none implies the others.
 
 ---
 

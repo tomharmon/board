@@ -121,7 +121,10 @@ pub(crate) fn init(c: &Connection) -> Result<()> {
             "A unified patch with optional revisions and file names.",
             diff,
         ),
-    ] {
+    ]
+    .into_iter()
+    .chain(crate::swarm::coordination_schemas())
+    {
         if c.execute(
             "INSERT INTO schemas(name,version,description,definition)
         SELECT ?1,1,?2,?3 WHERE NOT EXISTS(SELECT 1 FROM schemas WHERE name=?1)",

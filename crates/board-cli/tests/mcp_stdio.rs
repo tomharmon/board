@@ -68,7 +68,7 @@ fn installed_cli_dispatches_real_mcp_frames_to_its_selected_database_and_actor()
         .collect();
     assert_eq!(replies.len(), 5);
     assert_eq!(replies[0]["result"]["serverInfo"]["name"], "board-mcp");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 24);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 29);
     assert!(!unused.exists());
     let result = |i: usize| {
         let r = &replies[i]["result"];

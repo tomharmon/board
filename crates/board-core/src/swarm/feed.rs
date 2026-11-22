@@ -169,6 +169,13 @@ impl Board {
         let mut suppressed = vec![];
         let mut used = 0;
         if created {
+            if let Some(target) = super::coordination::record_on(tx, a, r, &m)? {
+                hits.insert(target);
+            }
+            tx.execute(
+                "UPDATE swarm_workers SET last_activity_at=? WHERE run_id=? AND actor=?",
+                params![crate::now(), r.id, actor],
+            )?;
             for who in hits {
                 let peer = who != "coordinator" && !r.can_control;
                 if peer && r.notifications_sent + used >= r.max_notifications {
@@ -207,6 +214,7 @@ impl Board {
             let at=Board::event_tx(tx,"swarm.dm",actor,None,serde_json::json!({}))?;
             tx.execute("INSERT INTO swarm_dms(run_id,from_actor,to_worker,text,event_cursor,created_at) VALUES(?,?,?,?,?,?)",params![r.id,actor,to_worker,text,at,crate::now()])?;
             let id=tx.last_insert_rowid();notify(tx,&r,actor,to_worker,"dm",at,Some(id))?;
+            tx.execute("UPDATE swarm_workers SET last_activity_at=? WHERE run_id=? AND actor=?",params![crate::now(),r.id,actor])?;
             spend(tx,&r,actor,i64::from(peer))?;dm_on(tx,id)})
     }
     pub fn swarm_read(
